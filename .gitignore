@@ -1,0 +1,7 @@
+问策智投_零基础项目执行手册.docx
+
+# Local Python environments and generated caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
