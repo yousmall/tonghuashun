@@ -13,17 +13,13 @@ from backend.app.agents.coordinator import (
     basic_compliance_check,
     verify_facts,
 )
-from backend.app.agents.demo_agents import make_fact_based_agent
+from backend.app.agents.rule_agents import make_rule_agents
 from backend.app.models import FactRecord, OrchestrationRequest, UserProfile
 
 
 def make_coordinator() -> CoordinatorAgent:
     """装配确定性依赖，避免测试依赖外部模型、行情接口或网络。"""
-    agents = {
-        name: make_fact_based_agent(name)
-        for name in ("market", "industry", "security", "fund", "portfolio")
-    }
-    return CoordinatorAgent(agents, verify_facts, basic_compliance_check)
+    return CoordinatorAgent(make_rule_agents(), verify_facts, basic_compliance_check)
 
 
 @pytest.mark.asyncio
@@ -49,6 +45,8 @@ async def test_portfolio_request_builds_parallel_specialist_dag() -> None:
     assert len([node for node in output.task_plan.nodes if node.agent_id in {"market", "industry", "security", "fund", "portfolio"}]) == 5
     assert output.compliance.status == "PASS"
     assert output.evidence == ["F-1"]
+    # 专业、事实和合规节点都必须写回状态，才能按手册要求在协作过程页可视化。
+    assert all(node.status != "pending" for node in output.task_plan.nodes)
 
 
 @pytest.mark.asyncio

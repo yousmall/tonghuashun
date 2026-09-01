@@ -4,9 +4,9 @@
 请求交给协调器。意图识别、Task DAG、事实核验和合规判断均保留在各自模块，
 避免 API 入口变成难以测试和维护的业务代码集合。
 
-本版本接入的是 ``demo_agents``，只会使用请求显式传入的 ``FactRecord``。因此
-它适合在快照模式下跑通 MVP 闭环；接入真实行情或大模型前，须替换为经过鉴权、
-时效检查和审计记录的正式实现。
+本版本接入的是确定性规则型专业智能体，只会使用请求显式传入的
+``FactRecord``。因此它适合在快照模式下跑通 MVP 闭环；接入真实行情或大模型前，
+须替换为经过鉴权、时效检查和审计记录的正式实现。
 """
 
 from __future__ import annotations
@@ -18,8 +18,16 @@ from backend.app.agents.coordinator import (
     basic_compliance_check,
     verify_facts,
 )
-from backend.app.agents.demo_agents import make_fact_based_agent
-from backend.app.models import AdvicePackage, OrchestrationRequest
+from backend.app.agents.rule_agents import make_rule_agents
+from backend.app.models import (
+    AdvicePackage,
+    OrchestrationRequest,
+    ProfileAssessment,
+    ProfileAssessmentRequest,
+    ProfileConfirmRequest,
+    UserProfile,
+)
+from backend.app.services import assess_profile, confirm_profile
 
 
 def build_coordinator() -> CoordinatorAgent:
@@ -30,12 +38,9 @@ def build_coordinator() -> CoordinatorAgent:
     编排协议均不需要改动。
     """
 
-    agent_ids = ("market", "industry", "security", "fund", "portfolio")
-    agents = {
-        # 每个 handler 都是异步函数，并且只根据 OrchestrationRequest 产生 AgentResult。
-        agent_id: make_fact_based_agent(agent_id)
-        for agent_id in agent_ids
-    }
+    # ``make_rule_agents`` 返回与 Task DAG 完全一致的五个注册键。它们不是行情源，
+    # 只对请求已经授权的 FactRecord 做确定性计算，便于单测和审计回放。
+    agents = make_rule_agents()
     return CoordinatorAgent(
         agents=agents,
         # 事实核验先于合规审核执行，二者都可在后续替换为正式服务实现。
@@ -60,6 +65,28 @@ async def health() -> dict[str, str]:
     """健康检查接口，供浏览器、部署平台和 README 的启动验证使用。"""
 
     return {"status": "ok"}
+
+
+@app.post("/api/v1/profile/assess", response_model=ProfileAssessment, tags=["profile"])
+async def assess_user_profile(request: ProfileAssessmentRequest) -> ProfileAssessment:
+    """将问卷/文本转换为未确认画像草稿。
+
+    返回值始终是 ``confirmed=False``；这不是可直接用于精确仓位建议的授权，
+    前端应展示提取证据和缺失字段，请用户在下一步核对并确认。
+    """
+
+    return assess_profile(request)
+
+
+@app.post("/api/v1/profile/confirm", response_model=UserProfile, tags=["profile"])
+async def confirm_user_profile(request: ProfileConfirmRequest) -> UserProfile:
+    """显式确认画像并递增版本号。
+
+    当前演示不持久化数据；生产环境必须在鉴权后的事务内比对上一版本，防止
+    并发覆盖。即使调用方传入 ``confirmed=True``，版本仍会递增以留下审计边界。
+    """
+
+    return confirm_profile(request.profile)
 
 
 @app.post(

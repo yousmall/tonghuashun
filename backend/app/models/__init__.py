@@ -6,10 +6,15 @@ from .schemas import (
     FactRecord,
     Intent,
     OrchestrationRequest,
+    ProfileAssessment,
+    ProfileAssessmentRequest,
+    ProfileConfirmRequest,
     TaskNode,
     TaskPlan,
     TaskStatus,
     UserProfile,
+    VerificationResult,
+    VerificationStatus,
 )
 
 __all__ = [
@@ -20,8 +25,13 @@ __all__ = [
     "FactRecord",
     "Intent",
     "OrchestrationRequest",
+    "ProfileAssessment",
+    "ProfileAssessmentRequest",
+    "ProfileConfirmRequest",
     "TaskNode",
     "TaskPlan",
     "TaskStatus",
     "UserProfile",
+    "VerificationResult",
+    "VerificationStatus",
 ]

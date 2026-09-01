@@ -79,7 +79,9 @@ class CoordinatorAgent:
             (Intent.PORTFOLIO_REVIEW, ("组合", "持仓", "仓位", "调仓", "回撤")),
             (Intent.FUND_SCREENING, ("基金", "etf", "指数基金")),
             (Intent.SECURITY_RESEARCH, ("股票", "个股", "证券", "公司")),
+            (Intent.INDUSTRY_ANALYSIS, ("行业比较", "行业分析", "赛道")),
             (Intent.MARKET_ANALYSIS, ("市场", "宏观", "行业", "行情")),
+            (Intent.EDUCATION, ("科普", "怎么理解", "是什么")),
         )
         for intent, keywords in rules:
             # 任意一个关键词命中即可进入对应工作流；不猜测未命中的复杂意图。
@@ -169,10 +171,19 @@ class CoordinatorAgent:
         # 这里仅选择注册的专业节点。事实核验和合规在后面严格按依赖顺序单独运行。
         specialist_nodes = [node for node in plan.nodes if node.agent_id in self.agents]
         results = await self._run_parallel(request, specialist_nodes)
+        # 专业节点的最终状态必须回写到 DAG，前端才能区分完成、失败与降级。
+        for node, result in zip(specialist_nodes, results, strict=True):
+            node.status = result.status
         # 核验器可移除不存在/过期的 fact_id，并同步降低结果置信度。
+        verification_node = next(node for node in plan.nodes if node.agent_id == "fact_verifier")
+        verification_node.status = TaskStatus.RUNNING
         results = await self.verifier(results, request.facts)
+        verification_node.status = TaskStatus.COMPLETED
         # 合规器使用核验后的结果作最终判定，保证无来源结论无法被放行。
+        compliance_node = next(node for node in plan.nodes if node.agent_id == "compliance")
+        compliance_node.status = TaskStatus.RUNNING
         compliance = await self.compliance_checker(request, results)
+        compliance_node.status = TaskStatus.COMPLETED
 
         if compliance.status is ComplianceStatus.BLOCK:
             # BLOCK 是硬拦截：不执行综合摘要，也不把专业观点组合成建议。
@@ -182,6 +193,8 @@ class CoordinatorAgent:
                 conclusion="请求未通过合规或适当性审核，未生成投资建议。",
                 confidence=0,
                 risks=[compliance.reason or "触发合规拦截"],
+                user_fit="不适配：请求未通过合规或适当性审核。",
+                next_steps=["调整问题表述或补充已确认画像后重试"],
                 compliance=compliance,
                 task_plan=plan,
                 agent_results=results,
@@ -197,6 +210,10 @@ class CoordinatorAgent:
         # 永远显式返回数据时点，前端不得把它改写为含糊的“当前”。
         snapshot_time = max((fact.snapshot_time for fact in request.facts), default=None)
         conclusion = self._summarize(usable, compliance.status)
+        # 只有画像已确认时才会走到此处；仍只输出目标区间/诊断而非自动交易指令。
+        user_fit = self._user_fit_summary(request)
+        allocation = self._allocation_summary(usable)
+        next_steps = self._next_steps(results, compliance.status)
         return AdvicePackage(
             trace_id=trace_id,
             intent=plan.intent,
@@ -205,6 +222,9 @@ class CoordinatorAgent:
             confidence=round(confidence, 2),
             evidence=evidence,
             risks=risks,
+            user_fit=user_fit,
+            allocation=allocation,
+            next_steps=next_steps,
             compliance=compliance,
             task_plan=plan,
             agent_results=results,
@@ -218,6 +238,8 @@ class CoordinatorAgent:
         async def execute(node: TaskNode) -> AgentResult:
             # plan() 已确保 agent_id 存在于注册表；在此处读取不会暴露用户可控索引。
             handler = self.agents[node.agent_id]
+            # RUNNING 只在协程真正开始时设置，避免把等待中的节点误展示为执行中。
+            node.status = TaskStatus.RUNNING
             try:
                 # wait_for 强制执行节点自己的超时预算，不允许慢模型拖住整条链路。
                 return await asyncio.wait_for(handler(request), timeout=node.timeout_seconds)
@@ -255,9 +277,12 @@ class CoordinatorAgent:
         """
         mapping = {
             Intent.MARKET_ANALYSIS: ("market", "industry"),
+            Intent.INDUSTRY_ANALYSIS: ("market", "industry"),
             Intent.SECURITY_RESEARCH: ("market", "industry", "security"),
             Intent.FUND_SCREENING: ("market", "fund"),
             Intent.PORTFOLIO_REVIEW: ("market", "industry", "security", "fund", "portfolio"),
+            # 教育类问题没有充分画像/事实时不应伪装成专业研究，直接进入 REVIEW。
+            Intent.EDUCATION: (),
         }
         return mapping[intent]
 
@@ -268,6 +293,8 @@ class CoordinatorAgent:
             intent=plan.intent,
             conclusion=reason,
             confidence=0,
+            user_fit="待确认：尚未具备生成个性化建议的必要条件。",
+            next_steps=["确认画像或补充希望分析的对象与授权事实"],
             compliance=ComplianceResult(
                 status=ComplianceStatus.REVIEW,
                 reason=reason,
@@ -292,6 +319,44 @@ class CoordinatorAgent:
         prefix = "需人工复核。" if status is ComplianceStatus.REVIEW else "分析结果："
         return f"{prefix}{opinions}"
 
+    @staticmethod
+    def _user_fit_summary(request: OrchestrationRequest) -> str:
+        """用已确认字段生成适配说明，不把风险等级解释成收益预期。"""
+        profile = request.profile
+        parts = [f"已确认画像 {profile.risk_level or '未量化'}"]
+        if profile.horizon_months is not None:
+            parts.append(f"期限 {profile.horizon_months} 个月")
+        if profile.max_drawdown is not None:
+            parts.append(f"最大回撤 {profile.max_drawdown:.0%}")
+        if profile.liquidity_need:
+            parts.append(f"流动性需求 {profile.liquidity_need}")
+        return "；".join(parts)
+
+    @staticmethod
+    def _allocation_summary(results: list[AgentResult]) -> list[dict[str, object]]:
+        """提取组合 Agent 的目标区间提示；没有组合事实时返回空而非编造权重。"""
+        for result in results:
+            if result.agent_id == "portfolio" and result.details:
+                return [{
+                    "type": "portfolio_diagnosis",
+                    "target_range": result.details.get("target_range_note"),
+                    "largest_position": result.details.get("largest_position"),
+                    "rebalancing": "仅作分批调整与复核提示，不自动下单",
+                }]
+        return []
+
+    @staticmethod
+    def _next_steps(results: list[AgentResult], status: ComplianceStatus) -> list[str]:
+        """把降级原因转化为可操作下一步，避免用户只看到模糊的低置信度。"""
+        steps: list[str] = []
+        if status is ComplianceStatus.REVIEW:
+            steps.append("补充有来源、含时间戳的事实后重新核验")
+        if any(result.status in {TaskStatus.DEGRADED, TaskStatus.UNKNOWN} for result in results):
+            steps.append("补齐各专业智能体列出的缺失字段")
+        if any(result.risk_flags for result in results):
+            steps.append("在执行任何调整前复核风险标记和证伪条件")
+        return steps or ["关注证据时点与证伪条件，定期复核"]
+
 
 async def verify_facts(
     results: list[AgentResult], facts: list[FactRecord]
@@ -308,7 +373,10 @@ async def verify_facts(
     now = datetime.now(timezone.utc)
     # 只有来源明确且未过期的事实才可继续支撑最终结论。
     valid_fact_ids = {
-        fact.fact_id for fact in facts if fact.snapshot_time >= now - timedelta(days=7)
+        fact.fact_id
+        for fact in facts
+        # 质量低于 0.4 的记录按手册只能作为待核验线索，不能支撑最终结论。
+        if fact.snapshot_time >= now - timedelta(days=7) and fact.quality >= 0.4 and fact.source_id.strip()
     }
     verified: list[AgentResult] = []
     for result in results:
@@ -321,7 +389,7 @@ async def verify_facts(
             # 此结果仍可被展示，但必须标为降级并设置置信度上限。
             result.status = TaskStatus.DEGRADED
             result.confidence = min(result.confidence, 0.4)
-            result.confidence_reasons.append("存在无来源或过期事实")
+            result.confidence_reasons.append("存在无来源、低质量或过期事实")
             result.risk_flags.append("证据质量不足")
             # 删除不合格引用，确保 AdvicePackage.evidence 中不会含无效事实 ID。
             result.facts_used = [fact_id for fact_id in result.facts_used if fact_id in valid_fact_ids]
@@ -338,6 +406,26 @@ async def basic_compliance_check(
     证据完整性三类最小控制；生产环境应替换为版本化、可配置、可回放的规则库。
     """
     text = request.query.lower()
+    disclosures = [RISK_NOTICE]
+    # 规则 1：权限与隐私优先级最高。不能因为用户给出自然语言就访问/推断他人数据。
+    if re.search(r"他人持仓|别人持仓|其他用户|泄露.*(密钥|token|密码)", text):
+        return ComplianceResult(
+            status=ComplianceStatus.BLOCK,
+            matched_rules=["PRIVACY_AND_PERMISSION"],
+            reason="不得访问、推断或泄露其他用户的持仓和敏感信息。",
+            risk_notice=RISK_NOTICE,
+            required_disclosures=disclosures,
+        )
+    # 规则 2：未经证实的传闻不能成为推荐理由，最多作为待核验线索。
+    if re.search(r"内幕|小道消息|传闻|听说.*利好", text):
+        return ComplianceResult(
+            status=ComplianceStatus.REVIEW,
+            matched_rules=["UNVERIFIED_RUMOR"],
+            reason="未经证实的传闻不能用于形成投资结论，请提供权威来源。",
+            risk_notice=RISK_NOTICE,
+            required_disclosures=disclosures,
+        )
+    # 规则 3：收益承诺必须硬拦截，不能通过更换措辞绕开。
     if re.search(r"稳赚|必涨|保本高收益", text):
         # 不将此类请求改写成具体标的建议，直接阻断确定性收益承诺。
         return ComplianceResult(
@@ -345,7 +433,9 @@ async def basic_compliance_check(
             matched_rules=["NO_RETURN_PROMISE"],
             reason="不得提供收益承诺或保证性表述。",
             risk_notice=RISK_NOTICE,
+            required_disclosures=disclosures,
         )
+    # 规则 4：低风险用户的满仓/全仓高风险请求与适当性冲突。
     if request.profile.risk_level == "R1" and re.search(r"满仓|全仓", text):
         # 此规则仅演示低风险画像与高暴露表达的冲突；真实版本还要判断标的波动性。
         return ComplianceResult(
@@ -353,7 +443,25 @@ async def basic_compliance_check(
             matched_rules=["SUITABILITY_R1_HIGH_RISK"],
             reason="低风险用户不能获得满仓高风险标的建议。",
             risk_notice=RISK_NOTICE,
+            required_disclosures=disclosures,
         )
+    # 规则 5：组合单标的权重不得超过已确认的硬上限。MVP 返回 REVIEW，
+    # 让结果压缩到区间并解释风险；绝不把它升级成自动调仓。
+    portfolio_weights = [
+        holding.get("weight")
+        for holding in request.portfolio
+        if isinstance(holding, dict) and isinstance(holding.get("weight"), (int, float))
+    ]
+    if portfolio_weights and max(portfolio_weights) > request.profile.single_security_limit:
+        return ComplianceResult(
+            status=ComplianceStatus.REVIEW,
+            matched_rules=["SINGLE_SECURITY_CONCENTRATION"],
+            reason="持仓存在超过已确认单标的上限的集中度风险。",
+            risk_notice=RISK_NOTICE,
+            required_disclosures=disclosures,
+        )
+    # 规则 6：具体价格/估值等判断没有通过事实层时不可放行。该检查也覆盖
+    # 事实过期、质量过低或 source_id 为空导致 verifier 清空证据的情形。
     if not any(result.facts_used for result in results):
         # 证据不足不是“通过但置信度低”，而是 REVIEW：只能提供教育性内容或追问。
         return ComplianceResult(
@@ -361,6 +469,11 @@ async def basic_compliance_check(
             matched_rules=["EVIDENCE_INSUFFICIENT"],
             reason="证据不足，仅可展示教育性说明。",
             risk_notice=RISK_NOTICE,
+            required_disclosures=disclosures,
         )
     # 所有已实现的硬规则均未命中时才允许通过；风险提示仍必须随结果一同返回。
-    return ComplianceResult(status=ComplianceStatus.PASS, risk_notice=RISK_NOTICE)
+    return ComplianceResult(
+        status=ComplianceStatus.PASS,
+        risk_notice=RISK_NOTICE,
+        required_disclosures=disclosures,
+    )
