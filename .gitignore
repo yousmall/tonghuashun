@@ -2,6 +2,18 @@
 
 # Local Python environments and generated caches
 .venv/
+.env
+.env.*
+!.env.example
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# Local artifact build and visual-QA workspaces
+.docx_work/
+.docx_review/
+.pptx_work/
+.chart-data-*/
+
+# Microsoft Office temporary lock files
+~$*

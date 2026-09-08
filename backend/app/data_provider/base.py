@@ -20,10 +20,21 @@ class DataProvider(Protocol):
     async def get_news(self, query: str) -> list[FactRecord]: ...
     async def get_fund_candidates(self, filters: dict[str, object]) -> list[FactRecord]: ...
     async def get_industry_rank(self, window: str) -> list[FactRecord]: ...
+    async def get_convertible_bond(self, target: str) -> list[FactRecord]: ...
+    async def get_basic_info(self, target: str) -> list[FactRecord]: ...
+    async def get_company_operations(self, target: str) -> list[FactRecord]: ...
+    async def get_shareholder_equity(self, target: str) -> list[FactRecord]: ...
+    async def get_event_data(self, target: str) -> list[FactRecord]: ...
+    async def get_macro_data(self, query: str) -> list[FactRecord]: ...
+    async def get_institutional_research(self, target: str) -> list[FactRecord]: ...
+    async def get_research_reports(self, target: str) -> list[FactRecord]: ...
+    async def get_announcements(self, target: str) -> list[FactRecord]: ...
+    async def screen_stocks(self, query: str) -> list[FactRecord]: ...
+    async def screen_sectors(self, query: str) -> list[FactRecord]: ...
 
 
 class SnapshotProvider:
-    """只读内存快照 Provider，供 MVP、单元测试和外部依赖故障降级使用。"""
+    """只读内存快照 Provider，供演示、单元测试和外部依赖故障降级使用。"""
 
     def __init__(self, facts: Sequence[FactRecord]) -> None:
         # 深拷贝隔离调用方后续修改，确保一次 Provider 实例始终代表同一审计快照。
@@ -46,7 +57,7 @@ class SnapshotProvider:
         return self._find(entity=symbol, fields={"pe_ttm", "pb", "revenue_growth", "roe", "fundamental_score"})
 
     async def get_news(self, query: str) -> list[FactRecord]:
-        # MVP 不做语义检索；只保留实体文本匹配，避免暗中引入未标注来源的搜索结果。
+        # 快照模式不做语义检索；只保留实体文本匹配，避免暗中引入未标注来源的搜索结果。
         normalized_query = query.casefold()
         return [
             fact.model_copy(deep=True)
@@ -61,3 +72,57 @@ class SnapshotProvider:
     async def get_industry_rank(self, window: str) -> list[FactRecord]:
         del window  # 快照的时点由 FactRecord.snapshot_time 表达，不伪造滚动窗口。
         return self._find(fields={"prosperity_score", "valuation_score", "capital_flow_score", "policy_score", "crowding_score"})
+
+    async def get_convertible_bond(self, target: str) -> list[FactRecord]:
+        return self._find(
+            entity=target,
+            fields={
+                "close_price",
+                "change",
+                "conversion_premium_rate",
+                "pure_bond_premium_rate",
+                "yield_to_maturity",
+                "remaining_size",
+                "bond_rating",
+                "conversion_price",
+            },
+        )
+
+    async def get_basic_info(self, target: str) -> list[FactRecord]:
+        return self._find(entity=target, fields={"company_name", "industry", "listing_date", "main_business"})
+
+    async def get_company_operations(self, target: str) -> list[FactRecord]:
+        return self._find(
+            entity=target,
+            fields={"main_business", "revenue_composition", "major_customer", "major_supplier", "major_contract"},
+        )
+
+    async def get_shareholder_equity(self, target: str) -> list[FactRecord]:
+        return self._find(
+            entity=target,
+            fields={"controlling_shareholder", "actual_controller", "total_shares", "float_shares", "shareholder_count"},
+        )
+
+    async def get_event_data(self, target: str) -> list[FactRecord]:
+        return self._find(entity=target, fields={"event", "earnings_forecast", "share_pledge", "unlock", "regulatory_letter"})
+
+    async def get_macro_data(self, query: str) -> list[FactRecord]:
+        del query
+        return self._find(fields={"cpi", "ppi", "pmi", "interest_rate", "exchange_rate", "social_financing"})
+
+    async def get_institutional_research(self, target: str) -> list[FactRecord]:
+        return self._find(entity=target, fields={"institution", "rating", "target_price", "earnings_forecast"})
+
+    async def get_research_reports(self, target: str) -> list[FactRecord]:
+        return self._find(entity=target, fields={"research_report"})
+
+    async def get_announcements(self, target: str) -> list[FactRecord]:
+        return self._find(entity=target, fields={"announcement"})
+
+    async def screen_stocks(self, query: str) -> list[FactRecord]:
+        del query
+        return self._find(fields={"screening_result", "close_price", "change", "pe_ttm", "pb", "roe"})
+
+    async def screen_sectors(self, query: str) -> list[FactRecord]:
+        del query
+        return self._find(fields={"sector_screening_result", "industry", "change", "capital_flow_score", "prosperity_score"})

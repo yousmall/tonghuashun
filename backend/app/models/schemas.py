@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -26,6 +26,7 @@ class Intent(StrEnum):
     INDUSTRY_ANALYSIS = "industry_analysis"
     SECURITY_RESEARCH = "security_research"
     FUND_SCREENING = "fund_screening"
+    CONVERTIBLE_BOND_ANALYSIS = "convertible_bond_analysis"
     PORTFOLIO_REVIEW = "portfolio_review"
     EDUCATION = "education"
     UNKNOWN = "unknown"
@@ -93,6 +94,13 @@ class UserProfile(BaseModel):
     constraints: list[str] = Field(default_factory=list)
     # 投资目标，例如“2 年后购房”；它会影响组合建议的流动性约束。
     target: str | None = None
+    # 画像不仅记录风险问卷，也保留与适当性直接相关的真实经历和收益目标。
+    # 这些字段均由用户提供或确认，系统不得从风险等级反向猜测。
+    investment_experience_years: float | None = Field(default=None, ge=0, le=100)
+    investment_history: list[str] = Field(default_factory=list)
+    holding_history: list[dict[str, Any]] = Field(default_factory=list)
+    expected_annual_return: float | None = Field(default=None, ge=-1, le=5)
+    behavioral_notes: list[str] = Field(default_factory=list)
     # 两类上限是组合/合规可执行的硬约束，不由语言模型自行决定。
     single_security_limit: float = Field(default=0.20, gt=0, le=1)
     industry_limit: float = Field(default=0.30, gt=0, le=1)
@@ -123,6 +131,8 @@ class FactRecord(BaseModel):
     quality: float = Field(ge=0, le=1)
     # 财务/经营数据的报告期，例如 2026Q1；行情数据可为空。
     period: str | None = None
+    # 规则派生事实记录输入 fact_id；供应商原始事实保持为空。
+    derived_from: list[str] = Field(default_factory=list)
 
     @field_validator("snapshot_time")
     @classmethod
@@ -274,8 +284,13 @@ class OrchestrationRequest(BaseModel):
     profile: UserProfile
     # 数据层在本次请求中已授权的事实集合。
     facts: list[FactRecord] = Field(default_factory=list)
+    # 默认由后端按意图自动补充真实数据；显式关闭时只使用调用方提供的事实。
+    auto_fetch: bool = True
     # 用户授权导入的持仓快照；真实系统还应增加权限与敏感字段脱敏。
     portfolio: list[dict[str, Any]] = Field(default_factory=list)
+    # 最近对话由客户端显式传入，既支持多轮理解，也避免服务端跨用户串话。
+    conversation_id: str | None = Field(default=None, max_length=128)
+    context_messages: list["ConversationTurn"] = Field(default_factory=list, max_length=20)
 
     @field_validator("query")
     @classmethod
@@ -303,6 +318,10 @@ class ProfileAssessmentRequest(BaseModel):
     # 问卷维度使用 0-100；未知维度省略，服务会列入 missing_fields。
     questionnaire: dict[str, float] = Field(default_factory=dict)
     narrative: str | None = Field(default=None, max_length=2_000)
+    investment_experience_years: float | None = Field(default=None, ge=0, le=100)
+    investment_history: list[str] = Field(default_factory=list, max_length=50)
+    holding_history: list[dict[str, Any]] = Field(default_factory=list, max_length=200)
+    expected_annual_return: float | None = Field(default=None, ge=-1, le=5)
 
     @field_validator("questionnaire")
     @classmethod
@@ -328,6 +347,99 @@ class ProfileConfirmRequest(BaseModel):
     profile: UserProfile
 
 
+class DataFetchRequest(BaseModel):
+    """从已配置金融数据源拉取一类只读数据。"""
+
+    kind: Literal[
+        "quote",
+        "financial",
+        "news",
+        "fund",
+        "industry",
+        "convertible",
+        "basic_info",
+        "company_operations",
+        "shareholder_equity",
+        "event",
+        "macro",
+        "institutional_research",
+        "research_report",
+        "announcement",
+        "stock_screen",
+        "sector_screen",
+    ]
+    target: str = Field(min_length=1, max_length=500)
+    filters: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("target")
+    @classmethod
+    def target_must_contain_visible_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("target 不能为空")
+        return normalized
+
+
+class DataFetchResponse(BaseModel):
+    """数据源查询结果及其真实来源状态。"""
+
+    provider: str
+    fetched_at: datetime
+    facts: list[FactRecord] = Field(default_factory=list)
+
+
+class ConversationTurn(BaseModel):
+    """一次可控的多轮上下文输入；只允许用户与助手文本。"""
+
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=4_000)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @field_validator("content")
+    @classmethod
+    def content_must_contain_visible_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("对话内容不能为空")
+        return normalized
+
+
+class CrossValidationIssue(BaseModel):
+    """跨智能体或跨来源一致性核验发现的一项问题。"""
+
+    code: str
+    severity: Literal["info", "warning", "critical"]
+    message: str
+    agent_ids: list[str] = Field(default_factory=list)
+    fact_ids: list[str] = Field(default_factory=list)
+
+
+class CrossValidationResult(BaseModel):
+    """跨智能体一致性、来源冲突和协调器共识摘要。"""
+
+    status: ComplianceStatus = ComplianceStatus.PASS
+    consensus_score: float | None = Field(default=None, ge=0, le=100)
+    confidence: float = Field(default=0, ge=0, le=1)
+    issues: list[CrossValidationIssue] = Field(default_factory=list)
+    supporting_agents: list[str] = Field(default_factory=list)
+    dissenting_agents: list[str] = Field(default_factory=list)
+
+
+class DataAcquisitionResult(BaseModel):
+    """自动取数阶段的审计摘要，不包含密钥、原始请求头或内部异常文本。"""
+
+    mode: Literal["provided", "live", "mixed", "unavailable", "not_required"] = "not_required"
+    provider: str | None = None
+    requested_capabilities: list[str] = Field(default_factory=list)
+    successful_capabilities: list[str] = Field(default_factory=list)
+    empty_capabilities: list[str] = Field(default_factory=list)
+    failed_capabilities: list[str] = Field(default_factory=list)
+    supplied_fact_count: int = Field(default=0, ge=0)
+    fetched_fact_count: int = Field(default=0, ge=0)
+    derived_fact_count: int = Field(default=0, ge=0)
+    message: str | None = None
+
+
 class AdvicePackage(BaseModel):
     """最终返回给 API 和前端的、可审计的建议包。"""
 
@@ -343,6 +455,10 @@ class AdvicePackage(BaseModel):
     confidence: float = Field(ge=0, le=1)
     # 去重后的 fact_id 列表，供证据中心展开。
     evidence: list[str] = Field(default_factory=list)
+    # 包含调用方事实、自动取数事实和规则派生事实，供证据中心完整回放。
+    facts: list[FactRecord] = Field(default_factory=list)
+    # 单独记录自动取数是否成功，防止界面把演示/手工事实误标为实时数据。
+    data_acquisition: DataAcquisitionResult = Field(default_factory=DataAcquisitionResult)
     # 去重后的风险提示列表。
     risks: list[str] = Field(default_factory=list)
     # 画像与本次结论的适配摘要；不足时应说明不适配/待确认，而非给精确仓位。
@@ -357,3 +473,5 @@ class AdvicePackage(BaseModel):
     task_plan: TaskPlan
     # 各专业智能体的原始标准化结果，便于保留分歧而非强行投票。
     agent_results: list[AgentResult] = Field(default_factory=list)
+    # 单独保留一致性审查，避免把专业分歧藏进一个平均分。
+    cross_validation: CrossValidationResult = Field(default_factory=CrossValidationResult)

@@ -1,7 +1,7 @@
-"""问策智投 Streamlit MVP 前端。
+"""问策智投 Streamlit 前端。
 
 本页面刻意不承担投资判断、数据抓取或合规决策：所有业务判断都通过 FastAPI
-提交给后端。前端只负责收集用户明确输入的画像和事实快照，并把后端返回的
+提交给后端。前端负责收集用户画像和可选事实快照，并把后端自动取数后返回的
 ``AdvicePackage`` 以可追溯、可解释的方式展示出来。
 
 启动方式（先启动 backend，再在另一个终端执行）：
@@ -83,7 +83,7 @@ def demo_facts() -> list[dict[str, Any]]:
 
 
 def init_session() -> None:
-    """初始化会话状态；刷新浏览器会丢失数据，这是本地 MVP 的刻意边界。"""
+    """初始化会话状态；刷新浏览器会丢失数据，这是本地演示版的刻意边界。"""
     st.session_state.setdefault(
         "profile",
         {
@@ -105,6 +105,8 @@ def init_session() -> None:
     st.session_state.setdefault("portfolio", [])
     st.session_state.setdefault("advice", None)
     st.session_state.setdefault("last_error", None)
+    st.session_state.setdefault("conversation", [])
+    st.session_state.setdefault("questionnaire", {})
 
 
 def api_request(api_base: str, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any] | None:
@@ -115,7 +117,7 @@ def api_request(api_base: str, method: str, path: str, payload: dict[str, Any] |
     它错误当作一个空的业务响应。
     """
     try:
-        with httpx.Client(timeout=12.0) as client:
+        with httpx.Client(timeout=30.0) as client:
             response = client.request(method, f"{api_base}{path}", json=payload)
         response.raise_for_status()
         return response.json()
@@ -130,7 +132,7 @@ def api_request(api_base: str, method: str, path: str, payload: dict[str, Any] |
 def show_status(status: str) -> None:
     """以一致颜色展示后端的三态合规结果，避免把 REVIEW 误读成可执行建议。"""
     if status == "PASS":
-        st.success("PASS：已通过当前 MVP 的事实与合规闸门。")
+        st.success("PASS：已通过当前事实与合规闸门。")
     elif status == "REVIEW":
         st.warning("REVIEW：仅可作教育性说明或人工复核，不能视为投资建议。")
     else:
@@ -153,11 +155,34 @@ def render_advice(advice: dict[str, Any]) -> None:
     """渲染 AdvicePackage 的共同部分，所有页面使用同一展示规则。"""
     compliance = advice["compliance"]
     show_status(compliance["status"])
-    left, middle, right = st.columns(3)
+    left, middle, right, consensus = st.columns(4)
     left.metric("综合置信度", f"{advice['confidence']:.0%}")
     middle.metric("引用事实", len(advice.get("evidence", [])))
     right.metric("专业结果", len(advice.get("agent_results", [])))
+    cross_validation = advice.get("cross_validation", {})
+    consensus_value = cross_validation.get("consensus_score")
+    consensus.metric("协调器共识", "无" if consensus_value is None else f"{consensus_value:.1f}")
     st.caption(f"Trace ID：{advice['trace_id']}  |  快照时点：{advice.get('snapshot_time') or '无可采信快照'}")
+    acquisition = advice.get("data_acquisition", {})
+    mode = acquisition.get("mode")
+    acquisition_summary = (
+        f"自动取数：{mode or '未知'} · 实取 {acquisition.get('fetched_fact_count', 0)} 条"
+        f" · 派生 {acquisition.get('derived_fact_count', 0)} 条"
+    )
+    if mode in {"live", "mixed"}:
+        st.success(acquisition_summary)
+    elif mode == "unavailable":
+        st.warning(f"{acquisition_summary}。{acquisition.get('message') or '当前仅按已有事实安全降级。'}")
+    else:
+        st.caption(f"{acquisition_summary}。{acquisition.get('message') or ''}")
+    if acquisition.get("failed_capabilities") or acquisition.get("empty_capabilities"):
+        with st.expander("自动取数明细"):
+            if acquisition.get("successful_capabilities"):
+                st.write(f"成功：{'、'.join(acquisition['successful_capabilities'])}")
+            if acquisition.get("empty_capabilities"):
+                st.write(f"无结果：{'、'.join(acquisition['empty_capabilities'])}")
+            if acquisition.get("failed_capabilities"):
+                st.write(f"失败并安全降级：{'、'.join(acquisition['failed_capabilities'])}")
     st.subheader("综合结论")
     st.write(advice["conclusion"])
     if advice.get("user_fit"):
@@ -174,50 +199,62 @@ def render_advice(advice: dict[str, Any]) -> None:
         st.caption(f"审核说明：{compliance['reason']}")
     if compliance.get("risk_notice"):
         st.caption(compliance["risk_notice"])
+    if cross_validation.get("issues"):
+        with st.expander("跨智能体与跨来源一致性检查", expanded=True):
+            for issue in cross_validation["issues"]:
+                st.warning(f"{issue['code']}：{issue['message']}")
 
 
-def run_analysis(api_base: str, query: str) -> None:
-    """调用统一分析端点，并把最近一次成功 AdvicePackage 保存在会话中。"""
+def run_analysis(api_base: str, query: str) -> dict[str, Any] | None:
+    """携带最近多轮上下文调用统一分析端点，并更新会话历史。"""
     if not profile_ready():
         st.warning("请先到“画像中心”确认画像，再执行个性化分析。")
-        return
-    if not st.session_state.facts:
-        st.warning("当前没有授权事实。请先在“市场驾驶舱”加载或录入事实快照。")
-        return
+        return None
+    st.session_state.conversation.append({"role": "user", "content": query, "created_at": utc_now()})
     payload = {
         "query": query,
         "profile": st.session_state.profile,
         "facts": st.session_state.facts,
+        "auto_fetch": True,
         "portfolio": st.session_state.portfolio,
+        "conversation_id": "streamlit-session",
+        "context_messages": st.session_state.conversation[-20:],
     }
     with st.spinner("正在规划任务、核验事实并进行合规审核…"):
         advice = api_request(api_base, "POST", "/portfolio/analyze", payload)
     if advice:
+        for fact in advice.get("facts", []):
+            add_fact(fact)
         st.session_state.advice = advice
         st.session_state.last_error = None
+        st.session_state.conversation.append(
+            {"role": "assistant", "content": advice["conclusion"], "created_at": utc_now()}
+        )
+    return advice
 
 
 def page_home(api_base: str) -> None:
-    """首页/对话：以自然语言路由到后端，而不是在浏览器内自行识别意图。"""
+    """首页/多轮对话：展示上下文历史，并由后端统一完成意图与投研编排。"""
     st.title("问策智投")
     st.caption("投资研究辅助 · 事实快照驱动 · 不自动交易 · 不承诺收益")
-    st.info("使用流程：确认画像 → 加载或录入事实 → 提交问题 → 在协作与证据页面复核。")
-    query = st.text_area(
-        "您想研究什么？",
-        placeholder="例如：请诊断我的持仓组合；请分析新能源行业；请研究某个标的。",
-        height=100,
-    )
-    first, second = st.columns(2)
+    st.info("使用流程：确认画像 → 提交问题 → 系统自动取数并核验 → 在协作与证据页面复核。也可手工补充事实。")
+    first, second = st.columns([3, 1])
     with first:
-        if st.button("加载完整演示快照", use_container_width=True):
+        if st.button("加载完整演示快照", width="stretch"):
             st.session_state.facts = demo_facts()
             st.success("已载入标记为 DEMO_SNAPSHOT 的演示事实。")
     with second:
-        if st.button("提交分析", type="primary", use_container_width=True):
-            if not query.strip():
-                st.warning("请先输入问题。")
-            else:
-                run_analysis(api_base, query.strip())
+        if st.button("清空对话", width="stretch"):
+            st.session_state.conversation = []
+            st.session_state.advice = None
+
+    for turn in st.session_state.conversation:
+        with st.chat_message(turn["role"]):
+            st.write(turn["content"])
+    query = st.chat_input("例如：结合刚才的行业判断，再诊断我的持仓")
+    if query:
+        run_analysis(api_base, query.strip())
+        st.rerun()
     if st.session_state.advice:
         st.divider()
         render_advice(st.session_state.advice)
@@ -230,7 +267,30 @@ def page_profile(api_base: str) -> None:
     current = st.session_state.profile
     with st.form("profile_assessment"):
         user_id = st.text_input("用户标识", value=current["user_id"])
-        narrative = st.text_area("自然语言补充", placeholder="例如：我 2 年后买房，最多接受 8% 回撤。")
+        narrative = st.text_area(
+            "自然语言补充",
+            placeholder="例如：我投资 3 年，2 年后买房，最多接受 8% 回撤，期望年化收益 8%。",
+        )
+        profile_left, profile_right = st.columns(2)
+        experience_years = profile_left.number_input(
+            "投资经验（年）",
+            min_value=0.0,
+            max_value=100.0,
+            value=float(current.get("investment_experience_years") or 0),
+            step=0.5,
+        )
+        expected_return_percent = profile_right.number_input(
+            "期望年化收益（%）",
+            min_value=-100.0,
+            max_value=500.0,
+            value=float(current.get("expected_annual_return") or 0) * 100,
+            step=0.5,
+        )
+        investment_history_text = st.text_area(
+            "投资历史（每行一项）",
+            value="\n".join(current.get("investment_history", [])),
+            placeholder="例如：2024 年开始定投宽基 ETF",
+        )
         with st.expander("填写风险问卷（全部填写后才计算 R1-R5）"):
             questionnaire = {
                 "financial_capacity": st.slider("财务承受能力", 0, 100, 50),
@@ -241,11 +301,20 @@ def page_profile(api_base: str) -> None:
             }
         create_draft = st.form_submit_button("生成画像草稿", type="primary")
     if create_draft:
+        st.session_state.questionnaire = questionnaire
         result = api_request(
             api_base,
             "POST",
             "/profile/assess",
-            {"user_id": user_id, "narrative": narrative or None, "questionnaire": questionnaire},
+            {
+                "user_id": user_id,
+                "narrative": narrative or None,
+                "questionnaire": questionnaire,
+                "investment_experience_years": experience_years,
+                "investment_history": [line.strip() for line in investment_history_text.splitlines() if line.strip()],
+                "holding_history": st.session_state.portfolio,
+                "expected_annual_return": expected_return_percent / 100,
+            },
         )
         if result:
             st.session_state.profile = result["profile"]
@@ -274,22 +343,54 @@ def page_profile(api_base: str) -> None:
     status = "已确认" if profile_ready() else "未确认"
     st.subheader(f"当前画像（{status}）")
     st.json(st.session_state.profile)
+    if st.session_state.questionnaire:
+        st.subheader("风险画像维度")
+        st.bar_chart(st.session_state.questionnaire, horizontal=True)
 
 
-def page_market() -> None:
+def page_market(api_base: str) -> None:
     """市场驾驶舱同时承担本地快照管理职责，所有新增记录均显式展示来源和时点。"""
     st.title("市场驾驶舱与事实快照")
     st.caption("这里展示的是用户授权的本地事实包，不是实时行情终端。")
     top_left, top_right = st.columns(2)
     with top_left:
-        if st.button("载入完整演示快照", use_container_width=True):
+        if st.button("载入完整演示快照", width="stretch"):
             st.session_state.facts = demo_facts()
             st.success("演示事实已载入。")
     with top_right:
-        if st.button("清空事实快照", use_container_width=True):
+        if st.button("清空事实快照", width="stretch"):
             st.session_state.facts = []
             st.session_state.advice = None
             st.info("已清空；历史分析结果也已移除，避免混淆证据。")
+
+    with st.expander("从问财 SkillHub/OpenAPI 拉取真实数据"):
+        fetch_left, fetch_right = st.columns(2)
+        fetch_label = fetch_left.selectbox(
+            "数据类型",
+            ["实时行情", "财务指标", "财经新闻", "公告", "研报", "基金/ETF", "行业排名", "可转债"],
+        )
+        fetch_target = fetch_right.text_input("标的或查询条件", placeholder="例如：600519 或 新能源行业近一个月")
+        fetch_kind = {
+            "实时行情": "quote",
+            "财务指标": "financial",
+            "财经新闻": "news",
+            "公告": "announcement",
+            "研报": "research_report",
+            "基金/ETF": "fund",
+            "行业排名": "industry",
+            "可转债": "convertible",
+        }[fetch_label]
+        if st.button("拉取并加入事实包", disabled=not fetch_target.strip()):
+            fetched = api_request(
+                api_base,
+                "POST",
+                "/data/fetch",
+                {"kind": fetch_kind, "target": fetch_target.strip(), "filters": {}},
+            )
+            if fetched:
+                for fact in fetched.get("facts", []):
+                    add_fact(fact)
+                st.success(f"已从 {fetched['provider']} 加入 {len(fetched.get('facts', []))} 条事实。")
 
     with st.expander("手工录入一条 FactRecord"):
         with st.form("fact_form", clear_on_submit=True):
@@ -325,9 +426,17 @@ def page_market() -> None:
     facts = st.session_state.facts
     st.metric("当前授权事实数", len(facts))
     if facts:
-        st.dataframe(facts, use_container_width=True, hide_index=True)
+        st.dataframe(facts, width="stretch", hide_index=True)
         average_quality = sum(float(fact["quality"]) for fact in facts) / len(facts)
         st.progress(average_quality, text=f"平均证据质量：{average_quality:.0%}")
+        numeric_scores = {
+            f"{fact['entity']} · {fact['field']}": float(fact["value"])
+            for fact in facts
+            if isinstance(fact.get("value"), (int, float)) and 0 <= float(fact["value"]) <= 100
+        }
+        if numeric_scores:
+            st.subheader("可比数值快照")
+            st.bar_chart(numeric_scores, horizontal=True)
     else:
         st.info("尚无事实。可载入演示快照或手工录入。")
 
@@ -335,18 +444,27 @@ def page_market() -> None:
 def page_research(api_base: str) -> None:
     """标的/行业研究页面：复用统一接口，避免前端产生另一个未核验的分析逻辑。"""
     st.title("标的与行业研究")
-    research_type = st.radio("研究类型", ["个股研究", "行业分析", "市场解读", "基金筛选"], horizontal=True)
+    research_type = st.radio("研究类型", ["个股研究", "行业分析", "市场解读", "基金筛选", "可转债分析"], horizontal=True)
     default_query = {
         "个股研究": "请研究示例科技这只个股",
         "行业分析": "请分析新能源行业",
         "市场解读": "请分析当前市场环境",
         "基金筛选": "请筛选适合我的ETF基金",
+        "可转债分析": "请分析示例可转债的估值、正股与风险",
     }[research_type]
     query = st.text_input("问题", value=default_query)
     if st.button("开始研究", type="primary"):
         run_analysis(api_base, query)
     if st.session_state.advice:
         render_advice(st.session_state.advice)
+        score_rows = {
+            result["agent_id"]: result["score"]
+            for result in st.session_state.advice.get("agent_results", [])
+            if result.get("score") is not None
+        }
+        if score_rows:
+            st.subheader("专业智能体评分对比")
+            st.bar_chart(score_rows, horizontal=True)
         st.subheader("专业观点与分歧")
         for result in st.session_state.advice.get("agent_results", []):
             title = f"{result['agent_id']} · {STATUS_LABELS.get(result['status'], result['status'])}"
@@ -385,7 +503,7 @@ def page_portfolio(api_base: str) -> None:
             )
             st.success("持仓与对应权重事实已加入本次会话。")
     if st.session_state.portfolio:
-        st.dataframe(st.session_state.portfolio, use_container_width=True, hide_index=True)
+        st.dataframe(st.session_state.portfolio, width="stretch", hide_index=True)
         total = sum(item["weight"] for item in st.session_state.portfolio)
         st.metric("权重合计", f"{total:.0%}")
         if total > 1.05:
@@ -398,7 +516,7 @@ def page_portfolio(api_base: str) -> None:
         render_advice(st.session_state.advice)
         if st.session_state.advice.get("allocation"):
             st.subheader("组合诊断摘要")
-            st.dataframe(st.session_state.advice["allocation"], use_container_width=True, hide_index=True)
+            st.dataframe(st.session_state.advice["allocation"], width="stretch", hide_index=True)
 
 
 def page_collaboration() -> None:
@@ -424,7 +542,7 @@ def page_collaboration() -> None:
                 "状态": STATUS_LABELS.get(node["status"], node["status"]),
             }
         )
-    st.dataframe(rows, use_container_width=True, hide_index=True)
+    st.dataframe(rows, width="stretch", hide_index=True)
     st.caption("专业节点可并行；事实核验完成后才运行合规审核。状态和依赖均由后端生成。")
 
 
@@ -439,20 +557,20 @@ def page_evidence() -> None:
     used = [fact for fact in st.session_state.facts if fact["fact_id"] in used_ids]
     if used:
         st.success(f"共 {len(used)} 条事实通过核验并进入最终建议包。")
-        st.dataframe(used, use_container_width=True, hide_index=True)
+        st.dataframe(used, width="stretch", hide_index=True)
     else:
         st.warning("没有可展示的通过核验事实；请检查是否过期、来源为空或质量过低。")
     st.subheader("未进入最终证据的输入")
     not_used = [fact for fact in st.session_state.facts if fact["fact_id"] not in used_ids]
     if not_used:
-        st.dataframe(not_used, use_container_width=True, hide_index=True)
+        st.dataframe(not_used, width="stretch", hide_index=True)
         st.caption("未被引用不必然错误：可能是当前智能体不需要该字段，也可能因时效/质量被核验器降级。")
     else:
         st.caption("本次输入事实均被至少一个可用结论引用。")
 
 
 def main() -> None:
-    """配置页面、侧栏状态和七个手册要求的 MVP 页面。"""
+    """配置页面、侧栏状态和七个产品页面。"""
     st.set_page_config(page_title="问策智投", page_icon="📈", layout="wide")
     init_session()
     st.markdown(
@@ -465,12 +583,16 @@ def main() -> None:
         unsafe_allow_html=True,
     )
     with st.sidebar:
-        st.header("问策智投 MVP")
+        st.header("问策智投")
         api_base = st.text_input("后端地址", value=DEFAULT_API_BASE)
-        if st.button("检查后端连接", use_container_width=True):
+        if st.button("检查后端连接", width="stretch"):
             health = api_request(api_base, "GET", "/health")
             if health:
                 st.success("后端连接正常。")
+                readiness = api_request(api_base, "GET", "/readiness")
+                if readiness:
+                    st.caption(f"分析模式：{readiness['mode']}")
+                    st.caption(f"问财数据源：{'已配置' if readiness['iwencai_skillhub_configured'] else '未配置'}")
         st.divider()
         page = st.radio(
             "导航",
@@ -485,7 +607,7 @@ def main() -> None:
     pages = {
         "首页/对话": lambda: page_home(api_base),
         "画像中心": lambda: page_profile(api_base),
-        "市场驾驶舱": page_market,
+        "市场驾驶舱": lambda: page_market(api_base),
         "标的研究": lambda: page_research(api_base),
         "组合诊断": lambda: page_portfolio(api_base),
         "协作过程": page_collaboration,

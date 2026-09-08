@@ -61,6 +61,30 @@ def _extract_narrative(narrative: str) -> tuple[dict[str, object], list[str]]:
         patch["liquidity_need"] = "高"
         patch["target"] = "未来存在刚性大额支出"
         evidence.append("识别到刚性大额支出，草稿流动性需求设为高")
+
+    experience_match = re.search(r"(?:投资|炒股|基金投资)\s*(\d+(?:\.\d+)?)\s*年", narrative)
+    if experience_match:
+        years = float(experience_match.group(1))
+        patch["investment_experience_years"] = years
+        evidence.append(f"从“{experience_match.group(0)}”提取投资经验 {years:g} 年")
+
+    return_match = re.search(r"(?:期望|目标|希望).{0,6}(?:年化|收益率?)\s*(\d+(?:\.\d+)?)\s*%", narrative)
+    if return_match:
+        expected_return = float(return_match.group(1)) / 100
+        patch["expected_annual_return"] = expected_return
+        evidence.append(f"从“{return_match.group(0)}”提取期望年化收益 {expected_return:.1%}")
+
+    behavioral_notes: list[str] = []
+    for keyword, note in (
+        ("追涨杀跌", "自述存在追涨杀跌行为"),
+        ("频繁交易", "自述交易较频繁"),
+        ("长期持有", "自述偏好长期持有"),
+    ):
+        if keyword in narrative:
+            behavioral_notes.append(note)
+            evidence.append(f"从“{keyword}”提取行为偏好")
+    if behavioral_notes:
+        patch["behavioral_notes"] = behavioral_notes
     return patch, evidence
 
 
@@ -78,6 +102,17 @@ def assess_profile(request: ProfileAssessmentRequest) -> ProfileAssessment:
         evidence.append("已按五项问卷加权公式计算风险分")
     else:
         evidence.append("问卷维度不完整，未计算风险等级")
+    explicit_values = {
+        "investment_experience_years": request.investment_experience_years,
+        "investment_history": request.investment_history,
+        "holding_history": request.holding_history,
+        "expected_annual_return": request.expected_annual_return,
+    }
+    for field, value in explicit_values.items():
+        if value not in (None, [], {}):
+            narrative_patch[field] = value
+            evidence.append(f"已记录用户明确提交的 {field}")
+
     profile = UserProfile(
         user_id=request.user_id,
         risk_score=score,
@@ -86,7 +121,13 @@ def assess_profile(request: ProfileAssessmentRequest) -> ProfileAssessment:
         **narrative_patch,
     )
     # 手册要求：期限、回撤、流动性等关键字段必须确认。缺失时给予明确下一步。
-    for field in ("horizon_months", "max_drawdown", "liquidity_need"):
+    for field in (
+        "horizon_months",
+        "max_drawdown",
+        "liquidity_need",
+        "investment_experience_years",
+        "expected_annual_return",
+    ):
         if getattr(profile, field) is None:
             missing.append(field)
     return ProfileAssessment(profile=profile, missing_fields=sorted(set(missing)), evidence=evidence)

@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import re
 from collections.abc import Awaitable, Callable
+import json
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -22,6 +23,8 @@ from backend.app.models import (
     AgentResult,
     ComplianceResult,
     ComplianceStatus,
+    CrossValidationIssue,
+    CrossValidationResult,
     FactRecord,
     Intent,
     OrchestrationRequest,
@@ -77,6 +80,7 @@ class CoordinatorAgent:
         # 生产版可以替换为 JSON Schema 受约束的 LLM 分类器，但必须保留 UNKNOWN。
         rules = (
             (Intent.PORTFOLIO_REVIEW, ("组合", "持仓", "仓位", "调仓", "回撤")),
+            (Intent.CONVERTIBLE_BOND_ANALYSIS, ("可转债", "转债", "转股溢价", "纯债溢价")),
             (Intent.FUND_SCREENING, ("基金", "etf", "指数基金")),
             (Intent.SECURITY_RESEARCH, ("股票", "个股", "证券", "公司")),
             (Intent.INDUSTRY_ANALYSIS, ("行业比较", "行业分析", "赛道")),
@@ -182,7 +186,16 @@ class CoordinatorAgent:
         # 合规器使用核验后的结果作最终判定，保证无来源结论无法被放行。
         compliance_node = next(node for node in plan.nodes if node.agent_id == "compliance")
         compliance_node.status = TaskStatus.RUNNING
+        cross_validation = cross_validate_results(results, request.facts)
         compliance = await self.compliance_checker(request, results)
+        if cross_validation.status is ComplianceStatus.REVIEW and compliance.status is ComplianceStatus.PASS:
+            compliance = compliance.model_copy(
+                update={
+                    "status": ComplianceStatus.REVIEW,
+                    "matched_rules": [*compliance.matched_rules, "CROSS_AGENT_INCONSISTENCY"],
+                    "reason": "跨智能体或跨来源一致性检查发现分歧，需要人工复核。",
+                }
+            )
         compliance_node.status = TaskStatus.COMPLETED
 
         if compliance.status is ComplianceStatus.BLOCK:
@@ -198,6 +211,7 @@ class CoordinatorAgent:
                 compliance=compliance,
                 task_plan=plan,
                 agent_results=results,
+                cross_validation=cross_validation,
             )
 
         # 失败节点不参与置信度平均；降级节点会保留，但其低置信度会拉低总分。
@@ -209,10 +223,10 @@ class CoordinatorAgent:
         confidence = sum(result.confidence for result in usable) / len(usable) if usable else 0
         # 永远显式返回数据时点，前端不得把它改写为含糊的“当前”。
         snapshot_time = max((fact.snapshot_time for fact in request.facts), default=None)
-        conclusion = self._summarize(usable, compliance.status)
+        conclusion = self._summarize(usable, compliance.status, cross_validation)
         # 只有画像已确认时才会走到此处；仍只输出目标区间/诊断而非自动交易指令。
         user_fit = self._user_fit_summary(request)
-        allocation = self._allocation_summary(usable)
+        allocation = self._allocation_summary(usable, request)
         next_steps = self._next_steps(results, compliance.status)
         return AdvicePackage(
             trace_id=trace_id,
@@ -228,6 +242,7 @@ class CoordinatorAgent:
             compliance=compliance,
             task_plan=plan,
             agent_results=results,
+            cross_validation=cross_validation,
         )
 
     async def _run_parallel(
@@ -280,6 +295,7 @@ class CoordinatorAgent:
             Intent.INDUSTRY_ANALYSIS: ("market", "industry"),
             Intent.SECURITY_RESEARCH: ("market", "industry", "security"),
             Intent.FUND_SCREENING: ("market", "fund"),
+            Intent.CONVERTIBLE_BOND_ANALYSIS: ("market", "industry", "security"),
             Intent.PORTFOLIO_REVIEW: ("market", "industry", "security", "fund", "portfolio"),
             # 教育类问题没有充分画像/事实时不应伪装成专业研究，直接进入 REVIEW。
             Intent.EDUCATION: (),
@@ -304,7 +320,11 @@ class CoordinatorAgent:
         )
 
     @staticmethod
-    def _summarize(results: list[AgentResult], status: ComplianceStatus) -> str:
+    def _summarize(
+        results: list[AgentResult],
+        status: ComplianceStatus,
+        cross_validation: CrossValidationResult,
+    ) -> str:
         """在不篡改专业分歧的前提下，生成最小可读的聚合结论。
 
         此处故意不做投票或“取平均意见”：基本面偏正面、技术面过热等冲突应作为
@@ -317,7 +337,12 @@ class CoordinatorAgent:
         opinions = "；".join(f"{result.agent_id}：{result.opinion}" for result in results)
         # REVIEW 的内容只能被界面标记为需人工复核/教育性说明。
         prefix = "需人工复核。" if status is ComplianceStatus.REVIEW else "分析结果："
-        return f"{prefix}{opinions}"
+        consensus = (
+            f"协调器置信加权共识分为 {cross_validation.consensus_score:.1f}。"
+            if cross_validation.consensus_score is not None
+            else ""
+        )
+        return f"{prefix}{consensus}{opinions}"
 
     @staticmethod
     def _user_fit_summary(request: OrchestrationRequest) -> str:
@@ -330,19 +355,41 @@ class CoordinatorAgent:
             parts.append(f"最大回撤 {profile.max_drawdown:.0%}")
         if profile.liquidity_need:
             parts.append(f"流动性需求 {profile.liquidity_need}")
+        if profile.investment_experience_years is not None:
+            parts.append(f"投资经验 {profile.investment_experience_years:g} 年")
+        if profile.expected_annual_return is not None:
+            parts.append(f"期望年化收益 {profile.expected_annual_return:.1%}")
         return "；".join(parts)
 
     @staticmethod
-    def _allocation_summary(results: list[AgentResult]) -> list[dict[str, object]]:
-        """提取组合 Agent 的目标区间提示；没有组合事实时返回空而非编造权重。"""
+    def _allocation_summary(
+        results: list[AgentResult], request: OrchestrationRequest
+    ) -> list[dict[str, object]]:
+        """按已确认风险等级输出资产类别区间，不生成具体交易指令。"""
+
+        ranges = {
+            "R1": ((0, 20), (60, 90), (10, 30)),
+            "R2": ((20, 40), (40, 70), (10, 25)),
+            "R3": ((40, 60), (25, 50), (5, 20)),
+            "R4": ((60, 80), (10, 30), (5, 15)),
+            "R5": ((75, 95), (0, 20), (0, 10)),
+        }
         for result in results:
             if result.agent_id == "portfolio" and result.details:
-                return [{
-                    "type": "portfolio_diagnosis",
-                    "target_range": result.details.get("target_range_note"),
-                    "largest_position": result.details.get("largest_position"),
-                    "rebalancing": "仅作分批调整与复核提示，不自动下单",
-                }]
+                profile_ranges = ranges.get(request.profile.risk_level or "", ranges["R3"])
+                return [
+                    {
+                        "asset_class": name,
+                        "min_weight": lower / 100,
+                        "max_weight": upper / 100,
+                        "basis": f"已确认画像 {request.profile.risk_level or '未量化'}；仅作目标区间",
+                    }
+                    for name, (lower, upper) in zip(
+                        ("权益类", "固收类", "现金及低波动类"),
+                        profile_ranges,
+                        strict=True,
+                    )
+                ]
         return []
 
     @staticmethod
@@ -358,25 +405,139 @@ class CoordinatorAgent:
         return steps or ["关注证据时点与证伪条件，定期复核"]
 
 
+FAST_MARKET_FIELDS = {
+    "close_price",
+    "change",
+    "volume",
+    "turnover_rate",
+    "volatility",
+}
+NEWS_FIELDS = {"news", "announcement", "research_report"}
+SCORE_FIELDS = {
+    "growth_score",
+    "inflation_score",
+    "liquidity_score",
+    "policy_score",
+    "risk_appetite_score",
+    "prosperity_score",
+    "valuation_score",
+    "capital_flow_score",
+    "crowding_score",
+    "fundamental_score",
+    "technical_score",
+    "event_score",
+    "governance_score",
+    "fund_score",
+}
+SLOW_FINANCIAL_FIELDS = {"pe_ttm", "pb", "roe", "revenue_growth", "fee_rate", "tracking_error"}
+PORTFOLIO_FIELDS = {"weight", "portfolio_weight", "sector_weight", "fund_risk_level"}
+
+
+def fact_max_age_seconds(fact: FactRecord) -> int:
+    """按数据类型返回可接受最大年龄，避免用统一 7 天阈值处理行情和财报。"""
+
+    field = fact.field.casefold()
+    if field in FAST_MARKET_FIELDS:
+        return 60
+    if field in NEWS_FIELDS:
+        return 300
+    if field in SCORE_FIELDS:
+        return 900
+    if field in PORTFOLIO_FIELDS:
+        return 86_400
+    if field in SLOW_FINANCIAL_FIELDS:
+        return 90 * 86_400
+    return 7 * 86_400
+
+
+def cross_validate_results(results: list[AgentResult], facts: list[FactRecord]) -> CrossValidationResult:
+    """检查跨来源事实冲突和跨 Agent 评分分歧，并生成置信加权共识。"""
+
+    issues: list[CrossValidationIssue] = []
+    grouped: dict[tuple[str, str, str | None], list[FactRecord]] = {}
+    for fact in facts:
+        grouped.setdefault((fact.entity, fact.field.casefold(), fact.period), []).append(fact)
+    for records in grouped.values():
+        if len({json.dumps(record.value, ensure_ascii=False, sort_keys=True, default=str) for record in records}) > 1:
+            issues.append(
+                CrossValidationIssue(
+                    code="SOURCE_VALUE_CONFLICT",
+                    severity="warning",
+                    message=f"{records[0].entity} 的 {records[0].field} 存在跨来源取值冲突。",
+                    fact_ids=[record.fact_id for record in records],
+                )
+            )
+
+    scored = [result for result in results if result.score is not None and result.confidence > 0]
+    total_weight = sum(result.confidence for result in scored)
+    consensus_score = (
+        sum(float(result.score) * result.confidence for result in scored) / total_weight
+        if total_weight
+        else None
+    )
+    dissenting: list[str] = []
+    supporting: list[str] = []
+    if consensus_score is not None:
+        for result in scored:
+            if abs(float(result.score) - consensus_score) >= 25:
+                dissenting.append(result.agent_id)
+            else:
+                supporting.append(result.agent_id)
+    if len(scored) >= 3 and max(float(result.score) for result in scored) - min(float(result.score) for result in scored) >= 35:
+        issues.append(
+            CrossValidationIssue(
+                code="AGENT_SCORE_DISPERSION",
+                severity="warning",
+                message="专业智能体评分分散度较高，协调器保留分歧并要求人工复核。",
+                agent_ids=[result.agent_id for result in scored],
+            )
+        )
+    for result in results:
+        if result.status is TaskStatus.COMPLETED and not result.facts_used:
+            issues.append(
+                CrossValidationIssue(
+                    code="COMPLETED_WITHOUT_EVIDENCE",
+                    severity="critical",
+                    message=f"{result.agent_id} 声称完成但没有通过核验的事实引用。",
+                    agent_ids=[result.agent_id],
+                )
+            )
+    status = ComplianceStatus.REVIEW if any(issue.severity in {"warning", "critical"} for issue in issues) else ComplianceStatus.PASS
+    confidence = sum(result.confidence for result in scored) / len(scored) if scored else 0
+    return CrossValidationResult(
+        status=status,
+        consensus_score=round(consensus_score, 2) if consensus_score is not None else None,
+        confidence=round(confidence, 2),
+        issues=issues,
+        supporting_agents=supporting,
+        dissenting_agents=dissenting,
+    )
+
+
 async def verify_facts(
-    results: list[AgentResult], facts: list[FactRecord]
+    results: list[AgentResult],
+    facts: list[FactRecord],
+    *,
+    now: datetime | None = None,
 ) -> list[AgentResult]:
     """最小事实核验器：剔除无来源或过期事实，并降低结果置信度。
 
     这是可运行的基础实现，并不替代生产级实体消歧、报表口径核验、指标重算和
     双源交叉验证。它先确保每一个 ``facts_used`` 都能在本次授权事实中找到，
-    再以 7 天作为演示期的通用时效阈值。
+    再按行情、新闻、评分、持仓与财务字段应用不同的时效阈值。
     """
     # 先建立存在性集合，以 O(1) 复杂度发现智能体引用了不存在的事实 ID。
     known_fact_ids = {fact.fact_id for fact in facts}
     # 全部使用带时区的 UTC，避免本地时区与数据源时区混用造成错误过期判断。
-    now = datetime.now(timezone.utc)
+    current_time = now or datetime.now(timezone.utc)
     # 只有来源明确且未过期的事实才可继续支撑最终结论。
     valid_fact_ids = {
         fact.fact_id
         for fact in facts
-        # 质量低于 0.4 的记录按手册只能作为待核验线索，不能支撑最终结论。
-        if fact.snapshot_time >= now - timedelta(days=7) and fact.quality >= 0.4 and fact.source_id.strip()
+        # 未来时间超过 5 分钟也视为异常，防止错误时钟让陈旧数据永久有效。
+        if current_time - timedelta(seconds=fact_max_age_seconds(fact)) <= fact.snapshot_time <= current_time + timedelta(minutes=5)
+        and fact.quality >= 0.4
+        and fact.source_id.strip()
     }
     verified: list[AgentResult] = []
     for result in results:
@@ -442,6 +603,20 @@ async def basic_compliance_check(
             status=ComplianceStatus.BLOCK,
             matched_rules=["SUITABILITY_R1_HIGH_RISK"],
             reason="低风险用户不能获得满仓高风险标的建议。",
+            risk_notice=RISK_NOTICE,
+            required_disclosures=disclosures,
+        )
+    # 目标收益与最大回撤明显不匹配时先教育和复核，不据此反推更高风险仓位。
+    if (
+        request.profile.expected_annual_return is not None
+        and request.profile.max_drawdown is not None
+        and request.profile.expected_annual_return >= 0.15
+        and request.profile.max_drawdown <= 0.08
+    ):
+        return ComplianceResult(
+            status=ComplianceStatus.REVIEW,
+            matched_rules=["RETURN_DRAWDOWN_MISMATCH"],
+            reason="期望收益与最大可接受回撤存在明显张力，请先重新确认目标和风险边界。",
             risk_notice=RISK_NOTICE,
             required_disclosures=disclosures,
         )
