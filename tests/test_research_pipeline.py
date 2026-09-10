@@ -18,10 +18,10 @@ class FakeIwencaiProvider:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    def _fact(self, suffix: str, field: str, value: object) -> FactRecord:
+    def _fact(self, suffix: str, field: str, value: object, *, entity: str = "示例科技") -> FactRecord:
         return FactRecord(
             fact_id=f"LIVE-{suffix}",
-            entity="示例科技",
+            entity=entity,
             field=field,
             value=value,
             snapshot_time=datetime.now(timezone.utc),
@@ -54,6 +54,26 @@ class FakeIwencaiProvider:
         self.calls.append("institutional_research")
         return [self._fact("RATING", "rating", "增持")]
 
+    async def get_macro_data(self, target: str) -> list[FactRecord]:
+        # 个股研究也计划 market 节点，因此这里必须提供完整五个宏观维度。
+        # 实体名与个股不同，避免把宏观分项误当成个股事实。
+        self.calls.append("macro")
+        return [
+            self._fact(f"MACRO-{field}", field, 55, entity="A股市场")
+            for field in ("growth_score", "inflation_score", "liquidity_score",
+                          "policy_score", "risk_appetite_score")
+        ]
+
+    async def get_industry_rank(self, target: str) -> list[FactRecord]:
+        # 同理，industry 节点需要完整五个行业维度；行业估值分与个股估值分
+        # 必须是不同实体，否则 industry 的分项会被当成个股估值。
+        self.calls.append("industry")
+        return [
+            self._fact(f"IND-{field}", field, 58, entity="示例行业")
+            for field in ("prosperity_score", "valuation_score", "capital_flow_score",
+                          "crowding_score", "policy_score")
+        ]
+
 
 def request_for_security(*, auto_fetch: bool = True) -> OrchestrationRequest:
     return OrchestrationRequest(
@@ -73,14 +93,19 @@ def test_pipeline_routes_live_data_and_preserves_derivation_lineage() -> None:
 
     assert audit.mode == "live"
     assert audit.provider == provider.source_id
-    assert set(provider.calls) == {"quote", "financial", "event", "institutional_research"}
-    assert audit.fetched_fact_count == 8
+    # 个股研究同时计划 market/industry/security，取数必须覆盖这三个节点的输入维度。
+    assert set(provider.calls) == {
+        "macro", "industry", "quote", "financial", "event", "institutional_research",
+    }
+    assert audit.fetched_fact_count == 18
     derived = [fact for fact in prepared.facts if fact.source_id == "DERIVED_RULE_V1"]
     assert {fact.field for fact in derived} == {
         "fundamental_score",
         "valuation_score",
         "technical_score",
     }
+    # 派生只作用于被研究的个股实体，不得把宏观/行业快照也算成它的派生结果。
+    assert {fact.entity for fact in derived} == {"示例科技"}
     assert all(fact.derived_from for fact in derived)
     assert all(parent.startswith("LIVE-") for fact in derived for parent in fact.derived_from)
 
@@ -137,7 +162,7 @@ def test_analyze_endpoint_returns_fetched_and_derived_facts(monkeypatch) -> None
     assert response.status_code == 200
     body = response.json()
     assert body["data_acquisition"]["mode"] == "live"
-    assert body["data_acquisition"]["fetched_fact_count"] == 8
+    assert body["data_acquisition"]["fetched_fact_count"] == 18
     assert any(fact["source_id"] == "IWENCAI_TEST" for fact in body["facts"])
     assert any(fact["source_id"] == "DERIVED_RULE_V1" for fact in body["facts"])
     assert set(body["evidence"]).issubset({fact["fact_id"] for fact in body["facts"]})

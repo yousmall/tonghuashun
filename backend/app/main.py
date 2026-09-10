@@ -11,11 +11,14 @@
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager
+from contextlib import suppress
 from datetime import datetime, timezone
 from time import perf_counter
 
-from fastapi import FastAPI, HTTPException
-from fastapi import Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Request, Response
 from dotenv import load_dotenv
 
 from backend.app.agents.coordinator import (
@@ -23,23 +26,69 @@ from backend.app.agents.coordinator import (
     basic_compliance_check,
     verify_facts,
 )
-from backend.app.agents.llm_agents import make_investment_agents
+from backend.app.agents.llm_agents import LLMConfig, OpenAICompatibleLLM, make_investment_agents
+from backend.app.semantic import SemanticService
 from backend.app.data_provider import IwencaiSkillHubProvider
+from backend.app.auth import TokenError, create_access_token, decode_access_token, hash_password, verify_password
+from backend.app.database import Database, DatabaseUnavailable, UsernameExists
 from backend.app.models import (
     AdvicePackage,
+    AuthResponse,
+    ConversationDetail,
+    ConversationSummary,
+    Credentials,
     DataFetchRequest,
     DataFetchResponse,
+    Intent,
     OrchestrationRequest,
     ProfileAssessment,
     ProfileAssessmentRequest,
     ProfileConfirmRequest,
     UserProfile,
+    UserSummary,
 )
-from backend.app.services import AutomatedResearchPipeline, ServiceMetrics, assess_profile, confirm_profile
+from backend.app.services import (
+    AutomatedResearchPipeline,
+    ServiceMetrics,
+    assess_profile,
+    confirm_profile,
+    summarise_advice,
+    used_fact_ids_of,
+)
+from backend.app.session_pool import (
+    SessionCapacityExceeded,
+    SessionLeaseExpired,
+    SessionThreadPool,
+)
 
 
 # 从本地 .env 加载可选外部服务配置；生产环境中已有的环境变量优先。
 load_dotenv()
+database = Database.from_env()
+session_thread_pool = SessionThreadPool.from_env()
+
+
+async def reap_idle_sessions() -> None:
+    """定期回收超过空闲时限且没有在途请求的登录会话。"""
+
+    interval = min(30.0, max(1.0, session_thread_pool.idle_timeout_seconds / 2))
+    while True:
+        await asyncio.sleep(interval)
+        session_thread_pool.reap_expired()
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """准备数据表并启动空闲会话清理任务。"""
+
+    database.initialize()
+    reaper = asyncio.create_task(reap_idle_sessions())
+    try:
+        yield
+    finally:
+        reaper.cancel()
+        with suppress(asyncio.CancelledError):
+            await reaper
 
 
 def build_coordinator() -> tuple[CoordinatorAgent, bool]:
@@ -52,12 +101,15 @@ def build_coordinator() -> tuple[CoordinatorAgent, bool]:
 
     # ``make_rule_agents`` 返回与 Task DAG 完全一致的五个注册键。它们不是行情源，
     # 只对请求已经授权的 FactRecord 做确定性计算，便于单测和审计回放。
-    agents, llm_enabled = make_investment_agents()
+    config = LLMConfig.from_env()
+    client = OpenAICompatibleLLM(config) if config else None
+    agents, llm_enabled = make_investment_agents(client)
     coordinator = CoordinatorAgent(
         agents=agents,
         # 事实核验先于合规审核执行，二者都可在后续替换为正式服务实现。
         verifier=verify_facts,
         compliance_checker=basic_compliance_check,
+        semantic=SemanticService(client),
     )
     return coordinator, llm_enabled
 
@@ -67,6 +119,7 @@ app = FastAPI(
     title="问策智投 API",
     version="1.0.0",
     description="投资研究辅助演示接口；不自动交易，不构成证券投资建议。",
+    lifespan=lifespan,
 )
 
 # 应用级单例。后续接数据库/Redis 时可改为 lifespan 管理。
@@ -74,6 +127,79 @@ coordinator, llm_enabled = build_coordinator()
 data_provider = IwencaiSkillHubProvider.from_env()
 research_pipeline = AutomatedResearchPipeline(data_provider)
 service_metrics = ServiceMetrics()
+
+
+def _decode_session_token(token: str) -> dict[str, object]:
+    """校验登录令牌，并返回其中的用户与会话标识。"""
+
+    database.require_ready()
+    assert database.auth_secret is not None
+    return decode_access_token(token, database.auth_secret)
+
+
+async def optional_authenticated_user(authorization: str | None = Header(default=None)):
+    """解析可选令牌并在请求期间固定对应租约。"""
+
+    if not authorization:
+        yield None
+        return
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="请使用 Bearer 登录令牌")
+    session_id: str | None = None
+    try:
+        payload = _decode_session_token(authorization.split(" ", 1)[1].strip())
+        session_id = str(payload["sid"])
+        leased_user_id = session_thread_pool.acquire(session_id)
+        if leased_user_id != int(payload["sub"]):
+            raise TokenError("登录状态无效")
+        future = session_thread_pool.submit(session_id, database.get_user, int(payload["sub"]))
+        user = await asyncio.wrap_future(future)
+        if not user:
+            raise TokenError("登录账号不存在")
+        user["_session_id"] = session_id
+        yield user
+    except DatabaseUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except (TokenError, SessionLeaseExpired) as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    finally:
+        if session_id is not None:
+            session_thread_pool.finish(session_id)
+
+
+def authenticated_user(
+    user: dict[str, object] | None = Depends(optional_authenticated_user),
+) -> dict[str, object]:
+    if not user:
+        raise HTTPException(status_code=401, detail="请先登录")
+    return user
+
+
+def auth_response_for(user: dict[str, object]) -> AuthResponse:
+    """分配会话槽并签发与该槽绑定的登录令牌。"""
+
+    database.require_ready()
+    assert database.auth_secret is not None
+    try:
+        session_id, beacon_token = session_thread_pool.allocate(int(user["id"]))
+    except SessionCapacityExceeded as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    try:
+        token, expires_at = create_access_token(
+            int(user["id"]),
+            str(user["username"]),
+            database.auth_secret,
+            session_id=session_id,
+        )
+        return AuthResponse(
+            access_token=token,
+            session_beacon_token=beacon_token,
+            expires_at=expires_at,
+            user=UserSummary.model_validate(user),
+        )
+    except Exception:
+        session_thread_pool.release(session_id, user_id=int(user["id"]))
+        raise
 
 
 @app.middleware("http")
@@ -99,22 +225,127 @@ async def health() -> dict[str, str]:
 
 @app.get("/api/v1/readiness", tags=["system"])
 async def readiness() -> dict[str, object]:
-    """报告可选外部能力是否就绪；缺失时基础规则模式仍保持可用。"""
+    """报告外部能力配置；未配置 LLM 时自然语言处理降级为澄清。"""
 
     return {
         "status": "ready",
         "mode": "hybrid_llm" if llm_enabled else "rule_only",
         "third_party_llm_configured": llm_enabled,
+        "language_processing": "llm" if llm_enabled else "unavailable",
         "iwencai_skillhub_configured": data_provider is not None,
         "automatic_data_pipeline_enabled": True,
+        "mysql_configured": database.configured,
+        "mysql_ready": database.configured and database.initialization_error is None,
+        "session_thread_pool": session_thread_pool.snapshot(),
     }
+
+
+@app.post("/api/v1/auth/register", response_model=AuthResponse, tags=["auth"])
+def register(credentials: Credentials) -> AuthResponse:
+    """创建账号并直接返回登录令牌；密码只以 scrypt 哈希形式进入 MySQL。"""
+
+    try:
+        user = database.create_user(credentials.username, hash_password(credentials.password))
+        return auth_response_for(user)
+    except UsernameExists as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except DatabaseUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/auth/login", response_model=AuthResponse, tags=["auth"])
+def login(credentials: Credentials) -> AuthResponse:
+    """验证账号密码并签发有过期时间、不可篡改的登录令牌。"""
+
+    try:
+        user = database.get_user_by_username(credentials.username)
+    except DatabaseUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if not user or not verify_password(credentials.password, str(user["password_hash"])):
+        raise HTTPException(status_code=401, detail="账号或密码错误")
+    user.pop("password_hash", None)
+    return auth_response_for(user)
+
+
+@app.get("/api/v1/auth/me", response_model=UserSummary, tags=["auth"])
+def current_user(user: dict[str, object] = Depends(authenticated_user)) -> UserSummary:
+    return UserSummary.model_validate(user)
+
+
+@app.get("/api/v1/auth/session/status", tags=["auth"])
+def session_status(authorization: str | None = Header(default=None)) -> dict[str, bool]:
+    """检查会话是否仍有效，但不把轮询本身算作用户活动。"""
+
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="请先登录")
+    try:
+        payload = _decode_session_token(authorization.split(" ", 1)[1].strip())
+    except DatabaseUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except TokenError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    if not session_thread_pool.is_active(str(payload["sid"]), user_id=int(payload["sub"])):
+        raise HTTPException(status_code=401, detail="登录已失效或闲置超过 10 分钟，请重新登录")
+    return {"active": True}
+
+
+@app.post("/api/v1/auth/logout", tags=["auth"])
+def logout(user: dict[str, object] = Depends(authenticated_user)) -> dict[str, str]:
+    """显式退出并立即释放当前登录占用的会话槽。"""
+
+    session_thread_pool.release(str(user["_session_id"]), user_id=int(user["id"]))
+    return {"status": "logged_out"}
+
+
+async def _beacon_token(request: Request) -> str | None:
+    """读取浏览器发送的最小权限会话回收凭据。"""
+
+    body = await request.body()
+    if not body or len(body) > 4096:
+        return None
+    try:
+        return body.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return None
+
+
+@app.post("/api/v1/auth/logout/beacon", status_code=204, tags=["auth"])
+async def session_logout_beacon(request: Request) -> Response:
+    """在浏览器页面关闭时以幂等方式释放会话槽。"""
+
+    beacon_token = await _beacon_token(request)
+    if beacon_token is not None:
+        session_thread_pool.release_beacon(beacon_token)
+    return Response(status_code=204)
+
+
+@app.get("/api/v1/history", response_model=list[ConversationSummary], tags=["history"])
+def list_history(
+    limit: int = Query(default=50, ge=1, le=100),
+    user: dict[str, object] = Depends(authenticated_user),
+) -> list[ConversationSummary]:
+    return [ConversationSummary.model_validate(row) for row in database.list_conversations(int(user["id"]), limit)]
+
+
+@app.get("/api/v1/history/{conversation_id}", response_model=ConversationDetail, tags=["history"])
+def history_detail(
+    conversation_id: str,
+    user: dict[str, object] = Depends(authenticated_user),
+) -> ConversationDetail:
+    result = database.get_conversation(int(user["id"]), conversation_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="对话记录不存在")
+    return ConversationDetail.model_validate(result)
 
 
 @app.get("/api/v1/metrics", tags=["system"])
 async def metrics() -> dict[str, object]:
     """返回容量与可用性观测值；其范围不冒充生产 SLA。"""
 
-    return service_metrics.snapshot()
+    return {
+        **service_metrics.snapshot(),
+        "session_thread_pool": session_thread_pool.snapshot(),
+    }
 
 
 @app.post("/api/v1/data/fetch", response_model=DataFetchResponse, tags=["data"])
@@ -160,18 +391,53 @@ async def assess_user_profile(request: ProfileAssessmentRequest) -> ProfileAsses
     前端应展示提取证据和缺失字段，请用户在下一步核对并确认。
     """
 
-    return assess_profile(request)
+    return await assess_profile(request, coordinator.semantic)
 
 
 @app.post("/api/v1/profile/confirm", response_model=UserProfile, tags=["profile"])
-async def confirm_user_profile(request: ProfileConfirmRequest) -> UserProfile:
-    """显式确认画像并递增版本号。
+async def confirm_user_profile(
+    request: ProfileConfirmRequest,
+    user: dict[str, object] | None = Depends(optional_authenticated_user),
+) -> UserProfile:
+    """显式确认画像、递增版本号并按账号持久化。
 
-    当前演示不持久化数据；生产环境必须在鉴权后的事务内比对上一版本，防止
-    并发覆盖。即使调用方传入 ``confirmed=True``，版本仍会递增以留下审计边界。
+    已登录用户的画像写入 MySQL，因此退出登录或换浏览器后再次登录可以直接恢复，
+    不必重新填写问卷；版本号用于留下审计边界。
     """
 
-    return confirm_profile(request.profile)
+    if user is not None:
+        # 画像归属以鉴权上下文为准，不接受前端声明的 user_id。
+        request = request.model_copy(
+            update={"profile": request.profile.model_copy(update={"user_id": str(user["id"])})}
+        )
+    confirmed = confirm_profile(request.profile)
+    if user is not None:
+        future = session_thread_pool.submit(
+            str(user["_session_id"]),
+            database.save_profile,
+            int(user["id"]),
+            confirmed.model_dump(mode="json"),
+            confirmed.version,
+        )
+        await asyncio.wrap_future(future)
+    return confirmed
+
+
+@app.get("/api/v1/profile", response_model=ProfileAssessment, tags=["profile"])
+def read_user_profile(user: dict[str, object] = Depends(authenticated_user)) -> ProfileAssessment:
+    """读取当前账号已确认的画像；没有保存过时返回未确认的默认画像。"""
+
+    try:
+        stored = database.get_profile(int(user["id"]))
+    except DatabaseUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if not stored:
+        return ProfileAssessment(profile=UserProfile(user_id=str(user["id"])), evidence=[])
+    profile = UserProfile.model_validate({**stored["payload"], "user_id": str(user["id"])})
+    return ProfileAssessment(
+        profile=profile,
+        evidence=["已从上次保存的投资偏好恢复，如情况有变化请重新评估。"],
+    )
 
 
 @app.post(
@@ -179,7 +445,10 @@ async def confirm_user_profile(request: ProfileConfirmRequest) -> UserProfile:
     response_model=AdvicePackage,
     tags=["advice"],
 )
-async def analyze_portfolio(request: OrchestrationRequest) -> AdvicePackage:
+async def analyze_portfolio(
+    request: OrchestrationRequest,
+    user: dict[str, object] | None = Depends(optional_authenticated_user),
+) -> AdvicePackage:
     """运行组合诊断闭环并返回可审计建议包。
 
     FastAPI 会在进入本函数前验证 ``query``、画像和事实记录的类型及边界。协调器
@@ -188,15 +457,54 @@ async def analyze_portfolio(request: OrchestrationRequest) -> AdvicePackage:
     """
 
     try:
-        intent = coordinator.understand_intent(request.query)
-        prepared_request, acquisition = await research_pipeline.prepare(request, intent)
-        advice = await coordinator.run(prepared_request)
-        return advice.model_copy(
+        if user:
+            request = request.model_copy(
+                update={"profile": request.profile.model_copy(update={"user_id": str(user["id"])})}
+            )
+        understanding = await coordinator.understand_request(request)
+        # 请求风险和意图在一次模型调用中完成，风险请求不访问外部数据服务。
+        fetch_intent = Intent.UNKNOWN if understanding.risk_rules else understanding.intent
+        prepared_request, acquisition = await research_pipeline.prepare(request, fetch_intent)
+        advice = await coordinator.run(prepared_request, understanding=understanding)
+        # 记录送入模型的事实规模，避免"取数成功但研判降级"对用户不可解释。
+        model_slice = coordinator.last_model_slice or {}
+        acquisition = acquisition.model_copy(
+            update={
+                "model_fact_count": int(model_slice.get("selected") or 0),
+                "model_fact_available": int(model_slice.get("available") or 0),
+                "facts_truncated": bool(model_slice.get("truncated")),
+            }
+        )
+        if llm_enabled and advice.agent_results and not any(
+            (result.details or {}).get("engine") == "third_party_llm" for result in advice.agent_results
+        ):
+            acquisition = acquisition.model_copy(update={"reason_code": "MODEL_UNAVAILABLE"})
+        completed_advice = advice.model_copy(
             update={
                 "facts": prepared_request.facts,
                 "data_acquisition": acquisition,
             }
         )
+        if user:
+            # 历史记录只保留展示所需的轻量摘要：完整证据包可达数 MB，会撑大
+            # messages 行宽并让列表/详情查询触发数据库排序内存告警。
+            future = session_thread_pool.submit(
+                str(user["_session_id"]),
+                database.save_exchange,
+                int(user["id"]),
+                request.conversation_id,
+                request.query,
+                request.model_dump(mode="json"),
+                completed_advice.conclusion,
+                summarise_advice(
+                    completed_advice.model_dump(mode="json"),
+                    used_fact_ids_of(completed_advice.model_dump(mode="json")),
+                ),
+            )
+            await asyncio.wrap_future(future)
+        return completed_advice
+    except DatabaseUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
         # 不暴露异常细节（可能包含数据源地址或内部实现），同时保留服务端日志入口。
         # 当前本地版未配置日志器；正式环境应记录 trace_id、异常类型与脱敏上下文。

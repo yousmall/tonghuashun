@@ -22,6 +22,14 @@ from .schemas import (
     VerificationResult,
     VerificationStatus,
 )
+from .auth_schemas import (
+    AuthResponse,
+    ConversationDetail,
+    ConversationSummary,
+    Credentials,
+    HistoryMessage,
+    UserSummary,
+)
 
 __all__ = [
     "AdvicePackage",
@@ -46,4 +54,10 @@ __all__ = [
     "UserProfile",
     "VerificationResult",
     "VerificationStatus",
+    "AuthResponse",
+    "ConversationDetail",
+    "ConversationSummary",
+    "Credentials",
+    "HistoryMessage",
+    "UserSummary",
 ]

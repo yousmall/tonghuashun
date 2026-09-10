@@ -1,0 +1,4 @@
+interface:
+  display_name: "问财金融研究"
+  short_description: "调用项目的只读问财能力完成筛选、诊断与证据检索"
+  default_prompt: "Use $iwencai-financial-research to gather current, source-attributed evidence for this Chinese-market research question."

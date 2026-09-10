@@ -12,11 +12,16 @@
 from __future__ import annotations
 
 import asyncio
-import re
 from collections.abc import Awaitable, Callable
 import json
+import re
 from datetime import datetime, timedelta, timezone
+from typing import Any
 from uuid import uuid4
+
+from backend.app.semantic import RequestUnderstanding, SemanticService
+from backend.app import fact_taxonomy as _TAXONOMY
+from backend.app.services.model_input import slice_facts_for_model
 
 from backend.app.models import (
     AdvicePackage,
@@ -31,6 +36,7 @@ from backend.app.models import (
     TaskNode,
     TaskPlan,
     TaskStatus,
+    UserProfile,
 )
 
 # 专业智能体的统一调用签名。实际实现可以是规则函数、远程模型调用或工作流，
@@ -62,45 +68,39 @@ class CoordinatorAgent:
         compliance_checker: ComplianceChecker,
         *,
         now: Callable[[], datetime] | None = None,
+        semantic: SemanticService | None = None,
     ) -> None:
         # 注册表由应用启动时装配。仅计划并执行已注册的 agent_id，避免由用户输入
         # 间接调用任意代码或不存在的“智能体”。
         self.agents = agents
+        self.semantic = semantic or SemanticService()
+        # 最近一次编排送入模型的事实切片摘要；由 API 层并入 data_acquisition，
+        # 让"取数成功但研判降级"对用户可解释。
+        self.last_model_slice: dict[str, Any] = {}
+        # 编排超时必须覆盖模型的排队、网络与重试总预算，否则会在模型响应前提前降级。
+        llm_config = getattr(self.semantic.llm, "config", None)
+        self._llm_node_timeout = min(60.0, max(8.0, getattr(llm_config, "timeout_seconds", 6.0) + 1.0))
         # 将核验与合规以依赖注入方式传入，便于替换为规则库、人工审核或服务调用。
         self.verifier = verifier
         self.compliance_checker = compliance_checker
         # 注入时间函数方便单元测试固定时钟；当前最小核验器仍使用 UTC 当前时间。
         self.now = now or (lambda: datetime.now(timezone.utc))
 
-    def understand_intent(self, query: str) -> Intent:
-        """第一版采用可测试的规则识别；后续可替换为受限 Schema 的 LLM。"""
-        # 对英文 ETF 等关键词做统一小写化；中文文本不受 lower() 影响。
-        normalized = query.lower()
-        # 规则顺序即优先级：组合诊断通常也会包含“股票/基金”，故需最先识别。
-        # 生产版可以替换为 JSON Schema 受约束的 LLM 分类器，但必须保留 UNKNOWN。
-        rules = (
-            (Intent.PORTFOLIO_REVIEW, ("组合", "持仓", "仓位", "调仓", "回撤")),
-            (Intent.CONVERTIBLE_BOND_ANALYSIS, ("可转债", "转债", "转股溢价", "纯债溢价")),
-            (Intent.FUND_SCREENING, ("基金", "etf", "指数基金")),
-            (Intent.SECURITY_RESEARCH, ("股票", "个股", "证券", "公司")),
-            (Intent.INDUSTRY_ANALYSIS, ("行业比较", "行业分析", "赛道")),
-            (Intent.MARKET_ANALYSIS, ("市场", "宏观", "行业", "行情")),
-            (Intent.EDUCATION, ("科普", "怎么理解", "是什么")),
-        )
-        for intent, keywords in rules:
-            # 任意一个关键词命中即可进入对应工作流；不猜测未命中的复杂意图。
-            if any(keyword in normalized for keyword in keywords):
-                return intent
-        # 不确定意图时返回 UNKNOWN，由 plan() 生成澄清问题，而不是继续取数分析。
-        return Intent.UNKNOWN
+    async def understand_request(self, request: OrchestrationRequest) -> RequestUnderstanding:
+        """同时识别上下文意图和请求风险；调用方应传递结果而非重复调用。"""
+        return await self.semantic.understand(request)
 
-    def plan(self, request: OrchestrationRequest, trace_id: str) -> TaskPlan:
+    async def understand_intent(self, query: str) -> Intent:
+        """便捷入口；多轮分析应调用 understand_request 并传入完整请求。"""
+        request = OrchestrationRequest(query=query, profile=UserProfile(user_id="intent-only"))
+        return (await self.understand_request(request)).intent
+
+    def plan(self, request: OrchestrationRequest, trace_id: str, intent: Intent = Intent.UNKNOWN) -> TaskPlan:
         """为已确认请求生成最小必要的 Task DAG。
 
         规划本身不调用数据服务或模型，因此速度快、易测试。它只描述“要做什么”，
         具体“怎么执行”由 :meth:`run` 根据节点关系实施。
         """
-        intent = self.understand_intent(request.query)
         if intent is Intent.UNKNOWN:
             # 意图不明确会实质改变所需数据和智能体，属于必须追问的情况。
             return TaskPlan(
@@ -124,7 +124,7 @@ class CoordinatorAgent:
                 task_id=f"{agent_id}-analysis",
                 agent_id=agent_id,
                 # 所有专业节点相互独立，因此没有 depends_on，可被并行调度。
-                timeout_seconds=8,
+                timeout_seconds=self._llm_node_timeout,
                 # 行情类事实变化快，设置为 15 分钟；财务等慢变量默认允许一天。
                 data_max_age_seconds=900 if agent_id == "market" else 86_400,
                 # 专业分析优先级低于核验和合规，后两者必须拥有最终控制权。
@@ -150,7 +150,7 @@ class CoordinatorAgent:
                     agent_id="compliance",
                     # 合规只接收核验后的结果，避免未证实结论进入规则判断。
                     depends_on=["fact-verification"],
-                    timeout_seconds=5,
+                    timeout_seconds=self._llm_node_timeout,
                     data_max_age_seconds=86_400,
                     priority=100,
                 ),
@@ -158,7 +158,9 @@ class CoordinatorAgent:
         )
         return TaskPlan(trace_id=trace_id, intent=intent, nodes=nodes)
 
-    async def run(self, request: OrchestrationRequest) -> AdvicePackage:
+    async def run(
+        self, request: OrchestrationRequest, *, understanding: RequestUnderstanding | None = None,
+    ) -> AdvicePackage:
         """按安全顺序执行计划，并始终返回可审计的 AdvicePackage。
 
         函数没有抛出某个专业节点的异常给前端：节点异常会被转换为失败结果，其他
@@ -167,14 +169,29 @@ class CoordinatorAgent:
         """
         # UUID 只截取 12 位是为了展示友好；真实审计数据库可保存完整 UUID。
         trace_id = f"T-{uuid4().hex[:12].upper()}"
-        plan = self.plan(request, trace_id)
+        understanding = understanding or await self.understand_request(request)
+        plan = self.plan(request, trace_id, understanding.intent)
+        if understanding.risk_rules:
+            # 在执行专业节点前处理风险；API 同时据此跳过外部取数。
+            compliance = semantic_compliance(understanding.risk_rules, understanding.reason)
+            plan.nodes = []
+            output = self._review_package(plan, compliance.reason or "请求需要复核")
+            return output.model_copy(update={"compliance": compliance, "confidence": 0})
+        if understanding.intent is Intent.UNKNOWN:
+            plan.clarification_question = understanding.reason + " 请说明研究对象与希望解决的问题。"
+
         if plan.clarification_question:
             # 追问不是异常，是刻意的安全业务结果，使用 REVIEW 状态返回给界面。
             return self._review_package(plan, plan.clarification_question)
 
         # 这里仅选择注册的专业节点。事实核验和合规在后面严格按依赖顺序单独运行。
         specialist_nodes = [node for node in plan.nodes if node.agent_id in self.agents]
-        results = await self._run_parallel(request, specialist_nodes)
+        # 只把与本次意图最相关的事实子集送给模型：全量证据包可能上千条，会直接
+        # 超出模型输入预算并让所有节点静默回退规则引擎。核验仍使用完整事实集。
+        model_facts, slice_metrics = slice_facts_for_model(request.facts, plan.intent)
+        self.last_model_slice = slice_metrics
+        model_view = _RequestView(request, model_facts)
+        results = await self._run_parallel(model_view, specialist_nodes)
         # 专业节点的最终状态必须回写到 DAG，前端才能区分完成、失败与降级。
         for node, result in zip(specialist_nodes, results, strict=True):
             node.status = result.status
@@ -188,6 +205,27 @@ class CoordinatorAgent:
         compliance_node.status = TaskStatus.RUNNING
         cross_validation = cross_validate_results(results, request.facts)
         compliance = await self.compliance_checker(request, results)
+        # 所有专业意见合并为一次语义审核，补充数值一致性检查无法发现的实质矛盾。
+        if compliance.status is not ComplianceStatus.BLOCK:
+            review = await self.semantic.review(request, results)
+            if review is None:
+                semantic_result = ComplianceResult(
+                    status=ComplianceStatus.REVIEW, matched_rules=["SEMANTIC_REVIEW_UNAVAILABLE"],
+                    reason="语义复核不可用或不确定，需要人工复核。",
+                    risk_notice=RISK_NOTICE, required_disclosures=[RISK_NOTICE],
+                )
+            else:
+                semantic_result = semantic_compliance(review.risk_rules, review.reason)
+                if review.conflicting_agents:
+                    cross_validation.status = ComplianceStatus.REVIEW
+                    cross_validation.issues.append(CrossValidationIssue(
+                        code="SEMANTIC_AGENT_CONFLICT", severity="warning", message=review.reason,
+                        agent_ids=review.conflicting_agents,
+                    ))
+                    cross_validation.dissenting_agents = sorted(
+                        set(cross_validation.dissenting_agents) | set(review.conflicting_agents)
+                    )
+            compliance = merge_compliance(compliance, semantic_result)
         if cross_validation.status is ComplianceStatus.REVIEW and compliance.status is ComplianceStatus.PASS:
             compliance = compliance.model_copy(
                 update={
@@ -333,16 +371,13 @@ class CoordinatorAgent:
         if not results:
             # 无可用结果时必须明确证据不足，而不是输出空的“建议”。
             return "证据不足，暂不输出投资建议。"
-        # 每个观点始终带来源 agent_id，方便前端把结论追溯到具体专业能力。
-        opinions = "；".join(f"{result.agent_id}：{result.opinion}" for result in results)
-        # REVIEW 的内容只能被界面标记为需人工复核/教育性说明。
-        prefix = "需人工复核。" if status is ComplianceStatus.REVIEW else "分析结果："
-        consensus = (
-            f"协调器置信加权共识分为 {cross_validation.consensus_score:.1f}。"
-            if cross_validation.consensus_score is not None
-            else ""
+        # 节点标识和分数保留在结构化结果中，用户摘要按主题分段。
+        labels = {"market": "市场", "industry": "行业", "security": "个股", "fund": "基金", "portfolio": "持仓"}
+        opinions = "\n\n".join(
+            f"{labels.get(result.agent_id, '分析')}：{result.opinion}" for result in results
         )
-        return f"{prefix}{consensus}{opinions}"
+        prefix = "仍需进一步确认，以下内容仅供参考。\n\n" if status is ComplianceStatus.REVIEW else ""
+        return f"{prefix}{opinions}"
 
     @staticmethod
     def _user_fit_summary(request: OrchestrationRequest) -> str:
@@ -405,32 +440,53 @@ class CoordinatorAgent:
         return steps or ["关注证据时点与证伪条件，定期复核"]
 
 
-FAST_MARKET_FIELDS = {
-    "close_price",
-    "change",
-    "volume",
-    "turnover_rate",
-    "volatility",
-}
-NEWS_FIELDS = {"news", "announcement", "research_report"}
-SCORE_FIELDS = {
-    "growth_score",
-    "inflation_score",
-    "liquidity_score",
-    "policy_score",
-    "risk_appetite_score",
-    "prosperity_score",
-    "valuation_score",
-    "capital_flow_score",
-    "crowding_score",
-    "fundamental_score",
-    "technical_score",
-    "event_score",
-    "governance_score",
-    "fund_score",
-}
-SLOW_FINANCIAL_FIELDS = {"pe_ttm", "pb", "roe", "revenue_growth", "fee_rate", "tracking_error"}
-PORTFOLIO_FIELDS = {"weight", "portfolio_weight", "sector_weight", "fund_risk_level"}
+FAST_MARKET_FIELDS = _TAXONOMY.FAST_MARKET_FIELDS
+NEWS_FIELDS = _TAXONOMY.NEWS_FIELDS
+SCORE_FIELDS = _TAXONOMY.SCORE_FIELDS
+SLOW_FINANCIAL_FIELDS = _TAXONOMY.SLOW_FINANCIAL_FIELDS
+PORTFOLIO_FIELDS = _TAXONOMY.PORTFOLIO_FIELDS
+FIELD_LABELS = _TAXONOMY.FIELD_LABELS
+
+
+class _RequestView:
+    """把编排请求替换为"送给模型的事实子集"的只读视图。
+
+    只替换 ``facts``，其余字段（画像、问题、持仓、上下文）沿用原请求。这样专业
+    节点看到的是裁剪后的输入，而事实核验仍使用完整证据包。
+    """
+
+    __slots__ = ("_request", "facts")
+
+    def __init__(self, request: Any, facts: list[FactRecord]) -> None:
+        object.__setattr__(self, "_request", request)
+        object.__setattr__(self, "facts", facts)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(object.__getattribute__(self, "_request"), name)
+
+
+def entity_label(entity: Any) -> str:
+    """把实体内部标识转成面向用户的称呼。"""
+    text = str(entity or "").strip()
+    if not text:
+        return "该对象"
+    if "宏观" in text:
+        return "宏观环境"
+    if "行业排名" in text or text == "行业":
+        return "行业整体"
+    if "基金ETF" in text:
+        return "基金与 ETF"
+    return text
+
+
+def field_label(field: Any) -> str:
+    """把字段编码转成面向用户的中文标签；未知字段不暴露内部编码。"""
+    code = str(field or "").strip()
+    if not code:
+        return "这项数据"
+    if re.search(r"[\u4e00-\u9fff]", code):
+        return code
+    return FIELD_LABELS.get(code.casefold(), "该项指标")
 
 
 def fact_max_age_seconds(fact: FactRecord) -> int:
@@ -456,6 +512,9 @@ def cross_validate_results(results: list[AgentResult], facts: list[FactRecord]) 
     issues: list[CrossValidationIssue] = []
     grouped: dict[tuple[str, str, str | None], list[FactRecord]] = {}
     for fact in facts:
+        # 分组键中的 period 同时承载两种含义：财务数据的报告期，以及综合搜索
+        # （公告/新闻/研报）中单条记录的身份标识。同一实体因此可以合法持有多条
+        # 取值不同的记录，而跨来源比对同一份记录时仍会归入同一组并检出冲突。
         grouped.setdefault((fact.entity, fact.field.casefold(), fact.period), []).append(fact)
     for records in grouped.values():
         if len({json.dumps(record.value, ensure_ascii=False, sort_keys=True, default=str) for record in records}) > 1:
@@ -463,7 +522,7 @@ def cross_validate_results(results: list[AgentResult], facts: list[FactRecord]) 
                 CrossValidationIssue(
                     code="SOURCE_VALUE_CONFLICT",
                     severity="warning",
-                    message=f"{records[0].entity} 的 {records[0].field} 存在跨来源取值冲突。",
+                    message=f"{entity_label(records[0].entity)}的{field_label(records[0].field)}存在不同来源数值不一致，已按较新资料处理。",
                     fact_ids=[record.fact_id for record in records],
                 )
             )
@@ -561,51 +620,12 @@ async def verify_facts(
 async def basic_compliance_check(
     request: OrchestrationRequest, results: list[AgentResult]
 ) -> ComplianceResult:
-    """规则优先的第一版合规闸门；后续规则库可替换本函数。
+    """确定性的数值、适当性与证据闸门；文本语义由 SemanticService 审核。
 
-    规则按“硬拦截优先于可展示内容”的顺序执行。它示范了收益承诺、适当性和
-    证据完整性三类最小控制；生产环境应替换为版本化、可配置、可回放的规则库。
+    这里只判断已结构化的目标、回撤、持仓上限和证据完整性。协调器合并语义审核结果，
+    并确保 BLOCK 优先于 REVIEW、REVIEW 优先于 PASS。
     """
-    text = request.query.lower()
     disclosures = [RISK_NOTICE]
-    # 规则 1：权限与隐私优先级最高。不能因为用户给出自然语言就访问/推断他人数据。
-    if re.search(r"他人持仓|别人持仓|其他用户|泄露.*(密钥|token|密码)", text):
-        return ComplianceResult(
-            status=ComplianceStatus.BLOCK,
-            matched_rules=["PRIVACY_AND_PERMISSION"],
-            reason="不得访问、推断或泄露其他用户的持仓和敏感信息。",
-            risk_notice=RISK_NOTICE,
-            required_disclosures=disclosures,
-        )
-    # 规则 2：未经证实的传闻不能成为推荐理由，最多作为待核验线索。
-    if re.search(r"内幕|小道消息|传闻|听说.*利好", text):
-        return ComplianceResult(
-            status=ComplianceStatus.REVIEW,
-            matched_rules=["UNVERIFIED_RUMOR"],
-            reason="未经证实的传闻不能用于形成投资结论，请提供权威来源。",
-            risk_notice=RISK_NOTICE,
-            required_disclosures=disclosures,
-        )
-    # 规则 3：收益承诺必须硬拦截，不能通过更换措辞绕开。
-    if re.search(r"稳赚|必涨|保本高收益", text):
-        # 不将此类请求改写成具体标的建议，直接阻断确定性收益承诺。
-        return ComplianceResult(
-            status=ComplianceStatus.BLOCK,
-            matched_rules=["NO_RETURN_PROMISE"],
-            reason="不得提供收益承诺或保证性表述。",
-            risk_notice=RISK_NOTICE,
-            required_disclosures=disclosures,
-        )
-    # 规则 4：低风险用户的满仓/全仓高风险请求与适当性冲突。
-    if request.profile.risk_level == "R1" and re.search(r"满仓|全仓", text):
-        # 此规则仅演示低风险画像与高暴露表达的冲突；真实版本还要判断标的波动性。
-        return ComplianceResult(
-            status=ComplianceStatus.BLOCK,
-            matched_rules=["SUITABILITY_R1_HIGH_RISK"],
-            reason="低风险用户不能获得满仓高风险标的建议。",
-            risk_notice=RISK_NOTICE,
-            required_disclosures=disclosures,
-        )
     # 目标收益与最大回撤明显不匹配时先教育和复核，不据此反推更高风险仓位。
     if (
         request.profile.expected_annual_return is not None
@@ -652,3 +672,26 @@ async def basic_compliance_check(
         risk_notice=RISK_NOTICE,
         required_disclosures=disclosures,
     )
+
+
+def semantic_compliance(rules: list[str], reason: str) -> ComplianceResult:
+    """规则 ID 来自受限枚举，优先级由代码决定，模型不能自行放行。"""
+    hard_blocks = {"PRIVACY_AND_PERMISSION", "NO_RETURN_PROMISE", "SUITABILITY_R1_HIGH_RISK"}
+    status = (ComplianceStatus.BLOCK if hard_blocks.intersection(rules)
+              else ComplianceStatus.REVIEW if rules else ComplianceStatus.PASS)
+    return ComplianceResult(
+        status=status, matched_rules=sorted(set(rules)), reason=reason,
+        risk_notice=RISK_NOTICE, required_disclosures=[RISK_NOTICE], rule_version="semantic-1.0",
+    )
+
+
+def merge_compliance(first: ComplianceResult, second: ComplianceResult) -> ComplianceResult:
+    """语义判定只能增加约束，不能覆盖数值或证据检查。"""
+    severity = {ComplianceStatus.PASS: 0, ComplianceStatus.REVIEW: 1, ComplianceStatus.BLOCK: 2}
+    strictest = max((first, second), key=lambda item: severity[item.status])
+    return strictest.model_copy(update={
+        "matched_rules": sorted(set(first.matched_rules + second.matched_rules)),
+        "reason": "；".join(item.reason for item in (first, second)
+                          if item.reason and item.status is not ComplianceStatus.PASS) or strictest.reason,
+        "required_disclosures": list(dict.fromkeys(first.required_disclosures + second.required_disclosures)),
+    })

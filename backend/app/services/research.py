@@ -11,7 +11,7 @@ from typing import Any, Callable
 from uuid import NAMESPACE_URL, uuid5
 
 from backend.app.models import DataAcquisitionResult, FactRecord, Intent, OrchestrationRequest
-from backend.app.agents.coordinator import fact_max_age_seconds
+from backend.app.fact_taxonomy import fact_max_age_seconds
 
 
 @dataclass(frozen=True)
@@ -138,6 +138,11 @@ class AutomatedResearchPipeline:
                 ("news", "get_news"),
             ),
             Intent.SECURITY_RESEARCH: (
+                # 个股研究同时计划 market/industry/security 三个专业节点，因此必须把
+                # 宏观与行业数据一并取回；否则这两个节点必然因缺字段降级，只留下
+                # 个股一个观点，还会被一致性检查误判为"跨智能体分歧"。
+                ("macro", "get_macro_data"),
+                ("industry", "get_industry_rank"),
                 ("quote", "get_quote"),
                 ("financial", "get_financial_metrics"),
                 ("event", "get_event_data"),

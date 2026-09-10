@@ -17,13 +17,13 @@ from backend.app.agents.rule_agents import make_rule_agents
 from backend.app.models import FactRecord, OrchestrationRequest, UserProfile
 
 
-def make_coordinator() -> CoordinatorAgent:
+def make_coordinator(semantic) -> CoordinatorAgent:
     """装配确定性依赖，避免测试依赖外部模型、行情接口或网络。"""
-    return CoordinatorAgent(make_rule_agents(), verify_facts, basic_compliance_check)
+    return CoordinatorAgent(make_rule_agents(), verify_facts, basic_compliance_check, semantic=semantic)
 
 
 @pytest.mark.asyncio
-async def test_portfolio_request_builds_parallel_specialist_dag() -> None:
+async def test_portfolio_request_builds_parallel_specialist_dag(semantic) -> None:
     """组合诊断应计划五类专业能力，并保留经核验的证据。"""
     request = OrchestrationRequest(
         query="请诊断我的持仓组合",
@@ -40,7 +40,7 @@ async def test_portfolio_request_builds_parallel_specialist_dag() -> None:
             )
         ],
     )
-    output = await make_coordinator().run(request)
+    output = await make_coordinator(semantic).run(request)
 
     assert len([node for node in output.task_plan.nodes if node.agent_id in {"market", "industry", "security", "fund", "portfolio"}]) == 5
     assert output.compliance.status == "PASS"
@@ -50,20 +50,20 @@ async def test_portfolio_request_builds_parallel_specialist_dag() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unconfirmed_profile_requires_review() -> None:
+async def test_unconfirmed_profile_requires_review(semantic) -> None:
     """画像尚未确认时，系统只能追问/复核，不能擅自生成个性化建议。"""
     request = OrchestrationRequest(
         query="帮我看看持仓",
         profile=UserProfile(user_id="u-1", confirmed=False),
     )
-    output = await make_coordinator().run(request)
+    output = await make_coordinator(semantic).run(request)
 
     assert output.compliance.status == "REVIEW"
     assert "确认" in output.conclusion
 
 
 @pytest.mark.asyncio
-async def test_return_promise_is_blocked() -> None:
+async def test_return_promise_is_blocked(semantic) -> None:
     """收益承诺属于硬拦截，无论专业智能体是否产生结果都不可放行。"""
     request = OrchestrationRequest(
         query="推荐稳赚股票",
@@ -80,7 +80,7 @@ async def test_return_promise_is_blocked() -> None:
             )
         ],
     )
-    output = await make_coordinator().run(request)
+    output = await make_coordinator(semantic).run(request)
 
     assert output.compliance.status == "BLOCK"
     assert output.confidence == 0

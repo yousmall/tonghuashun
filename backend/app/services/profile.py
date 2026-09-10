@@ -1,13 +1,13 @@
 """用户画像草稿、确认与风险等级计算。
 
-该模块有意不调用 LLM：问卷打分和有限的正则抽取都可复算、可审计。自然语言
+问卷打分保留确定性公式，自然语言通过受限 LLM 提取并附带原文证据。文本
 只用于收集画像线索，返回的 ``confirmed`` 始终为 False，直到用户显式调用
 确认接口。
 """
 
 from __future__ import annotations
 
-import re
+from backend.app.semantic import SemanticService
 
 from backend.app.models import (
     ProfileAssessment,
@@ -32,69 +32,13 @@ def _risk_level(score: float | None) -> str | None:
     return ("R1", "R2", "R3", "R4", "R5")[min(4, int(score // 20))]
 
 
-def _extract_narrative(narrative: str) -> tuple[dict[str, object], list[str]]:
-    """提取少量低歧义表达并返回证据说明。
-
-    这里不尝试猜测用户风险等级；例如“稳一点”没有稳定量化含义，只能进入
-    ``missing_fields``。每一项提取均附带原始匹配文本，方便前端让用户核对。
-    """
-    patch: dict[str, object] = {}
-    evidence: list[str] = []
-    year_match = re.search(r"(\d+)\s*年(?:后|内)", narrative)
-    month_match = re.search(r"(\d+)\s*个?月(?:后|内)", narrative)
-    if year_match:
-        months = int(year_match.group(1)) * 12
-        patch["horizon_months"] = months
-        evidence.append(f"从“{year_match.group(0)}”提取投资期限 {months} 个月")
-    elif month_match:
-        months = int(month_match.group(1))
-        patch["horizon_months"] = months
-        evidence.append(f"从“{month_match.group(0)}”提取投资期限 {months} 个月")
-
-    drawdown_match = re.search(r"(?:最多|最大|不超过|接受)\s*(\d+(?:\.\d+)?)\s*%\s*(?:亏损|回撤|下跌)?", narrative)
-    if drawdown_match:
-        drawdown = float(drawdown_match.group(1)) / 100
-        patch["max_drawdown"] = drawdown
-        evidence.append(f"从“{drawdown_match.group(0)}”提取最大回撤 {drawdown:.0%}")
-
-    if re.search(r"买房|购房|学费|医疗|大额支出", narrative):
-        patch["liquidity_need"] = "高"
-        patch["target"] = "未来存在刚性大额支出"
-        evidence.append("识别到刚性大额支出，草稿流动性需求设为高")
-
-    experience_match = re.search(r"(?:投资|炒股|基金投资)\s*(\d+(?:\.\d+)?)\s*年", narrative)
-    if experience_match:
-        years = float(experience_match.group(1))
-        patch["investment_experience_years"] = years
-        evidence.append(f"从“{experience_match.group(0)}”提取投资经验 {years:g} 年")
-
-    return_match = re.search(r"(?:期望|目标|希望).{0,6}(?:年化|收益率?)\s*(\d+(?:\.\d+)?)\s*%", narrative)
-    if return_match:
-        expected_return = float(return_match.group(1)) / 100
-        patch["expected_annual_return"] = expected_return
-        evidence.append(f"从“{return_match.group(0)}”提取期望年化收益 {expected_return:.1%}")
-
-    behavioral_notes: list[str] = []
-    for keyword, note in (
-        ("追涨杀跌", "自述存在追涨杀跌行为"),
-        ("频繁交易", "自述交易较频繁"),
-        ("长期持有", "自述偏好长期持有"),
-    ):
-        if keyword in narrative:
-            behavioral_notes.append(note)
-            evidence.append(f"从“{keyword}”提取行为偏好")
-    if behavioral_notes:
-        patch["behavioral_notes"] = behavioral_notes
-    return patch, evidence
-
-
-def assess_profile(request: ProfileAssessmentRequest) -> ProfileAssessment:
+async def assess_profile(request: ProfileAssessmentRequest, semantic: SemanticService | None = None) -> ProfileAssessment:
     """根据问卷与文本创建一份未确认画像草稿。
 
     问卷必须五项齐全才计算加权风险分；部分答题时保留已有线索并明确列出缺失项，
     以免用不完整信息给出看似精确的适当性结论。
     """
-    narrative_patch, evidence = _extract_narrative(request.narrative or "")
+    narrative_patch, evidence = await (semantic or SemanticService()).extract_profile(request.narrative or "")
     missing = [name for name in RISK_WEIGHTS if name not in request.questionnaire]
     score = None
     if not missing:

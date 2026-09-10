@@ -1,0 +1,54 @@
+[theme]
+base = "light"
+# 品牌主色保持不变；其余层级改为金融终端式的中性冷灰，让正文与数据回到高对比底色。
+primaryColor = "#AD384E"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F5F6F8"
+textColor = "#1F2430"
+linkColor = "#9C3149"
+borderColor = "#E3E6EB"
+codeBackgroundColor = "#F5F6F8"
+codeTextColor = "#1F2430"
+showWidgetBorder = true
+showSidebarBorder = true
+baseRadius = "10px"
+buttonRadius = "9px"
+baseFontSize = 15
+baseFontWeight = 400
+font = "Microsoft YaHei"
+headingFontSizes = ["34px", "25px", "19px", "17px", "15px", "13px"]
+headingFontWeights = [700, 700, 650, 600, 600, 600]
+metricValueFontSize = "1.55rem"
+metricValueFontWeight = 700
+linkUnderline = false
+# 语义色：风险与合规提示用红，正常与已完成用绿，与终端习惯一致。
+redColor = "#C0392B"
+redBackgroundColor = "#FCEBEA"
+redTextColor = "#96271B"
+greenColor = "#18794E"
+greenBackgroundColor = "#E7F5EC"
+greenTextColor = "#12603D"
+orangeColor = "#B26A00"
+orangeBackgroundColor = "#FDF2E0"
+orangeTextColor = "#8A5200"
+blueColor = "#2C5FD6"
+blueBackgroundColor = "#E9EFFC"
+blueTextColor = "#22499F"
+violetColor = "#6B4BC4"
+violetBackgroundColor = "#EFEBFB"
+violetTextColor = "#533A9B"
+grayColor = "#5C6472"
+grayBackgroundColor = "#EEF0F3"
+grayTextColor = "#454C58"
+chartCategoricalColors = ["#AD384E", "#2C5FD6", "#18794E", "#B26A00", "#6B4BC4", "#0F7C8A", "#5C6472"]
+chartSequentialColors = ["#FDF4F5", "#F7DFE3", "#EFC5CC", "#E3A5B0", "#D3828F", "#C15F70", "#AD384E", "#8E2C40", "#6E2131", "#4E1723"]
+
+[theme.sidebar]
+backgroundColor = "#F7F8FA"
+secondaryBackgroundColor = "#EFF1F4"
+textColor = "#1F2430"
+borderColor = "#E3E6EB"
+
+[client]
+toolbarMode = "minimal"
+showErrorDetails = "none"

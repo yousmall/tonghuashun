@@ -76,8 +76,8 @@ class UserProfile(BaseModel):
     是硬闸门；它为 ``False`` 时，协调器只会要求确认信息，不会输出建议。
     """
 
-    # 用户唯一标识。真实系统应来自鉴权上下文，而不是由前端任意指定。
-    user_id: str
+    # 用户唯一标识。已登录请求由鉴权上下文写入，前端不需要也看不到该字段。
+    user_id: str = Field(default="", max_length=128)
     # 画像版本号，用于审计“当时到底使用了哪个画像”。
     version: int = 1
     # R1-R5 等适当性等级；第一版保留字符串以便对接现有规则库。
@@ -314,7 +314,8 @@ class OrchestrationRequest(BaseModel):
 class ProfileAssessmentRequest(BaseModel):
     """画像评估入口：支持问卷分项和自然语言，两者均只生成草稿。"""
 
-    user_id: str = Field(min_length=1)
+    # 已登录请求由鉴权上下文覆盖，客户端无需也无需知道自己的账号标识。
+    user_id: str = Field(default="", max_length=128)
     # 问卷维度使用 0-100；未知维度省略，服务会列入 missing_fields。
     questionnaire: dict[str, float] = Field(default_factory=dict)
     narrative: str | None = Field(default=None, max_length=2_000)
@@ -437,6 +438,12 @@ class DataAcquisitionResult(BaseModel):
     supplied_fact_count: int = Field(default=0, ge=0)
     fetched_fact_count: int = Field(default=0, ge=0)
     derived_fact_count: int = Field(default=0, ge=0)
+    # 送入模型研判的事实条数与是否被裁剪：让"取数成功但研判降级"可解释。
+    model_fact_count: int = Field(default=0, ge=0)
+    model_fact_available: int = Field(default=0, ge=0)
+    facts_truncated: bool = False
+    # 结构化降级原因码（不含内部实现细节），供界面翻译成用户可理解的话术。
+    reason_code: str | None = None
     message: str | None = None
 
 

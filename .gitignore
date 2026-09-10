@@ -8,12 +8,26 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+# 测试与临时工具在工作区内使用的临时目录
+.tmp_pytest/
+tmp*/
 
 # Local artifact build and visual-QA workspaces
 .docx_work/
 .docx_review/
 .pptx_work/
+.docx_agent_calls_work/
 .chart-data-*/
+
+# 交付物与文档渲染产物：PPT、演示视频和渲染中间目录留在本地，不进仓库
+deliverables/
+问策智投_提交材料/
+agent_calling_relationships_zh.docx
 
 # Microsoft Office temporary lock files
 ~$*
+
+# Local frontend visual checks
+.streamlit/*.log
+.streamlit/*.png
+.streamlit/_visual_preview.py

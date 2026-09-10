@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -11,11 +12,15 @@ import httpx
 import pytest
 
 from backend.app.agents.coordinator import cross_validate_results, verify_facts
+from backend.app.agents.coordinator import CoordinatorAgent, basic_compliance_check
 from backend.app.agents.demo_agents import make_fact_based_agent
 from backend.app.agents.llm_agents import HybridInvestmentAgent, LLMConfig, OpenAICompatibleLLM
+from backend.app.agents.rule_agents import make_rule_agents
+from backend.app import main as main_module
 from backend.app.data_provider import IwencaiSkillHubProvider
 from backend.app.main import app, coordinator
 from backend.app.models import AgentResult, FactRecord, Intent, OrchestrationRequest, ProfileAssessmentRequest, TaskStatus, UserProfile
+from backend.app.services import AutomatedResearchPipeline
 from backend.app.services.profile import assess_profile
 
 
@@ -31,13 +36,14 @@ def make_fact(field: str, value: object, *, age_seconds: int = 0, source: str = 
     )
 
 
-def test_extended_profile_records_history_experience_and_expected_return() -> None:
-    assessment = assess_profile(
+@pytest.mark.asyncio
+async def test_extended_profile_records_history_experience_and_expected_return(semantic) -> None:
+    assessment = await assess_profile(
         ProfileAssessmentRequest(
             user_id="u-extended",
             narrative="我投资 3 年，2 年后买房，最多接受 8% 回撤，期望年化收益 9%。",
             investment_history=["长期定投宽基 ETF"],
-        )
+        ), semantic
     )
     assert assessment.profile.investment_experience_years == 3
     assert assessment.profile.expected_annual_return == 0.09
@@ -114,7 +120,18 @@ async def test_hybrid_agent_accepts_only_structured_authorized_llm_output() -> N
 async def test_iwencai_provider_normalizes_response_and_never_exposes_key() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers["authorization"] == "Bearer iw-secret"
-        if "可转债" in json.loads(request.content)["query"]:
+        assert request.headers["x-claw-call-type"] == "normal"
+        assert request.headers["x-claw-skill-id"] == "hithink-market-query"
+        assert request.headers["x-claw-skill-version"] == "1.0.0"
+        assert request.headers["x-claw-plugin-id"] == "none"
+        assert request.headers["x-claw-plugin-version"] == "none"
+        assert re.fullmatch(r"[0-9a-f]{64}", request.headers["x-claw-trace-id"])
+        assert request.url.path == "/v1/query2data"
+        payload = json.loads(request.content)
+        assert payload["is_cache"] == "1"
+        assert payload["expand_index"] == "true"
+        assert "source" not in payload
+        if "可转债" in payload["query"]:
             return httpx.Response(200, json={"data": [{"证券简称": "示例转债", "转股溢价率": 12.5, "债券评级": "AA+"}]})
         return httpx.Response(200, json={"data": [{"证券简称": "贵州茅台", "最新价": 1500, "涨跌幅": 1.2}]})
 
@@ -130,16 +147,28 @@ async def test_iwencai_provider_normalizes_response_and_never_exposes_key() -> N
     assert "iw-secret" not in repr(facts)
     bond_facts = await provider.get_convertible_bond("示例转债")
     assert {fact.field for fact in bond_facts} == {"conversion_premium_rate", "bond_rating"}
-    assert coordinator.understand_intent("请分析示例可转债") is Intent.CONVERTIBLE_BOND_ANALYSIS
+    assert await main_module.coordinator.understand_intent("请分析示例可转债") is Intent.CONVERTIBLE_BOND_ANALYSIS
 
 
 @pytest.mark.asyncio
 async def test_iwencai_provider_exposes_selected_skillhub_capabilities() -> None:
     queries: list[str] = []
+    paths: list[str] = []
+    channels: list[str] = []
+    skill_headers: list[tuple[str, str]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        query = json.loads(request.content)["query"]
+        payload = json.loads(request.content)
+        query = payload["query"]
         queries.append(query)
+        paths.append(request.url.path)
+        channels.extend(payload.get("channels", []))
+        skill_headers.append(
+            (
+                request.headers["x-claw-skill-id"],
+                request.headers["x-claw-skill-version"],
+            )
+        )
         if "上市公司公告" in query:
             return httpx.Response(200, json={"data": [{"证券简称": "示例", "公告标题": "重大合同公告"}]})
         if "券商研报" in query:
@@ -167,6 +196,12 @@ async def test_iwencai_provider_exposes_selected_skillhub_capabilities() -> None
 
     returned_fields = {fact.field for facts in results for fact in facts}
     assert {"announcement", "research_report"} <= returned_fields
+    assert paths.count("/v1/comprehensive/search") == 2
+    assert set(channels) == {"report", "announcement"}
+    assert ("report-search", "2.0.0") in skill_headers
+    assert ("announcement-search", "1.0.0") in skill_headers
+    assert ("hithink-macro-query", "1.0.0") in skill_headers
+    assert ("hithink-astock-selector", "1.0.0") in skill_headers
     combined = "\n".join(queries)
     for marker in (
         "基本资料",
@@ -184,7 +219,86 @@ async def test_iwencai_provider_exposes_selected_skillhub_capabilities() -> None
 
 
 @pytest.mark.asyncio
-async def test_one_hundred_concurrent_requests_finish_within_smoke_budget() -> None:
+async def test_iwencai_provider_does_not_retry_invalid_credentials() -> None:
+    attempts = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(401, request=request)
+
+    provider = IwencaiSkillHubProvider(
+        "iw-secret",
+        max_retries=2,
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(RuntimeError, match="未接受当前密钥"):
+        await provider.get_quote("600519")
+
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_iwencai_provider_distinguishes_forbidden_capability() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, request=request)
+
+    provider = IwencaiSkillHubProvider(
+        "iw-secret",
+        max_retries=2,
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(RuntimeError, match="开通对应数据能力"):
+        await provider.get_quote("600519")
+
+
+@pytest.mark.asyncio
+async def test_iwencai_provider_reports_network_failures_without_secrets() -> None:
+    attempts = 0
+    call_types: list[str] = []
+    trace_ids: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        call_types.append(request.headers["x-claw-call-type"])
+        trace_ids.append(request.headers["x-claw-trace-id"])
+        raise httpx.ConnectError("TLS handshake failed", request=request)
+
+    provider = IwencaiSkillHubProvider(
+        "iw-secret",
+        max_retries=2,
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await provider.get_quote("600519")
+
+    message = str(exc_info.value)
+    assert attempts == 3
+    assert call_types == ["normal", "retry", "retry"]
+    assert len(set(trace_ids)) == 3
+    assert all(re.fullmatch(r"[0-9a-f]{64}", trace_id) for trace_id in trace_ids)
+    assert "网络、DNS 或代理" in message
+    assert "iw-secret" not in message
+    assert provider.base_url not in message
+
+
+@pytest.mark.asyncio
+async def test_one_hundred_concurrent_requests_finish_within_smoke_budget(monkeypatch, semantic) -> None:
+    monkeypatch.setattr(
+        main_module,
+        "coordinator",
+        CoordinatorAgent(
+            agents=make_rule_agents(),
+            verifier=verify_facts,
+            compliance_checker=basic_compliance_check,
+            semantic=semantic,
+        ),
+    )
+    monkeypatch.setattr(main_module, "research_pipeline", AutomatedResearchPipeline(None))
     payload = {
         "query": "请诊断我的持仓组合",
         "profile": {"user_id": "load-test", "risk_level": "R3", "confirmed": True},
