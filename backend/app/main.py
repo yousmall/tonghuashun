@@ -30,7 +30,13 @@ from backend.app.agents.llm_agents import LLMConfig, OpenAICompatibleLLM, make_i
 from backend.app.semantic import SemanticService
 from backend.app.data_provider import IwencaiSkillHubProvider
 from backend.app.auth import TokenError, create_access_token, decode_access_token, hash_password, verify_password
-from backend.app.database import Database, DatabaseUnavailable, UsernameExists
+from backend.app.database import (
+    Database,
+    DatabaseUnavailable,
+    UsernameExists,
+    WatchlistCapacityExceeded,
+    WatchlistItemExists,
+)
 from backend.app.models import (
     AdvicePackage,
     AuthResponse,
@@ -46,6 +52,8 @@ from backend.app.models import (
     ProfileConfirmRequest,
     UserProfile,
     UserSummary,
+    WatchlistItem,
+    WatchlistItemCreate,
 )
 from backend.app.services import (
     AutomatedResearchPipeline,
@@ -89,6 +97,14 @@ async def lifespan(_: FastAPI):
         reaper.cancel()
         with suppress(asyncio.CancelledError):
             await reaper
+        closers = []
+        llm = getattr(coordinator.semantic, "llm", None)
+        if llm is not None and hasattr(llm, "aclose"):
+            closers.append(llm.aclose())
+        if data_provider is not None and hasattr(data_provider, "aclose"):
+            closers.append(data_provider.aclose())
+        if closers:
+            await asyncio.gather(*closers)
 
 
 def build_coordinator() -> tuple[CoordinatorAgent, bool]:
@@ -338,6 +354,41 @@ def history_detail(
     return ConversationDetail.model_validate(result)
 
 
+@app.get("/api/v1/watchlist", response_model=list[WatchlistItem], tags=["watchlist"])
+def list_watchlist(user: dict[str, object] = Depends(authenticated_user)) -> list[WatchlistItem]:
+    """返回当前账号的自选标的。"""
+
+    return [WatchlistItem.model_validate(row) for row in database.list_watchlist(int(user["id"]))]
+
+
+@app.post("/api/v1/watchlist", response_model=WatchlistItem, tags=["watchlist"])
+def add_watchlist_item(
+    request: WatchlistItemCreate,
+    user: dict[str, object] = Depends(authenticated_user),
+) -> WatchlistItem:
+    """新增自选标的；重复项和容量限制以可操作错误返回。"""
+
+    try:
+        row = database.add_watchlist_item(int(user["id"]), request.target, request.asset_type)
+        return WatchlistItem.model_validate(row)
+    except WatchlistItemExists as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except WatchlistCapacityExceeded as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.delete("/api/v1/watchlist/{item_id}", tags=["watchlist"])
+def remove_watchlist_item(
+    item_id: int,
+    user: dict[str, object] = Depends(authenticated_user),
+) -> dict[str, str]:
+    """删除当前账号自己的自选项。"""
+
+    if not database.remove_watchlist_item(int(user["id"]), item_id):
+        raise HTTPException(status_code=404, detail="自选标的不存在或已被移除")
+    return {"status": "removed"}
+
+
 @app.get("/api/v1/metrics", tags=["system"])
 async def metrics() -> dict[str, object]:
     """返回容量与可用性观测值；其范围不冒充生产 SLA。"""
@@ -353,7 +404,12 @@ async def fetch_market_data(request: DataFetchRequest) -> DataFetchResponse:
     """从问财只读接口调用项目允许的 SkillHub 能力并标准化为事实。"""
 
     if data_provider is None:
-        raise HTTPException(status_code=503, detail="尚未配置 IWENCAI_API_KEY，当前只能使用本地快照。")
+        return DataFetchResponse(
+            provider="IWENCAI_SKILLHUB",
+            fetched_at=datetime.now(timezone.utc),
+            status="unavailable",
+            message="尚未配置 IWENCAI_API_KEY，请在 .env 中配置只读密钥并重启后端。",
+        )
     try:
         handlers = {
             "quote": lambda: data_provider.get_quote(request.target),
@@ -375,7 +431,14 @@ async def fetch_market_data(request: DataFetchRequest) -> DataFetchResponse:
         }
         facts = await handlers[request.kind]()
     except RuntimeError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        # 单个外部数据源不可用不是整套研究服务故障。返回显式状态和空事实，
+        # 由界面提示用户如何恢复；不得把失败伪装成“没有搜索结果”。
+        return DataFetchResponse(
+            provider=data_provider.source_id,
+            fetched_at=datetime.now(timezone.utc),
+            status="unavailable",
+            message=str(exc),
+        )
     return DataFetchResponse(
         provider=data_provider.source_id,
         fetched_at=datetime.now(timezone.utc),
@@ -464,7 +527,9 @@ async def analyze_portfolio(
         understanding = await coordinator.understand_request(request)
         # 请求风险和意图在一次模型调用中完成，风险请求不访问外部数据服务。
         fetch_intent = Intent.UNKNOWN if understanding.risk_rules else understanding.intent
-        prepared_request, acquisition = await research_pipeline.prepare(request, fetch_intent)
+        prepared_request, acquisition = await research_pipeline.prepare(
+            request, fetch_intent, target=understanding.target
+        )
         advice = await coordinator.run(prepared_request, understanding=understanding)
         # 记录送入模型的事实规模，避免"取数成功但研判降级"对用户不可解释。
         model_slice = coordinator.last_model_slice or {}
@@ -488,6 +553,7 @@ async def analyze_portfolio(
         if user:
             # 历史记录只保留展示所需的轻量摘要：完整证据包可达数 MB，会撑大
             # messages 行宽并让列表/详情查询触发数据库排序内存告警。
+            completed_payload = completed_advice.model_dump(mode="json")
             future = session_thread_pool.submit(
                 str(user["_session_id"]),
                 database.save_exchange,
@@ -496,10 +562,7 @@ async def analyze_portfolio(
                 request.query,
                 request.model_dump(mode="json"),
                 completed_advice.conclusion,
-                summarise_advice(
-                    completed_advice.model_dump(mode="json"),
-                    used_fact_ids_of(completed_advice.model_dump(mode="json")),
-                ),
+                summarise_advice(completed_payload, used_fact_ids_of(completed_payload)),
             )
             await asyncio.wrap_future(future)
         return completed_advice

@@ -133,6 +133,9 @@ class FactRecord(BaseModel):
     period: str | None = None
     # 规则派生事实记录输入 fact_id；供应商原始事实保持为空。
     derived_from: list[str] = Field(default_factory=list)
+    # 产出这条事实的取数调用键（方法@研究目标）。仅用于判断能否复用已有资料、
+    # 避免同一份数据被反复取回；不参与展示、评分或合规判断。
+    produced_by: str | None = None
 
     @field_validator("snapshot_time")
     @classmethod
@@ -386,6 +389,8 @@ class DataFetchResponse(BaseModel):
 
     provider: str
     fetched_at: datetime
+    status: Literal["ok", "unavailable"] = "ok"
+    message: str | None = None
     facts: list[FactRecord] = Field(default_factory=list)
 
 
@@ -429,10 +434,12 @@ class CrossValidationResult(BaseModel):
 class DataAcquisitionResult(BaseModel):
     """自动取数阶段的审计摘要，不包含密钥、原始请求头或内部异常文本。"""
 
-    mode: Literal["provided", "live", "mixed", "unavailable", "not_required"] = "not_required"
+    mode: Literal["provided", "live", "mixed", "reused", "unavailable", "not_required"] = "not_required"
     provider: str | None = None
     requested_capabilities: list[str] = Field(default_factory=list)
     successful_capabilities: list[str] = Field(default_factory=list)
+    # 本次未重复调用、直接沿用有效期内的已有资料的能力。
+    reused_capabilities: list[str] = Field(default_factory=list)
     empty_capabilities: list[str] = Field(default_factory=list)
     failed_capabilities: list[str] = Field(default_factory=list)
     supplied_fact_count: int = Field(default=0, ge=0)

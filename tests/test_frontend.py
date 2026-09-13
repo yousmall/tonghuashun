@@ -1,9 +1,18 @@
 """用户界面回归：信息简化不能隐藏风险或破坏会话交互。"""
 from pathlib import Path
 
+import pytest
 from streamlit.testing.v1 import AppTest
 
-from frontend.streamlit_app import display_value, plain_language
+from frontend.streamlit_app import (
+    NAVIGATION,
+    analysis_chain_stages,
+    display_value,
+    format_api_error,
+    plain_language,
+    portfolio_risk_snapshot,
+    source_trace_rows,
+)
 
 
 SETUP = """
@@ -27,10 +36,27 @@ def test_login_renders_without_backend():
     assert not app.code
 
 
+def test_main_reuses_login_user_without_rechecking_auth_me():
+    script = SETUP + """
+st.session_state.profile_restored = True
+paths = []
+def fake_api(base, method, path, payload=None, **kwargs):
+    paths.append(path)
+    return {'id': 1, 'username': 'test-user'}
+with patch.object(ui, 'api_request', side_effect=fake_api), patch.object(ui, 'register_browser_session'), patch.object(ui, 'enforce_session_timeout'):
+    ui.main()
+st.session_state.request_paths = paths
+"""
+    app = AppTest.from_string(script).run()
+
+    assert not app.exception
+    assert "/auth/me" not in app.session_state["request_paths"]
+
+
 def test_navigation_and_profile_call_to_action():
     app = AppTest.from_string(SETUP + MAIN).run()
     assert not app.exception
-    assert app.radio[0].options == ['投资问答', '查找资料', '持仓分析', '历史记录', '投资偏好']
+    assert app.radio[0].options == ['投资问答', '自选研究', '持仓分析', '历史记录', '投资偏好']
     assert app.chat_input[0].disabled
     next(button for button in app.button if button.label == '填写投资偏好').click().run(timeout=15)
     assert not app.exception
@@ -87,6 +113,44 @@ ui.page_portfolio('http://localhost')
     assert not any(item.value == '别的研究结果' for item in app.markdown)
 
 
+def test_watchlist_page_adds_account_item_and_supports_comparison():
+    script = SETUP + """
+st.session_state.profile['confirmed'] = True
+st.session_state.watchlist = []
+def fake_api(base, method, path, payload=None, **kwargs):
+    if method == 'POST' and path == '/watchlist':
+        return {'id': 1, 'target': payload['target'], 'asset_type': payload['asset_type'],
+                'created_at': '2026-09-12T08:00:00Z'}
+    return None
+with patch.object(ui, 'api_request', side_effect=fake_api):
+    ui.page_watchlist('http://localhost')
+"""
+    app = AppTest.from_string(script).run(timeout=15)
+    next(field for field in app.text_input if field.label == '名称或代码').set_value('贵州茅台')
+    next(button for button in app.button if button.label == '加入自选').click().run(timeout=15)
+
+    assert not app.exception
+    assert app.session_state['watchlist'][0]['target'] == '贵州茅台'
+    assert any(button.label == '开始研究' for button in app.button)
+    assert any(button.label == '移除' for button in app.button)
+
+
+def test_portfolio_risk_snapshot_is_deterministic_and_respects_profile_limit():
+    snapshot = portfolio_risk_snapshot(
+        [
+            {'name': '甲', 'weight': 0.35},
+            {'name': '乙', 'weight': 0.25},
+            {'name': '丙', 'weight': 0.10},
+        ],
+        {'single_security_limit': 0.30},
+    )
+
+    assert snapshot['total'] == pytest.approx(0.70)
+    assert snapshot['top_two'] == pytest.approx(0.60)
+    assert snapshot['unallocated'] == pytest.approx(0.30)
+    assert snapshot['over_limit'] == ['甲']
+
+
 def test_plain_language_preserves_small_values_and_disagreement():
     assert display_value('fee_rate', .005) == '0.5%'
     result = plain_language('协调器置信加权共识分为 50.0。security：基本面与技术面存在分歧，不能确定上涨。')
@@ -127,7 +191,7 @@ def fake_api(base, method, path, payload=None):
     return {'facts': [{'fact_id': 'news-1', 'field': 'news', 'entity': '测试基金', 'value': '一条测试公告',
                        'snapshot_time': '2026-09-09T08:00:00Z', 'source_id': 'IWENCAI_SKILLHUB', 'quality': .9}]}
 with patch.object(ui, 'api_request', side_effect=fake_api):
-    ui.page_materials('http://localhost')
+    ui.render_materials_body('http://localhost')
 """
     app = AppTest.from_string(script).run(timeout=15)
     app.selectbox[0].select('基金 / ETF')
@@ -139,8 +203,33 @@ with patch.object(ui, 'api_request', side_effect=fake_api):
     assert '一条测试公告' in app.dataframe[0].value.to_string()
 
 
+def test_iwencai_configuration_error_stays_actionable():
+    message = format_api_error("尚未配置 IWENCAI_API_KEY，请在 .env 中配置只读密钥并重启后端。")
+
+    assert message == "尚未配置问财访问密钥。请在 .env 中设置 IWENCAI_API_KEY，并重启后端。"
+
+
+def test_material_query_explains_provider_failure_and_keeps_existing_facts():
+    script = SETUP + """
+st.session_state.facts = [{'fact_id': 'old', 'field': 'news', 'entity': '旧资料', 'value': '保留内容'}]
+def fake_api(base, method, path, payload=None):
+    return {'status': 'unavailable', 'facts': [],
+            'message': '无法建立问财服务连接，请检查网络、DNS 或代理设置后重试。'}
+with patch.object(ui, 'api_request', side_effect=fake_api):
+    ui.render_materials_body('http://localhost')
+"""
+    app = AppTest.from_string(script).run(timeout=15)
+    next(field for field in app.text_input if field.label == '股票、基金或查询条件').set_value('贵州茅台')
+    next(button for button in app.button if button.label == '查询并加入资料').click().run(timeout=15)
+
+    assert not app.exception
+    assert [fact['fact_id'] for fact in app.session_state['facts']] == ['old']
+    assert any('无法建立问财服务连接' in warning.value for warning in app.warning)
+    assert not app.error
+
+
 def test_manual_material_preserves_percent_source_and_date():
-    app = AppTest.from_string(SETUP + "ui.page_materials('http://localhost')").run(timeout=15)
+    app = AppTest.from_string(SETUP + "ui.render_materials_body('http://localhost')").run(timeout=15)
     next(field for field in app.text_input if field.label == '资料涉及的对象').set_value('测试基金')
     next(field for field in app.selectbox if field.label == '指标或资料类型').select('fee_rate')
     app.text_area[0].set_value('0.5%')
@@ -160,7 +249,7 @@ if 'prepared' not in st.session_state:
     st.session_state.prepared = True
     st.session_state.facts = [{'fact_id': 'old', 'field': 'news', 'entity': '旧资料', 'value': '原始新闻'}]
     st.session_state.advice = {'trace_id': 'analysis-1', 'evidence': ['old']}
-ui.page_materials('http://localhost')
+ui.render_materials_body('http://localhost')
 """
     app = AppTest.from_string(script).run(timeout=15)
     next(button for button in app.button if button.label == '清空研究资料').click().run(timeout=15)
@@ -190,6 +279,7 @@ with patch.object(ui, 'api_request', side_effect=fake_api):
 def test_details_uses_selected_result_evidence_not_current_materials():
     script = SETUP + """
 st.session_state.facts = [{'fact_id':'e1','entity':'其他对象','field':'news','value':'不应串入'}]
+st.session_state.analysis_detail_view = '数据溯源'
 st.session_state.advice = {'trace_id':'a1', 'evidence':['e1'], 'compliance':{'status':'REVIEW'},
     'facts':[{'fact_id':'e1','entity':'原对象','field':'news','value':'原始资料'},
              {'fact_id':'e2','entity':'未引用对象','field':'news','value':'未引用资料'}],
@@ -199,11 +289,43 @@ ui.render_analysis_details()
 """
     app = AppTest.from_string(script).run(timeout=15)
     assert not app.exception
-    assert [tab.label for tab in app.tabs] == ['分析观点','数据依据','完成情况']
+    assert [tab.label for tab in app.tabs] == ['结论面板','投资逻辑链','数据溯源','执行记录']
     assert '原始资料' in app.dataframe[0].value.to_string()
     assert '不应串入' not in app.dataframe[0].value.to_string()
     assert any('未被这次分析引用' in item.label for item in app.expander)
     assert not app.metric and not app.code
+
+
+def test_logic_chain_and_source_trace_keep_view_to_fact_relationship():
+    advice = {
+        'evidence': ['price', 'news'],
+        'facts': [
+            {'fact_id': 'price', 'entity': '测试公司', 'field': 'close_price', 'value': 10,
+             'snapshot_time': '2026-09-11T01:00:00Z', 'source_id': 'IWENCAI_SKILLHUB'},
+            {'fact_id': 'news', 'entity': '测试公司', 'field': 'news', 'value': '公司发布公告',
+             'snapshot_time': '2026-09-11T02:00:00Z', 'source_id': 'USER_SUPPLIED:公司财经'},
+            {'fact_id': 'unused', 'entity': '其他公司', 'field': 'news', 'value': '不相关资料',
+             'snapshot_time': '2026-09-11T03:00:00Z', 'source_id': 'USER_SUPPLIED:其他'},
+        ],
+        'agent_results': [
+            {'agent_id': 'security', 'status': 'completed', 'facts_used': ['price', 'news']},
+            {'agent_id': 'industry', 'status': 'degraded', 'facts_used': ['news']},
+        ],
+        'cross_validation': {'status': 'PASS'},
+        'compliance': {'status': 'REVIEW'},
+    }
+
+    stages = analysis_chain_stages(advice)
+    assert [stage['label'] for stage in stages] == ['数据基础', '分项研判', '交叉核验', '风险结论']
+    assert stages[0]['value'] == '2 条引用'
+    assert stages[1]['value'] == '1/2 完成'
+    rows = source_trace_rows(advice)
+    assert len(rows) == 2
+    assert rows[0]['支持分析'] == '个股研究'
+    assert rows[1]['支持分析'] == '个股研究、行业分析'
+    assert rows[0]['来源'] == '同花顺问财'
+    assert all('fact_id' not in row for row in rows)
+    assert all('不相关资料' not in str(row) for row in rows)
 
 
 def test_display_keeps_unmapped_business_fields_and_explicit_percent():
@@ -292,7 +414,7 @@ if 'prepared' not in st.session_state:
     st.session_state.facts = [
         {'fact_id':'one','field':'news','entity':'甲公司','value':'资料甲'},
         {'fact_id':'two','field':'news','entity':'乙公司','value':'资料乙'}]
-ui.page_materials('http://localhost')
+ui.render_materials_body('http://localhost')
 """).run(timeout=15)
     app.multiselect[0].set_value(['one'])
     app.run(timeout=15)
@@ -301,39 +423,41 @@ ui.page_materials('http://localhost')
     assert [fact['fact_id'] for fact in app.session_state['facts']] == ['two']
 
 
-def test_question_page_and_materials_page_are_separate():
-    """问答页只负责提问；取数、补充和整理资料只在“查找资料”页出现。"""
+def test_question_page_embeds_materials_panel():
+    """原“查找资料”页已并入问答页：取数、补充和整理都在提问的同一页完成。"""
     home = AppTest.from_string(SETUP + """
 st.session_state.facts = [{'fact_id': 'f1', 'field': 'news', 'entity': '甲公司', 'value': '资料甲'}]
 ui.page_home('http://localhost')
 """).run(timeout=15)
     assert not home.exception
-    assert not any(field.label == '股票、基金或查询条件' for field in home.text_input)
-    assert not any(field.label == '在资料里查找' for field in home.text_input)
-    assert not any(button.label == '查询并加入资料' for button in home.button)
-    # 问答页仍显示资料概况，并给出跳转入口，而不是把资料页塞进来。
-    assert any('1 条资料' in item.value for item in home.caption)
-    assert any(button.label == '前往查找资料' for button in home.button)
-
-    materials = AppTest.from_string(SETUP + "ui.page_materials('http://localhost')").run(timeout=15)
-    assert not materials.exception
-    assert materials.title[0].value == '查找资料'
-    assert [tab.label for tab in materials.tabs] == ['查询资料', '补充资料', '已有资料']
-    assert not materials.chat_input
+    # 备料控件现在就在问答页内，不必先跳到另一个入口再跳回来。
+    assert any(button.label == '查询并加入资料' for button in home.button)
+    assert any(field.label == '股票、基金或查询条件' for field in home.text_input)
+    assert any(field.label == '在资料里查找' for field in home.text_input)
+    assert [tab.label for tab in home.tabs] == ['查询资料', '补充资料', '已有资料（1）']
+    # 资料概况仍要一眼可见，否则用户不知道提问会参考什么。
+    assert any('1 条研究资料' in item.value for item in home.caption)
+    # 合并后不再保留独立入口，避免同一功能出现两条路径。
+    assert '查找资料' not in NAVIGATION
+    assert NAVIGATION[0] == '投资问答'
 
 
-def test_materials_entry_switches_navigation():
-    app = AppTest.from_string(SETUP + """
-def fake_api(base, method, path, payload=None, **kwargs):
-    return {'id': 1, 'username': 'test-user'} if path == '/auth/me' else None
-with patch.object(ui, 'api_request', side_effect=fake_api), \\
-        patch.object(ui, 'register_browser_session'), patch.object(ui, 'enforce_session_timeout'):
-    ui.main()
+def test_materials_panel_sits_above_ask_controls():
+    """备料面板排在提问控件之前：底部只留输入框和法律声明，不再堆第三块内容。
+
+    ``st.chat_input`` 会被 Streamlit 收进独立的底部容器，因此它不出现在
+    ``main.children`` 里；这里断言的是主内容区的相对顺序。
+    """
+    home = AppTest.from_string(SETUP + """
+st.session_state.facts = [{'fact_id': 'f1', 'field': 'news', 'entity': '甲公司', 'value': '资料甲'}]
+ui.page_home('http://localhost')
 """).run(timeout=15)
-    next(button for button in app.button if button.label == '前往查找资料').click().run(timeout=15)
-    assert not app.exception
-    assert app.radio[0].value == '查找资料'
-    assert app.title[0].value == '查找资料'
-    # 路由后看到的是资料页自己的控件，而不是问答页的输入框。
-    assert any(button.label == '查询并加入资料' for button in app.button)
-    assert not app.chat_input
+    assert not home.exception
+    order = [
+        str(getattr(element, "label", None) or getattr(element, "value", None) or "")
+        for element in home.main.children.values()
+    ]
+    materials_at = next(index for index, text in enumerate(order) if '研究资料（1）' in text)
+    quick_ask_at = next(index for index, text in enumerate(order) if '按研究方向提问' in text)
+    assert materials_at < quick_ask_at
+    assert len(home.chat_input) == 1

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -57,3 +57,28 @@ class ConversationDetail(BaseModel):
     created_at: datetime
     updated_at: datetime
     messages: list[HistoryMessage] = Field(default_factory=list)
+
+
+AssetType = Literal["股票", "基金", "行业", "可转债"]
+
+
+class WatchlistItemCreate(BaseModel):
+    """新增自选标的；名称保留用户输入口径，但清理首尾和重复空白。"""
+
+    target: str = Field(min_length=1, max_length=60)
+    asset_type: AssetType = "股票"
+
+    @field_validator("target")
+    @classmethod
+    def normalize_target(cls, value: str) -> str:
+        normalized = " ".join(value.split())
+        if not normalized:
+            raise ValueError("自选标的不能为空")
+        return normalized
+
+
+class WatchlistItem(BaseModel):
+    id: int
+    target: str
+    asset_type: AssetType
+    created_at: datetime

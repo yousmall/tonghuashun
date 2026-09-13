@@ -229,8 +229,16 @@ class IwencaiSkillHubProvider:
         self.max_retries = max_retries
         self.transport = transport
         self._semaphore = asyncio.Semaphore(max_concurrency)
+        # Provider 是应用级单例；复用一个异步客户端才能真正复用 TCP/TLS 连接池。
+        # 每次调用仍生成独立追踪 ID，并保留原有超时、重试和熔断语义。
+        self._client = httpx.AsyncClient(transport=transport, timeout=timeout_seconds)
         self._failure_count = 0
         self._circuit_open_until: datetime | None = None
+
+    async def aclose(self) -> None:
+        """在应用退出时释放问财连接池。"""
+
+        await self._client.aclose()
 
     @classmethod
     def from_env(cls) -> "IwencaiSkillHubProvider | None":
@@ -316,8 +324,9 @@ class IwencaiSkillHubProvider:
                     "X-Claw-Trace-Id": secrets.token_hex(32),
                 }
                 try:
-                    async with httpx.AsyncClient(transport=self.transport, timeout=self.timeout_seconds) as client:
-                        response = await client.post(f"{self.base_url}{path}", headers=headers, json=payload)
+                    response = await self._client.post(
+                        f"{self.base_url}{path}", headers=headers, json=payload
+                    )
                     response.raise_for_status()
                     self._failure_count = 0
                     return self._normalize(response.json(), entity_hint=entity_hint, channel=channel)

@@ -17,7 +17,7 @@ from backend.app.models import (
     OrchestrationRequest,
     ProfileAssessmentRequest,
 )
-from backend.app.semantic import SemanticService
+from backend.app.semantic import UNAVAILABLE_REASON, SemanticService
 from backend.app.services.profile import assess_profile
 
 
@@ -83,17 +83,141 @@ async def test_intent_is_model_result_with_context_and_no_keyword_override():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("content", [
-    understanding("buy_now"), understanding(confidence=0.1),
+    understanding("buy_now"),
     {**understanding(), "confidence": float("nan")},
     {**understanding(), "risk_rules": ["RUN_SHELL"]},
     {**understanding(), "confirmed": True}, [], None, {},
 ])
-async def test_invalid_or_uncertain_intent_returns_unknown_without_guessing(content):
+async def test_invalid_intent_output_returns_unknown_without_guessing(content):
+    """模型没有给出可用判定（枚举非法、数值越界、多余字段）时才视为不可用。"""
     semantic, calls = service(content)
     result = await semantic.understand(request("请诊断我的持仓组合"))
     assert result.intent is Intent.UNKNOWN
     assert result.confidence == 0
+    assert result.reason == UNAVAILABLE_REASON
     assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_low_confidence_keeps_model_reason_and_downgrades_intent_to_unknown():
+    """模型答得出但自己不确定时，判定仍然有效：保留具体理由，只保守降级意图。
+
+    这类回复恰恰写明了"缺什么才无法归类"；把它替换成统一的"语义判断不可用"
+    会让用户看到一个与真实原因无关的提示。
+    """
+    reason = "未指明具体证券或行业，无法归入 security_research 等类别；缺少风险等级与投资期限"
+    semantic, calls = service({
+        "intent": "security_research", "confidence": 0.5, "risk_rules": [], "reason": reason,
+    })
+    result = await semantic.understand(request("目前推荐买什么股票"))
+    assert result.intent is Intent.UNKNOWN  # 保守降级：不取数、不派专业智能体。
+    assert result.confidence == 0.5  # 保留模型自报置信度，不假装成一次可靠判定。
+    assert result.reason == reason  # 用户看到的是真实原因，而不是兜底文案。
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_understanding_exposes_research_target_as_reuse_key_only():
+    """target 只用于判断"同一份资料是否已取过"，识别不出就留空，不影响意图判断。"""
+
+    semantic, calls = service({**understanding("security_research"), "target": "贵州茅台"})
+    result = await semantic.understand(request("那它的负债情况呢"))
+    assert result.target == "贵州茅台"
+    # 模型必须被明确要求输出该字段，否则复用永远退化成按原话匹配。
+    payload = json.loads(calls[0]["messages"][1]["content"])
+    assert "target" in payload["required_schema"]["properties"]
+
+    # 旧响应没有 target 时依然合法（字段可选），不会因此被判为不可用。
+    legacy, _ = service(understanding("security_research"))
+    result = await legacy.understand(request("那它的负债情况呢"))
+    assert result.intent is Intent.SECURITY_RESEARCH
+    assert result.target is None
+
+
+@pytest.mark.asyncio
+async def test_low_confidence_keeps_research_target():
+    """置信度不足降级为追问时，研究对象不必一起丢掉。"""
+
+    semantic, _ = service({**understanding("security_research", confidence=0.2), "target": "贵州茅台"})
+    result = await semantic.understand(request("那它的负债情况呢"))
+    assert result.intent is Intent.UNKNOWN
+    assert result.target == "贵州茅台"
+
+
+@pytest.mark.asyncio
+async def test_unsupported_input_names_exact_user_fragment_in_fixed_refusal():
+    semantic, calls = service({
+        # 即使模型误给了可执行意图，只要明确标出不可处理片段，后端也应保守降为 UNKNOWN。
+        "intent": "security_research",
+        "confidence": 0.95,
+        "risk_rules": [],
+        "reason": "写诗不属于投资研究助手的能力范围。",
+        "unsupported_part": "再写一首诗",
+    })
+    coordinator = CoordinatorAgent(make_rule_agents(), verify_facts, basic_compliance_check, semantic=semantic)
+
+    result = await coordinator.run(request("分析贵州茅台，再写一首诗"))
+
+    assert result.conclusion == (
+        "我只是个投资助手，无法输出相关信息。"
+        "不能分析的内容：“再写一首诗”。原因：写诗不属于投资研究助手的能力范围。"
+    )
+    assert result.task_plan.clarification_question == result.conclusion
+    assert result.intent is Intent.UNKNOWN
+    assert result.agent_results == []
+    payload = json.loads(calls[0]["messages"][1]["content"])
+    assert "unsupported_part" in payload["required_schema"]["properties"]
+
+
+@pytest.mark.asyncio
+async def test_untrusted_unsupported_fragment_falls_back_to_current_input():
+    semantic, _ = service({
+        "intent": "unknown",
+        "confidence": 0.95,
+        "risk_rules": [],
+        "reason": "该内容不属于投资分析。",
+        "unsupported_part": "用户没有输入的内容",
+    })
+    coordinator = CoordinatorAgent(make_rule_agents(), verify_facts, basic_compliance_check, semantic=semantic)
+
+    result = await coordinator.run(request("帮我制定旅游路线"))
+
+    assert "不能分析的内容：“帮我制定旅游路线”" in result.conclusion
+    assert "用户没有输入的内容" not in result.conclusion
+
+
+@pytest.mark.asyncio
+async def test_blocked_input_uses_same_fixed_refusal_and_identifies_part():
+    reason = "不能提供收益保证。"
+    semantic, _ = service({
+        "intent": "security_research",
+        "confidence": 0.95,
+        "risk_rules": ["NO_RETURN_PROMISE"],
+        "reason": reason,
+        "unsupported_part": "保证下周翻倍",
+    })
+    coordinator = CoordinatorAgent(make_rule_agents(), verify_facts, basic_compliance_check, semantic=semantic)
+
+    result = await coordinator.run(request("分析贵州茅台并保证下周翻倍"))
+
+    assert result.conclusion.startswith("我只是个投资助手，无法输出相关信息。")
+    assert "不能分析的内容：“保证下周翻倍”" in result.conclusion
+    assert result.compliance.status == "BLOCK"
+    assert result.compliance.reason == reason
+
+
+@pytest.mark.asyncio
+async def test_low_confidence_risk_flag_still_gated_before_fetch_or_specialists():
+    """没把握的风险标记只能增加约束，不能让请求更容易被放行。"""
+    reason = "可能要求收益保证，但表述不明确"
+    semantic, _ = service({
+        "intent": "unknown", "confidence": 0.3, "risk_rules": ["NO_RETURN_PROMISE"], "reason": reason,
+    })
+    coordinator = CoordinatorAgent(make_rule_agents(), verify_facts, basic_compliance_check, semantic=semantic)
+    result = await coordinator.run(request("这只能不能保证翻倍"))
+    assert result.compliance.status == "BLOCK"
+    assert result.agent_results == []
+    assert result.compliance.reason == reason  # 拦截理由沿用模型原文，便于用户理解补充方向。
 
 
 @pytest.mark.asyncio
@@ -412,6 +536,30 @@ async def test_thinking_parameter_is_provider_compatible(model, mode, expected):
     await llm.complete_json(system="test", payload={})
     assert sent[0].get("thinking") == expected
     assert sent[0]["max_tokens"] == 2000
+
+
+@pytest.mark.asyncio
+async def test_client_reuses_pool_and_serializes_payload_without_json_padding():
+    sent = []
+
+    def handler(req):
+        body = json.loads(req.content)
+        sent.append(body["messages"][1]["content"])
+        return response({"ok": True})
+
+    llm = OpenAICompatibleLLM(
+        LLMConfig("https://model.test", "fake", "test", max_retries=0),
+        transport=httpx.MockTransport(handler),
+    )
+    client = llm._client
+    try:
+        assert await llm.complete_json(system="test", payload={"query": "测试", "items": [1, 2]}) == {"ok": True}
+        assert await llm.complete_json(system="test", payload={"query": "复用"}) == {"ok": True}
+    finally:
+        await llm.aclose()
+    assert llm._client is client
+    assert len(sent) == 2
+    assert sent[0] == '{"query":"测试","items":[1,2]}'
 
 
 @pytest.mark.asyncio

@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 from backend.app.models import FactRecord
 
 FAST_MARKET_FIELDS = frozenset({"close_price", "change", "volume", "turnover_rate", "volatility"})
@@ -152,3 +154,26 @@ def fact_max_age_seconds(fact: FactRecord) -> int:
     if field in SLOW_FINANCIAL_FIELDS:
         return 90 * 86_400
     return 7 * 86_400
+
+
+# 采信一条事实的最低质量分；低于它的事实既不进结论，也不作为"已有资料"复用。
+MIN_FACT_QUALITY = 0.4
+# 允许的时钟前瞻：超过该偏差的"未来"时间戳视为异常，不能因为错误时钟长期有效。
+FUTURE_FACT_TOLERANCE = timedelta(minutes=5)
+
+
+def fact_is_current(fact: FactRecord, now: datetime) -> bool:
+    """事实是否仍在自身时效窗口内、来源可追溯且质量达标。
+
+    这是核验器（``verify_facts``）与自动取数复用判据共用的唯一口径：只有会通过
+    核验的事实才允许被当作"已有资料"跳过取数，否则会出现"省了取数、却让结论
+    降级"的隐性损失。
+    """
+
+    if not fact.source_id.strip() or fact.quality < MIN_FACT_QUALITY:
+        return False
+    return (
+        now - timedelta(seconds=fact_max_age_seconds(fact))
+        <= fact.snapshot_time
+        <= now + FUTURE_FACT_TOLERANCE
+    )

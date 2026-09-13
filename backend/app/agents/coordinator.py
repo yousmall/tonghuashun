@@ -15,7 +15,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 import json
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -52,6 +52,18 @@ RISK_NOTICE = (
     "以上内容基于所示数据时点和公开/授权信息生成，仅用于投资研究辅助，"
     "不构成收益承诺或交易指令；请结合自身风险承受能力和独立判断审慎决策。"
 )
+UNSUPPORTED_INPUT_PREFIX = "我只是个投资助手，无法输出相关信息"
+
+
+def unsupported_input_message(request: OrchestrationRequest, understanding: RequestUnderstanding) -> str:
+    """用固定口径拒绝无法分析的输入，并引用经过校验的用户原文片段。"""
+
+    part = (understanding.unsupported_part or "").strip()
+    if not part or part not in request.query:
+        part = request.query.strip()[:500]
+    readable_part = " ".join(part.split()) or "当前输入"
+    reason = understanding.reason.strip() or "该内容超出投资研究助手能够处理的范围。"
+    return f"{UNSUPPORTED_INPUT_PREFIX}。不能分析的内容：“{readable_part}”。原因：{reason}"
 
 
 class CoordinatorAgent:
@@ -175,10 +187,10 @@ class CoordinatorAgent:
             # 在执行专业节点前处理风险；API 同时据此跳过外部取数。
             compliance = semantic_compliance(understanding.risk_rules, understanding.reason)
             plan.nodes = []
-            output = self._review_package(plan, compliance.reason or "请求需要复核")
+            output = self._review_package(plan, unsupported_input_message(request, understanding))
             return output.model_copy(update={"compliance": compliance, "confidence": 0})
         if understanding.intent is Intent.UNKNOWN:
-            plan.clarification_question = understanding.reason + " 请说明研究对象与希望解决的问题。"
+            plan.clarification_question = unsupported_input_message(request, understanding)
 
         if plan.clarification_question:
             # 追问不是异常，是刻意的安全业务结果，使用 REVIEW 状态返回给界面。
@@ -490,20 +502,9 @@ def field_label(field: Any) -> str:
 
 
 def fact_max_age_seconds(fact: FactRecord) -> int:
-    """按数据类型返回可接受最大年龄，避免用统一 7 天阈值处理行情和财报。"""
+    """按数据类型返回可接受最大年龄；口径统一由 ``fact_taxonomy`` 维护。"""
 
-    field = fact.field.casefold()
-    if field in FAST_MARKET_FIELDS:
-        return 60
-    if field in NEWS_FIELDS:
-        return 300
-    if field in SCORE_FIELDS:
-        return 900
-    if field in PORTFOLIO_FIELDS:
-        return 86_400
-    if field in SLOW_FINANCIAL_FIELDS:
-        return 90 * 86_400
-    return 7 * 86_400
+    return _TAXONOMY.fact_max_age_seconds(fact)
 
 
 def cross_validate_results(results: list[AgentResult], facts: list[FactRecord]) -> CrossValidationResult:
@@ -589,15 +590,9 @@ async def verify_facts(
     known_fact_ids = {fact.fact_id for fact in facts}
     # 全部使用带时区的 UTC，避免本地时区与数据源时区混用造成错误过期判断。
     current_time = now or datetime.now(timezone.utc)
-    # 只有来源明确且未过期的事实才可继续支撑最终结论。
-    valid_fact_ids = {
-        fact.fact_id
-        for fact in facts
-        # 未来时间超过 5 分钟也视为异常，防止错误时钟让陈旧数据永久有效。
-        if current_time - timedelta(seconds=fact_max_age_seconds(fact)) <= fact.snapshot_time <= current_time + timedelta(minutes=5)
-        and fact.quality >= 0.4
-        and fact.source_id.strip()
-    }
+    # 只有来源明确、质量达标且未过期的事实才可继续支撑最终结论。
+    # 判据与自动取数复用共用 ``fact_is_current``，避免两处时效口径漂移。
+    valid_fact_ids = {fact.fact_id for fact in facts if _TAXONOMY.fact_is_current(fact, current_time)}
     verified: list[AgentResult] = []
     for result in results:
         # invalid 表示根本无来源，stale 表示来源存在但已超过本版本允许的年龄。

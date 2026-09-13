@@ -29,6 +29,8 @@ from .auth_schemas import (
     Credentials,
     HistoryMessage,
     UserSummary,
+    WatchlistItem,
+    WatchlistItemCreate,
 )
 
 __all__ = [
@@ -60,4 +62,6 @@ __all__ = [
     "Credentials",
     "HistoryMessage",
     "UserSummary",
+    "WatchlistItem",
+    "WatchlistItemCreate",
 ]

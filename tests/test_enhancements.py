@@ -151,6 +151,38 @@ async def test_iwencai_provider_normalizes_response_and_never_exposes_key() -> N
 
 
 @pytest.mark.asyncio
+async def test_iwencai_provider_reuses_and_closes_http_client() -> None:
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(200, json={"data": [{"证券简称": "示例", "最新价": 10}]})
+
+    provider = IwencaiSkillHubProvider(
+        "iw-secret",
+        base_url="https://iwencai.example",
+        max_retries=0,
+        transport=httpx.MockTransport(handler),
+    )
+    client = provider._client
+    await provider.get_quote("示例")
+    await provider.get_quote("示例")
+
+    assert provider._client is client
+    assert requests == 2
+    assert client.is_closed is False
+    await provider.aclose()
+    assert client.is_closed is True
+
+
+def test_llm_default_concurrency_covers_all_portfolio_specialists() -> None:
+    config = LLMConfig(base_url="https://llm.example/v1", api_key="secret", model="third-party")
+
+    assert config.max_concurrency == 5
+
+
+@pytest.mark.asyncio
 async def test_iwencai_provider_exposes_selected_skillhub_capabilities() -> None:
     queries: list[str] = []
     paths: list[str] = []

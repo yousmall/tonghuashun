@@ -11,7 +11,7 @@ from typing import Any, Callable
 from uuid import NAMESPACE_URL, uuid5
 
 from backend.app.models import DataAcquisitionResult, FactRecord, Intent, OrchestrationRequest
-from backend.app.fact_taxonomy import fact_max_age_seconds
+from backend.app.fact_taxonomy import fact_is_current, fact_max_age_seconds
 
 
 @dataclass(frozen=True)
@@ -21,6 +21,26 @@ class DataCall:
     label: str
     method: str
     args: tuple[Any, ...]
+    # 复用键：同一能力 + 同一研究目标视为"同一次取数"。它在服务端由语义层抽取的
+    # 研究对象生成，与发给数据源的查询文本无关，因此换一种问法仍能识别出"这份
+    # 资料已经取过"。
+    key: str
+
+
+# 只带查询摘要、没有任何业务字段的调用不算"已经取到资料"：这类返回不是结果，
+# 而是数据源的一次空手而归，下一轮必须重试。
+NON_SUBSTANTIVE_FIELDS = frozenset({"provider_response"})
+
+
+def _target_key(target: str | None, query: str) -> str:
+    """生成复用键里的研究对象标识。
+
+    优先使用语义层抽取的对象；抽取不到时退化为整句查询。退化意味着"换一种问法
+    就会重新取数"——这是刻意的保守行为：没有可靠的对象标识时，不能假定上一轮的
+    资料仍然适用于新问题。
+    """
+
+    return re.sub(r"\s+", "", (target or query or "").strip()).casefold()
 
 
 class AutomatedResearchPipeline:
@@ -41,8 +61,14 @@ class AutomatedResearchPipeline:
         self,
         request: OrchestrationRequest,
         intent: Intent,
+        *,
+        target: str | None = None,
     ) -> tuple[OrchestrationRequest, DataAcquisitionResult]:
-        """返回补齐事实后的请求以及不泄露底层异常的取数审计摘要。"""
+        """返回补齐事实后的请求以及不泄露底层异常的取数审计摘要。
+
+        ``target`` 是语义层抽取的研究对象，仅用于判断"同一份资料本轮是否已经取过"。
+        真正发给数据源的仍是用户原话：问财接受自然语言查询，改写它反而会改变结果。
+        """
 
         supplied = [fact.model_copy(deep=True) for fact in request.facts]
         portfolio_facts = self._portfolio_facts(request)
@@ -67,7 +93,7 @@ class AutomatedResearchPipeline:
                 message="当前请求尚未通过画像/意图闸门，未调用外部数据源。",
             )
 
-        calls = self._calls_for(request, intent)
+        calls = self._calls_for(request, intent, target)
         requested = [call.label for call in calls]
         if self.provider is None:
             derived = derive_scoring_facts(base_facts, now=self.now())
@@ -80,15 +106,19 @@ class AutomatedResearchPipeline:
                 message="未配置问财只读密钥，已仅使用调用方事实和持仓快照。",
             )
 
+        # 追问时最容易浪费的一段：同一目标的资料通常几分钟前才取过。这里先判断
+        # 哪些能力可以直接沿用，只对真正缺资料的能力发起外部调用。
+        reusable, pending = self._split_reusable(calls, base_facts, self.now())
+        reused = [call.label for call in reusable]
         results = await asyncio.gather(
-            *(self._execute(call) for call in calls),
+            *(self._execute(call) for call in pending),
             return_exceptions=True,
         )
         fetched: list[FactRecord] = []
         successful: list[str] = []
         empty: list[str] = []
         failed: list[str] = []
-        for call, result in zip(calls, results, strict=True):
+        for call, result in zip(pending, results, strict=True):
             if isinstance(result, BaseException):
                 failed.append(call.label)
             elif result:
@@ -103,6 +133,17 @@ class AutomatedResearchPipeline:
         if fetched:
             mode = "mixed" if base_facts else "live"
             message = "真实数据已自动获取并进入事实核验、专业分析和合规流程。"
+        elif reused:
+            # 全部计划内的能力都沿用了既有资料：这不是"取数失败"，不能按不可用上报，
+            # 否则界面会告诉用户"未取得最新数据"，把一次正常复用说成故障。
+            mode = "reused"
+            message = (
+                "本次沿用仍在有效期内的已授权资料，未重复调用外部数据源。"
+                if not (failed or empty)
+                # 有沿用也有没取到的（例如数据源熔断）：不能只说"没重复调用"，
+                # 那会让一次残缺的取数看起来完全正常。
+                else "部分资料沿用了有效期内的已有资料，另有能力本次未能取得。"
+            )
         else:
             mode = "unavailable"
             message = "外部数据未返回可用事实，分析已按现有事实安全降级。"
@@ -113,6 +154,7 @@ class AutomatedResearchPipeline:
             provider=getattr(self.provider, "source_id", type(self.provider).__name__),
             requested_capabilities=requested,
             successful_capabilities=successful,
+            reused_capabilities=reused,
             empty_capabilities=empty,
             failed_capabilities=failed,
             supplied_fact_count=len(supplied),
@@ -123,10 +165,85 @@ class AutomatedResearchPipeline:
 
     async def _execute(self, call: DataCall) -> list[FactRecord]:
         method = getattr(self.provider, call.method)
-        return await method(*call.args)
+        facts = await method(*call.args)
+        # 打上来源调用键：下一轮针对同一目标再提问时，据此判断能否直接沿用。
+        return [fact.model_copy(update={"produced_by": call.key}) for fact in facts]
 
-    def _calls_for(self, request: OrchestrationRequest, intent: Intent) -> list[DataCall]:
-        target = request.query
+    def _split_reusable(
+        self,
+        calls: list[DataCall],
+        facts: list[FactRecord],
+        now: datetime,
+    ) -> tuple[list[DataCall], list[DataCall]]:
+        """把计划拆成"沿用已有资料"与"需要真正取数"两组。
+
+        判据是"这次能力上一轮取回的事实，是否**全部**仍在各自时效内"。它刻意不维护
+        "哪些字段才算够用"的清单，原因有二：
+
+        * 数据源每次返回的字段并不稳定（同一次宏观查询，有时给 pmi、有时不给），
+          按字段清单判断会让一次缺字段就永远无法复用；
+        * 逐字段判断需要人工维护映射，一旦与实际返回不符，就会出现"少取了资料却
+          没人发现"的隐性损失，而这里恰恰是最不该出错的地方。
+
+        只沿用整批仍有效的事实，等价于"不重取也能拿到同样这批数据"，因此跳过取数
+        永远不会让结论比不跳过时更差。
+        """
+
+        reusable: list[DataCall] = []
+        pending: list[DataCall] = []
+        for call in calls:
+            if self._covers(call, facts, now):
+                reusable.append(call)
+            else:
+                pending.append(call)
+        return reusable, pending
+
+    @staticmethod
+    def _covers(call: DataCall, facts: list[FactRecord], now: datetime) -> bool:
+        """这次能力上一轮取回的事实是否仍然整批可用。
+
+        供应商每次返回的 ``fact_id`` 都是新的，同一字段会随着多轮追问不断累积历史
+        版本。因此判据取**每个字段的最新一版**：只要最新一版仍然有效，就说明这次
+        能力该拿的字段当前都拿得到；旧版本过期不应永久作废复用。反过来，某个字段
+        只剩过期版本时，仍按"需要重取"处理。
+        """
+
+        latest: dict[str, FactRecord] = {}
+        for fact in facts:
+            if fact.produced_by != call.key:
+                continue
+            field = fact.field.casefold()
+            current = latest.get(field)
+            if current is None or (fact.snapshot_time, fact.quality) > (current.snapshot_time, current.quality):
+                latest[field] = fact
+        if not any(field not in NON_SUBSTANTIVE_FIELDS for field in latest):
+            return False
+        return all(fact_is_current(fact, now) for fact in latest.values())
+
+    @staticmethod
+    def _research_scope(request: OrchestrationRequest, intent: Intent, target: str | None) -> str:
+        """本次取数的研究对象标识，用作复用键。
+
+        组合诊断的"研究对象"就是持仓本身，而持仓在本地是确定的，不必依赖模型抽取：
+        用持仓集合做键，既不会随问法变化，也能在用户真的改了持仓时自动重新取数。
+        其余情况优先用语义层抽取的对象；抽取不到时退化为整句查询，也就是"换一种
+        问法就重新取数"——没有可靠的对象标识时，这是唯一安全的退路。
+        """
+
+        if intent is Intent.PORTFOLIO_REVIEW:
+            entities = sorted(
+                _holding_entity(holding) for holding in request.portfolio if isinstance(holding, dict)
+            )
+            held = [entity for entity in entities if entity]
+            if held:
+                return f"portfolio:{','.join(held)}"
+        return _target_key(target, request.query)
+
+    def _calls_for(
+        self, request: OrchestrationRequest, intent: Intent, target: str | None = None
+    ) -> list[DataCall]:
+        query_text = request.query
+        research_target = self._research_scope(request, intent, target)
         routes: dict[Intent, tuple[tuple[str, str], ...]] = {
             Intent.MARKET_ANALYSIS: (
                 ("macro", "get_macro_data"),
@@ -161,7 +278,9 @@ class AutomatedResearchPipeline:
             Intent.UNKNOWN: (),
         }
         calls = [
-            DataCall(label=name, method=method, args=(target,))
+            # args 仍然是用户原话（问财接受自然语言查询）；key 才用抽取出的研究对象，
+            # 这样"换一种问法问同一只票"能被识别为同一次取数。
+            DataCall(label=name, method=method, args=(query_text,), key=f"{method}@{research_target}")
             for name, method in routes[intent]
         ]
         if intent is Intent.FUND_SCREENING:
@@ -169,7 +288,8 @@ class AutomatedResearchPipeline:
                 "query": request.query,
                 "risk_level": request.profile.risk_level or "未指定",
             }
-            calls.append(DataCall(label="fund", method="get_fund_candidates", args=(filters,)))
+            calls.append(DataCall(label="fund", method="get_fund_candidates", args=(filters,),
+                                  key=f"get_fund_candidates@{research_target}"))
         if intent is Intent.PORTFOLIO_REVIEW:
             for index, holding in enumerate(request.portfolio[: self.max_portfolio_entities], start=1):
                 if not isinstance(holding, dict):
@@ -177,10 +297,14 @@ class AutomatedResearchPipeline:
                 entity = _holding_entity(holding)
                 if not entity:
                     continue
+                # 持仓的取数目标就是持仓名，跨轮天然稳定。
+                holding_key = _target_key(entity, entity)
                 calls.extend(
                     (
-                        DataCall(label=f"quote:{index}:{entity}", method="get_quote", args=(entity,)),
-                        DataCall(label=f"financial:{index}:{entity}", method="get_financial_metrics", args=(entity,)),
+                        DataCall(label=f"quote:{index}:{entity}", method="get_quote", args=(entity,),
+                                 key=f"get_quote@{holding_key}"),
+                        DataCall(label=f"financial:{index}:{entity}", method="get_financial_metrics",
+                                 args=(entity,), key=f"get_financial_metrics@{holding_key}"),
                     )
                 )
         return calls
