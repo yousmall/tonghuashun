@@ -16,7 +16,7 @@ from backend.app.models import FactRecord
 # 截断即可，不影响结论的可追溯性。
 MAX_STORED_EVIDENCE = 60
 
-_FACT_KEYS = ("fact_id", "entity", "field", "value", "snapshot_time", "source_id", "quality", "period")
+_FACT_KEYS = ("fact_id", "entity", "field", "value", "snapshot_time", "source_id", "source_url", "quality", "period")
 
 
 def summarise_advice(advice: dict[str, Any], used_fact_ids: set[str] | None = None) -> dict[str, Any]:
@@ -35,8 +35,10 @@ def summarise_advice(advice: dict[str, Any], used_fact_ids: set[str] | None = No
 
     summary: dict[str, Any] = {
         "trace_id": advice.get("trace_id"),
+        "profile_version": advice.get("profile_version"),
         "snapshot_time": advice.get("snapshot_time"),
         "conclusion": advice.get("conclusion"),
+        "risk_conclusion": advice.get("risk_conclusion"),
         "risks": list(advice.get("risks") or []),
         "next_steps": list(advice.get("next_steps") or []),
         "evidence": list(advice.get("evidence") or []),

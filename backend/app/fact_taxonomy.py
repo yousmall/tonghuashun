@@ -10,9 +10,26 @@ from datetime import datetime, timedelta
 
 from backend.app.models import FactRecord
 
-FAST_MARKET_FIELDS = frozenset({"close_price", "change", "volume", "turnover_rate", "volatility"})
+FAST_MARKET_FIELDS = frozenset(
+    {"close_price", "change", "change_amount", "volume", "turnover_rate", "volatility"}
+)
 NEWS_FIELDS = frozenset({"news", "announcement", "research_report", "news_summary",
                          "announcement_summary", "research_report_summary"})
+# 天然"多条并列"的字段：同一实体在同一时点可以合法存在多条不同记录（两条新闻、
+# 多起事件、多家券商的评级与目标价）。它们之间不存在"同一项记录自相矛盾"，因此
+# 不参与同项取值比对，只作为并列证据呈现与逐条引用。判定标准是"该字段是否逐行
+# 记录"：行情、财务、评分、持仓权重等标量字段仍照常比对。
+MULTI_VALUE_FIELDS = frozenset(
+    {
+        *NEWS_FIELDS,
+        "event",
+        # 机构调研按"每家机构一行"返回，评级/目标价/盈利预测/机构名称都是行内取值。
+        "rating",
+        "target_price",
+        "earnings_forecast",
+        "institution",
+    }
+)
 SCORE_FIELDS = frozenset(
     {
         "growth_score",
@@ -31,19 +48,37 @@ SCORE_FIELDS = frozenset(
         "fund_score",
     }
 )
-SLOW_FINANCIAL_FIELDS = frozenset({"pe_ttm", "pb", "roe", "revenue_growth", "fee_rate", "tracking_error"})
+SLOW_FINANCIAL_FIELDS = frozenset(
+    {
+        # TTM / 静态 / 动态是三种不同口径的市盈率，加权 ROE 也是独立指标；
+        # 它们是同一份财报的并列口径，时效口径一致。
+        "pe_ttm",
+        "pe_static",
+        "pe_dynamic",
+        "pb",
+        "roe",
+        "roe_weighted",
+        "revenue_growth",
+        "fee_rate",
+        "tracking_error",
+    }
+)
 PORTFOLIO_FIELDS = frozenset({"weight", "portfolio_weight", "sector_weight", "fund_risk_level"})
 
 # 面向用户的中文指标名：任何展示给用户的文案都必须经它转换，不能回显内部字段编码。
 FIELD_LABELS: dict[str, str] = {
     "close_price": "最新价",
     "change": "涨跌幅",
+    "change_amount": "涨跌额",
     "volume": "成交量",
     "turnover_rate": "换手率",
     "volatility": "波动率",
-    "pe_ttm": "市盈率",
+    "pe_ttm": "市盈率TTM",
+    "pe_static": "静态市盈率",
+    "pe_dynamic": "动态市盈率",
     "pb": "市净率",
     "roe": "净资产收益率",
+    "roe_weighted": "加权净资产收益率",
     "revenue_growth": "营业收入增长率",
     "fee_rate": "费率",
     "tracking_error": "跟踪误差",

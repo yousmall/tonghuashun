@@ -31,3 +31,7 @@ agent_calling_relationships_zh.docx
 .streamlit/*.log
 .streamlit/*.png
 .streamlit/_visual_preview.py
+
+# Local end-to-end probe script and generated run artifacts
+e2e_browser_probe.py
+examples/last_run_report.json

@@ -78,12 +78,27 @@ def test_register_login_persist_history_and_isolate_users(monkeypatch, request, 
             "/api/v1/auth/login", json={"username": "alice", "password": "wrong-pass"}
         ).status_code == 401
 
+        missing_profile = client.post(
+            "/api/v1/portfolio/analyze", headers=headers,
+            json={"query": "请诊断我的持仓组合", "profile": {"version": 1, "confirmed": True}},
+        )
+        assert missing_profile.status_code == 409
+        profile = client.post(
+            "/api/v1/profile/confirm", headers=headers,
+            json={"profile": {"risk_level": "R3", "confirmed": False, "version": 1}},
+        )
+        assert profile.status_code == 200
+        stale_profile = client.post(
+            "/api/v1/portfolio/analyze", headers=headers,
+            json={"query": "请诊断我的持仓组合", "profile": {"version": 1, "confirmed": True}},
+        )
+        assert stale_profile.status_code == 409
         analyzed = client.post(
             "/api/v1/portfolio/analyze",
             headers=headers,
             json={
                 "query": "请诊断我的持仓组合",
-                "profile": {"user_id": "untrusted-client-value", "risk_level": "R3", "confirmed": True},
+                "profile": {"user_id": "untrusted-client-value", "risk_level": "R5", "confirmed": True, "version": 2},
                 "facts": [
                     {
                         "fact_id": "F-AUTH-1",
@@ -100,6 +115,7 @@ def test_register_login_persist_history_and_isolate_users(monkeypatch, request, 
             },
         )
         assert analyzed.status_code == 200
+        assert analyzed.json()["profile_version"] == 2
 
         histories = client.get("/api/v1/history", headers=headers)
         assert histories.status_code == 200
@@ -110,6 +126,8 @@ def test_register_login_persist_history_and_isolate_users(monkeypatch, request, 
         assert detail.status_code == 200
         assert [message["role"] for message in detail.json()["messages"]] == ["user", "assistant"]
         assert detail.json()["messages"][1]["payload"]["trace_id"] == analyzed.json()["trace_id"]
+        assert detail.json()["messages"][0]["payload"]["profile"]["risk_level"] == "R3"
+        assert detail.json()["messages"][0]["payload"]["profile"]["version"] == 2
 
         added = client.post(
             "/api/v1/watchlist",

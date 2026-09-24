@@ -50,6 +50,22 @@ async def test_portfolio_request_builds_parallel_specialist_dag(semantic) -> Non
 
 
 @pytest.mark.asyncio
+async def test_one_authorized_source_does_not_force_risk_review(semantic) -> None:
+    request = OrchestrationRequest(
+        query="请诊断我的持仓组合",
+        profile=UserProfile(user_id="u-one-source", risk_level="R3", confirmed=True),
+        facts=[FactRecord(
+            fact_id="F-weight", entity="示例ETF", field="weight", value=0.2,
+            snapshot_time=datetime.now(timezone.utc),
+            source_id="IWENCAI_SKILLHUB", quality=0.9,
+        )],
+    )
+    output = await make_coordinator(semantic).run(request)
+    assert output.cross_validation.status == "PASS"
+    assert output.compliance.status == "PASS"
+
+
+@pytest.mark.asyncio
 async def test_unconfirmed_profile_requires_review(semantic) -> None:
     """画像尚未确认时，系统只能追问/复核，不能擅自生成个性化建议。"""
     request = OrchestrationRequest(
@@ -59,6 +75,7 @@ async def test_unconfirmed_profile_requires_review(semantic) -> None:
     output = await make_coordinator(semantic).run(request)
 
     assert output.compliance.status == "REVIEW"
+    assert output.cross_validation.status == "REVIEW"
     assert "确认" in output.conclusion
 
 
@@ -84,3 +101,74 @@ async def test_return_promise_is_blocked(semantic) -> None:
 
     assert output.compliance.status == "BLOCK"
     assert output.confidence == 0
+
+
+
+@pytest.mark.asyncio
+async def test_one_source_risk_conclusion_is_bounded(semantic) -> None:
+    request = OrchestrationRequest(
+        query="请诊断我的持仓组合",
+        profile=UserProfile(user_id="u-risk", risk_level="R3", confirmed=True),
+        facts=[FactRecord(
+            fact_id="F-risk", entity="示例ETF", field="weight", value=0.2,
+            snapshot_time=datetime.now(timezone.utc),
+            source_id="IWENCAI_SKILLHUB", quality=0.9,
+        )],
+    )
+    output = await make_coordinator(semantic).run(request)
+    assert output.cross_validation.status == "PASS"
+    assert output.compliance.status == "PASS"
+    assert "未触发已配置的硬性风险规则" in output.risk_conclusion
+    assert "不表示标的没有投资风险" in output.risk_conclusion
+
+
+@pytest.mark.asyncio
+async def test_concentration_risk_conclusion_uses_confirmed_limit(semantic) -> None:
+    request = OrchestrationRequest(
+        query="请诊断我的持仓组合",
+        profile=UserProfile(
+            user_id="u-concentrated", risk_level="R3", confirmed=True,
+            single_security_limit=0.3,
+        ),
+        portfolio=[{"symbol": "示例ETF", "weight": 0.5}],
+    )
+    output = await make_coordinator(semantic).run(request)
+    assert output.compliance.status == "REVIEW"
+    assert "集中度风险" in output.risk_conclusion
+    assert "比例上限" in output.risk_conclusion
+
+
+@pytest.mark.asyncio
+async def test_same_source_conflict_prevents_certain_risk_conclusion(semantic) -> None:
+    timestamp = datetime.now(timezone.utc)
+    request = OrchestrationRequest(
+        query="请诊断我的持仓组合",
+        profile=UserProfile(user_id="u-conflict", risk_level="R3", confirmed=True),
+        facts=[
+            FactRecord(
+                fact_id=f"F-conflict-{value}", entity="示例ETF",
+                field="weight", value=value, snapshot_time=timestamp,
+                source_id="IWENCAI_SKILLHUB", quality=0.9,
+            )
+            for value in (0.2, 0.25)
+        ],
+    )
+    output = await make_coordinator(semantic).run(request)
+    assert output.cross_validation.status == "REVIEW"
+    assert "INTERNAL_VALUE_CONFLICT" in {issue.code for issue in output.cross_validation.issues}
+    assert "待核对" in output.risk_conclusion
+    assert "规则未触发" not in output.risk_conclusion
+
+
+
+@pytest.mark.asyncio
+async def test_missing_skill_data_cannot_produce_positive_risk_conclusion(semantic) -> None:
+    request = OrchestrationRequest(
+        query="请诊断我的持仓组合",
+        profile=UserProfile(user_id="u-no-data", risk_level="R3", confirmed=True),
+    )
+    output = await make_coordinator(semantic).run(request)
+    assert output.cross_validation.status == "REVIEW"
+    assert output.compliance.status == "REVIEW"
+    assert output.evidence == []
+    assert "缺少通过核验的资料引用" in output.risk_conclusion

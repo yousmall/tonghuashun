@@ -217,6 +217,13 @@ class HybridInvestmentAgent(BaseAgent):
                 candidate.confidence = min(candidate.confidence, baseline.confidence)
                 candidate.confidence_reasons = list(dict.fromkeys(
                     baseline.confidence_reasons + candidate.confidence_reasons))
+            # 模型允许返回 null 分数（"无可比评分"）。但规则基线已经算出了同一批
+            # 事实的确定性分数，模型不得把它抹掉：否则该节点会静默退出共识计算
+            # 与"评分分散"核验，等于让模型自己决定要不要被交叉检查。
+            if candidate.score is None and baseline.score is not None:
+                candidate.score = baseline.score
+                candidate.confidence_reasons = list(dict.fromkeys(
+                    [*candidate.confidence_reasons, "模型未给出评分，沿用规则基线分数"]))
             candidate.details = {
                 **baseline.details, "llm_assessment": candidate.details,
                 "engine": "third_party_llm", "model": self.llm.config.model,

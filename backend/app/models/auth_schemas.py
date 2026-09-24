@@ -51,12 +51,26 @@ class HistoryMessage(BaseModel):
     created_at: datetime
 
 
+class ConversationRename(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+
+    @field_validator("title")
+    @classmethod
+    def normalize_title(cls, value: str) -> str:
+        title = " ".join(value.split())
+        if not title:
+            raise ValueError("对话名称不能为空")
+        return title
+
+
 class ConversationDetail(BaseModel):
     id: str
     title: str
     created_at: datetime
     updated_at: datetime
     messages: list[HistoryMessage] = Field(default_factory=list)
+    has_more: bool = False
+    next_before_id: int | None = None
 
 
 AssetType = Literal["股票", "基金", "行业", "可转债"]

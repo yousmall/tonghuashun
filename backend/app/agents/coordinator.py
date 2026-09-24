@@ -54,6 +54,25 @@ RISK_NOTICE = (
 )
 UNSUPPORTED_INPUT_PREFIX = "我只是个投资助手，无法输出相关信息"
 
+# 语义规则的版本号随判定口径变化而升级，便于按 trace_id 回放当时的规则行为。
+SEMANTIC_RULE_VERSION = "semantic-1.1"
+# 开发手册 9.2 / TC-COM-01 的硬拦截条件写的是"R1 用户要求集中高风险标的"：规则是否
+# 命中由模型判断，但"用户等级是否构成适当性落差"必须由代码用已确认画像复核。实测中
+# 该规则曾被用在只要求横向比较、等级为 R4 的请求上，使整份分析作废。因此这里把等级
+# 前提固化为代码常量：只有保守型（R1）才可能硬拦截，其余等级最多降级为 REVIEW。
+SUITABILITY_RULE = "SUITABILITY_R1_HIGH_RISK"
+SUITABILITY_BLOCK_RISK_LEVELS = frozenset({"R1"})
+SUITABILITY_REVIEW_REASON = (
+    "本次问题涉及高波动标的与资金用途的匹配，风险检查要求人工复核后再作判断。"
+)
+
+
+def is_conservative_profile(risk_level: str | None) -> bool:
+    """判断已确认画像是否属于"高风险集中投入"规则的适用等级。"""
+
+    # 等级缺失或无法识别时不能假设用户是保守型：宁可降级复核，也不能凭空硬拦截。
+    return (risk_level or "").strip().upper() in SUITABILITY_BLOCK_RISK_LEVELS
+
 
 def unsupported_input_message(request: OrchestrationRequest, understanding: RequestUnderstanding) -> str:
     """用固定口径拒绝无法分析的输入，并引用经过校验的用户原文片段。"""
@@ -86,9 +105,6 @@ class CoordinatorAgent:
         # 间接调用任意代码或不存在的“智能体”。
         self.agents = agents
         self.semantic = semantic or SemanticService()
-        # 最近一次编排送入模型的事实切片摘要；由 API 层并入 data_acquisition，
-        # 让"取数成功但研判降级"对用户可解释。
-        self.last_model_slice: dict[str, Any] = {}
         # 编排超时必须覆盖模型的排队、网络与重试总预算，否则会在模型响应前提前降级。
         llm_config = getattr(self.semantic.llm, "config", None)
         self._llm_node_timeout = min(60.0, max(8.0, getattr(llm_config, "timeout_seconds", 6.0) + 1.0))
@@ -172,6 +188,8 @@ class CoordinatorAgent:
 
     async def run(
         self, request: OrchestrationRequest, *, understanding: RequestUnderstanding | None = None,
+        metrics_sink: dict[str, Any] | None = None,
+        progress_sink: Callable[[str], None] | None = None,
     ) -> AdvicePackage:
         """按安全顺序执行计划，并始终返回可审计的 AdvicePackage。
 
@@ -181,14 +199,22 @@ class CoordinatorAgent:
         """
         # UUID 只截取 12 位是为了展示友好；真实审计数据库可保存完整 UUID。
         trace_id = f"T-{uuid4().hex[:12].upper()}"
+        if metrics_sink is not None:
+            metrics_sink.clear()
         understanding = understanding or await self.understand_request(request)
         plan = self.plan(request, trace_id, understanding.intent)
         if understanding.risk_rules:
-            # 在执行专业节点前处理风险；API 同时据此跳过外部取数。
-            compliance = semantic_compliance(understanding.risk_rules, understanding.reason)
+            # 在执行专业节点前处理风险；API 同时据此跳过外部取数。等级前提同样由代码复核。
+            compliance = semantic_compliance(
+                understanding.risk_rules, understanding.reason, risk_level=request.profile.risk_level
+            )
             plan.nodes = []
             output = self._review_package(plan, unsupported_input_message(request, understanding))
-            return output.model_copy(update={"compliance": compliance, "confidence": 0})
+            return output.model_copy(update={
+                "compliance": compliance,
+                "confidence": 0,
+                "risk_conclusion": build_risk_conclusion(compliance, output.cross_validation, []),
+            })
         if understanding.intent is Intent.UNKNOWN:
             plan.clarification_question = unsupported_input_message(request, understanding)
 
@@ -201,8 +227,11 @@ class CoordinatorAgent:
         # 只把与本次意图最相关的事实子集送给模型：全量证据包可能上千条，会直接
         # 超出模型输入预算并让所有节点静默回退规则引擎。核验仍使用完整事实集。
         model_facts, slice_metrics = slice_facts_for_model(request.facts, plan.intent)
-        self.last_model_slice = slice_metrics
+        if metrics_sink is not None:
+            metrics_sink.update(slice_metrics)
         model_view = _RequestView(request, model_facts)
+        if progress_sink is not None:
+            progress_sink("分项研判")
         results = await self._run_parallel(model_view, specialist_nodes)
         # 专业节点的最终状态必须回写到 DAG，前端才能区分完成、失败与降级。
         for node, result in zip(specialist_nodes, results, strict=True):
@@ -210,11 +239,15 @@ class CoordinatorAgent:
         # 核验器可移除不存在/过期的 fact_id，并同步降低结果置信度。
         verification_node = next(node for node in plan.nodes if node.agent_id == "fact_verifier")
         verification_node.status = TaskStatus.RUNNING
+        if progress_sink is not None:
+            progress_sink("事实核验")
         results = await self.verifier(results, request.facts)
         verification_node.status = TaskStatus.COMPLETED
         # 合规器使用核验后的结果作最终判定，保证无来源结论无法被放行。
         compliance_node = next(node for node in plan.nodes if node.agent_id == "compliance")
         compliance_node.status = TaskStatus.RUNNING
+        if progress_sink is not None:
+            progress_sink("风险检查")
         cross_validation = cross_validate_results(results, request.facts)
         compliance = await self.compliance_checker(request, results)
         # 所有专业意见合并为一次语义审核，补充数值一致性检查无法发现的实质矛盾。
@@ -227,7 +260,9 @@ class CoordinatorAgent:
                     risk_notice=RISK_NOTICE, required_disclosures=[RISK_NOTICE],
                 )
             else:
-                semantic_result = semantic_compliance(review.risk_rules, review.reason)
+                semantic_result = semantic_compliance(
+                    review.risk_rules, review.reason, risk_level=request.profile.risk_level
+                )
                 if review.conflicting_agents:
                     cross_validation.status = ComplianceStatus.REVIEW
                     cross_validation.issues.append(CrossValidationIssue(
@@ -243,7 +278,10 @@ class CoordinatorAgent:
                 update={
                     "status": ComplianceStatus.REVIEW,
                     "matched_rules": [*compliance.matched_rules, "CROSS_AGENT_INCONSISTENCY"],
-                    "reason": "跨智能体或跨来源一致性检查发现分歧，需要人工复核。",
+                    "reason": (
+                        cross_validation.issues[0].message
+                        if cross_validation.issues else "交叉核验尚未完成，需要人工复核。"
+                    ),
                 }
             )
         compliance_node.status = TaskStatus.COMPLETED
@@ -256,6 +294,7 @@ class CoordinatorAgent:
                 conclusion="请求未通过合规或适当性审核，未生成投资建议。",
                 confidence=0,
                 risks=[compliance.reason or "触发合规拦截"],
+                risk_conclusion=build_risk_conclusion(compliance, cross_validation, results),
                 user_fit="不适配：请求未通过合规或适当性审核。",
                 next_steps=["调整问题表述或补充已确认画像后重试"],
                 compliance=compliance,
@@ -268,7 +307,10 @@ class CoordinatorAgent:
         usable = [result for result in results if result.status is not TaskStatus.FAILED]
         # 用集合去重后排序，令同样输入获得稳定的证据/风险展示顺序。
         evidence = sorted({fact_id for result in usable for fact_id in result.facts_used})
-        risks = sorted({flag for result in usable for flag in result.risk_flags})
+        risks = sorted({
+            flag for result in usable for flag in result.risk_flags
+            if result.facts_used or flag in {"证据不足", "信息不完整", "证据质量不足"}
+        })
         # 这是第一版的等权平均；生产版可按数据质量、时效、领域权重重新加权。
         confidence = sum(result.confidence for result in usable) / len(usable) if usable else 0
         # 永远显式返回数据时点，前端不得把它改写为含糊的“当前”。
@@ -277,7 +319,7 @@ class CoordinatorAgent:
         # 只有画像已确认时才会走到此处；仍只输出目标区间/诊断而非自动交易指令。
         user_fit = self._user_fit_summary(request)
         allocation = self._allocation_summary(usable, request)
-        next_steps = self._next_steps(results, compliance.status)
+        next_steps = self._next_steps(results, compliance.status, cross_validation)
         return AdvicePackage(
             trace_id=trace_id,
             intent=plan.intent,
@@ -286,6 +328,7 @@ class CoordinatorAgent:
             confidence=round(confidence, 2),
             evidence=evidence,
             risks=risks,
+            risk_conclusion=build_risk_conclusion(compliance, cross_validation, results),
             user_fit=user_fit,
             allocation=allocation,
             next_steps=next_steps,
@@ -359,6 +402,7 @@ class CoordinatorAgent:
             intent=plan.intent,
             conclusion=reason,
             confidence=0,
+            risk_conclusion="画像或分析对象尚待确认，暂不能形成风险判断。",
             user_fit="待确认：尚未具备生成个性化建议的必要条件。",
             next_steps=["确认画像或补充希望分析的对象与授权事实"],
             compliance=ComplianceResult(
@@ -380,15 +424,22 @@ class CoordinatorAgent:
         此处故意不做投票或“取平均意见”：基本面偏正面、技术面过热等冲突应作为
         不同观点保留给用户与合规器，而非伪造一个单一确定结论。
         """
-        if not results:
-            # 无可用结果时必须明确证据不足，而不是输出空的“建议”。
+        supported = [result for result in results if result.facts_used]
+        if not supported:
+            # 未引用核验事实的观点只能留在分项状态，不能进入风险结论。
             return "证据不足，暂不输出投资建议。"
         # 节点标识和分数保留在结构化结果中，用户摘要按主题分段。
         labels = {"market": "市场", "industry": "行业", "security": "个股", "fund": "基金", "portfolio": "持仓"}
         opinions = "\n\n".join(
-            f"{labels.get(result.agent_id, '分析')}：{result.opinion}" for result in results
+            f"{labels.get(result.agent_id, '分析')}：{result.opinion}" for result in supported
         )
-        prefix = "仍需进一步确认，以下内容仅供参考。\n\n" if status is ComplianceStatus.REVIEW else ""
+        prefix = ""
+        if status is ComplianceStatus.REVIEW:
+            prefix = (
+                "交叉核验尚未完成，以下分项判断仅供复核参考。\n\n"
+                if cross_validation.status is ComplianceStatus.REVIEW
+                else "风险检查提示需要复核，以下分项判断仅供参考。\n\n"
+            )
         return f"{prefix}{opinions}"
 
     @staticmethod
@@ -440,10 +491,16 @@ class CoordinatorAgent:
         return []
 
     @staticmethod
-    def _next_steps(results: list[AgentResult], status: ComplianceStatus) -> list[str]:
+    def _next_steps(
+        results: list[AgentResult], status: ComplianceStatus,
+        cross_validation: CrossValidationResult,
+    ) -> list[str]:
         """把降级原因转化为可操作下一步，避免用户只看到模糊的低置信度。"""
         steps: list[str] = []
-        if status is ComplianceStatus.REVIEW:
+        issue_codes = {issue.code for issue in cross_validation.issues}
+        if "EVIDENCE_REFERENCE_REJECTED" in issue_codes:
+            steps.append("刷新缺失或过期的资料并重新分析；仍无法核实时转人工复核")
+        if status is ComplianceStatus.REVIEW and not steps:
             steps.append("补充有来源、含时间戳的事实后重新核验")
         if any(result.status in {TaskStatus.DEGRADED, TaskStatus.UNKNOWN} for result in results):
             steps.append("补齐各专业智能体列出的缺失字段")
@@ -454,6 +511,7 @@ class CoordinatorAgent:
 
 FAST_MARKET_FIELDS = _TAXONOMY.FAST_MARKET_FIELDS
 NEWS_FIELDS = _TAXONOMY.NEWS_FIELDS
+MULTI_VALUE_FIELDS = _TAXONOMY.MULTI_VALUE_FIELDS
 SCORE_FIELDS = _TAXONOMY.SCORE_FIELDS
 SLOW_FINANCIAL_FIELDS = _TAXONOMY.SLOW_FINANCIAL_FIELDS
 PORTFOLIO_FIELDS = _TAXONOMY.PORTFOLIO_FIELDS
@@ -508,32 +566,118 @@ def fact_max_age_seconds(fact: FactRecord) -> int:
 
 
 def cross_validate_results(results: list[AgentResult], facts: list[FactRecord]) -> CrossValidationResult:
-    """检查跨来源事实冲突和跨 Agent 评分分歧，并生成置信加权共识。"""
+    """用已核验引用检查同项记录、派生依据与专业观点的一致性。"""
 
     issues: list[CrossValidationIssue] = []
-    grouped: dict[tuple[str, str, str | None], list[FactRecord]] = {}
+    facts_by_id = {fact.fact_id: fact for fact in facts}
+    used_ids = {
+        fact_id for result in results if result.status is not TaskStatus.FAILED
+        for fact_id in result.facts_used
+    }
+    if results and not used_ids:
+        issues.append(CrossValidationIssue(
+            code="NO_VERIFIED_EVIDENCE",
+            severity="warning",
+            message="本次没有可核验的资料引用，无法完成交叉核对。",
+        ))
+    # 派生评分不是第二个数据源；沿 derived_from 回溯原始资料。
+    roots: dict[str, FactRecord] = {}
+
+    def add_roots(fact_id: str, visited: set[str]) -> None:
+        if fact_id in visited or fact_id not in facts_by_id:
+            return
+        visited.add(fact_id)
+        fact = facts_by_id[fact_id]
+        if fact.derived_from:
+            for parent_id in fact.derived_from:
+                add_roots(parent_id, visited)
+        else:
+            roots[fact.fact_id] = fact
+
+    for fact_id in used_ids:
+        add_roots(fact_id, set())
+
+    # 对已引用指标，同时检查同一数据包里的其它有效同项记录。
+    # 否则智能体只引用其中一条时，冲突记录会被遗漏。
+    relevant_keys = {
+        (fact.entity, fact.field.casefold(), fact.period) for fact in roots.values()
+    }
+    now = datetime.now(timezone.utc)
     for fact in facts:
-        # 分组键中的 period 同时承载两种含义：财务数据的报告期，以及综合搜索
-        # （公告/新闻/研报）中单条记录的身份标识。同一实体因此可以合法持有多条
-        # 取值不同的记录，而跨来源比对同一份记录时仍会归入同一组并检出冲突。
+        key = (fact.entity, fact.field.casefold(), fact.period)
+        if (
+            key in relevant_keys
+            and not fact.derived_from
+            and not fact.source_id.upper().startswith("DERIVED_")
+            and _TAXONOMY.fact_is_current(fact, now)
+        ):
+            roots[fact.fact_id] = fact
+
+    # 一个授权来源也可能返回同一报告期的矛盾记录。实时行情的不同
+    # 快照可正常变化；只有相同时点取值不一致时才按冲突处理。
+    # 天然多条的字段（新闻/公告/研报/事件、多机构评级与目标价）不进入该分组。
+    grouped: dict[tuple[str, str, str | None], list[FactRecord]] = {}
+    for fact in roots.values():
         grouped.setdefault((fact.entity, fact.field.casefold(), fact.period), []).append(fact)
-    for records in grouped.values():
-        if len({json.dumps(record.value, ensure_ascii=False, sort_keys=True, default=str) for record in records}) > 1:
-            issues.append(
-                CrossValidationIssue(
+
+    for (entity, field, period), records in grouped.items():
+        # 天然多条的字段（新闻/公告/研报/事件、多机构评级与目标价）本来就该有
+        # 多条不同取值，按"同一项记录"比对只会产生误报。它们只逐条引用与展示。
+        if field in MULTI_VALUE_FIELDS:
+            continue
+        by_source: dict[str, list[FactRecord]] = {}
+        for record in records:
+            by_source.setdefault(record.source_id, []).append(record)
+        latest_by_source: list[FactRecord] = []
+        for source_records in by_source.values():
+            same_time: dict[datetime, set[str]] = {}
+            for record in source_records:
+                value = json.dumps(record.value, ensure_ascii=False, sort_keys=True, default=str)
+                same_time.setdefault(record.snapshot_time, set()).add(value)
+            values = {
+                json.dumps(record.value, ensure_ascii=False, sort_keys=True, default=str)
+                for record in source_records
+            }
+            if len(values) > 1 and (
+                period is not None or any(len(items) > 1 for items in same_time.values())
+            ):
+                issues.append(CrossValidationIssue(
+                    code="INTERNAL_VALUE_CONFLICT",
+                    severity="warning",
+                    message=f"{entity_label(entity)}的{field_label(field)}在同一来源的同项记录中不一致，需核对时间与口径。",
+                    fact_ids=[record.fact_id for record in source_records],
+                ))
+            latest_by_source.append(max(source_records, key=lambda record: record.snapshot_time))
+        if len(latest_by_source) >= 2:
+            values = {
+                json.dumps(record.value, ensure_ascii=False, sort_keys=True, default=str)
+                for record in latest_by_source
+            }
+            if len(values) > 1:
+                issues.append(CrossValidationIssue(
                     code="SOURCE_VALUE_CONFLICT",
                     severity="warning",
-                    message=f"{entity_label(records[0].entity)}的{field_label(records[0].field)}存在不同来源数值不一致，已按较新资料处理。",
-                    fact_ids=[record.fact_id for record in records],
-                )
-            )
+                    message=f"{entity_label(entity)}的{field_label(field)}在不同来源的同项记录中不一致，需核对时间与口径。",
+                    fact_ids=[record.fact_id for record in latest_by_source],
+                ))
+
+    labels = {"market": "市场", "industry": "行业", "security": "个股",
+              "fund": "基金", "portfolio": "持仓"}
+    for result in results:
+        rejected = (result.details or {}).get("rejected_reference_count", 0)
+        if isinstance(rejected, int) and rejected > 0:
+            issues.append(CrossValidationIssue(
+                code="EVIDENCE_REFERENCE_REJECTED",
+                severity="warning",
+                message=f"{labels.get(result.agent_id, '相关')}分析有 {rejected} 条引用未通过核验，相关观点已降级。",
+                agent_ids=[result.agent_id],
+            ))
 
     scored = [result for result in results if result.score is not None and result.confidence > 0]
     total_weight = sum(result.confidence for result in scored)
     consensus_score = (
         sum(float(result.score) * result.confidence for result in scored) / total_weight
-        if total_weight
-        else None
+        if total_weight else None
     )
     dissenting: list[str] = []
     supporting: list[str] = []
@@ -544,25 +688,23 @@ def cross_validate_results(results: list[AgentResult], facts: list[FactRecord]) 
             else:
                 supporting.append(result.agent_id)
     if len(scored) >= 3 and max(float(result.score) for result in scored) - min(float(result.score) for result in scored) >= 35:
-        issues.append(
-            CrossValidationIssue(
-                code="AGENT_SCORE_DISPERSION",
-                severity="warning",
-                message="专业智能体评分分散度较高，协调器保留分歧并要求人工复核。",
-                agent_ids=[result.agent_id for result in scored],
-            )
-        )
+        issues.append(CrossValidationIssue(
+            code="AGENT_SCORE_DISPERSION",
+            severity="warning",
+            message="专业分析的评分差距较大，系统保留分歧并要求人工复核。",
+            agent_ids=[result.agent_id for result in scored],
+        ))
     for result in results:
         if result.status is TaskStatus.COMPLETED and not result.facts_used:
-            issues.append(
-                CrossValidationIssue(
-                    code="COMPLETED_WITHOUT_EVIDENCE",
-                    severity="critical",
-                    message=f"{result.agent_id} 声称完成但没有通过核验的事实引用。",
-                    agent_ids=[result.agent_id],
-                )
-            )
-    status = ComplianceStatus.REVIEW if any(issue.severity in {"warning", "critical"} for issue in issues) else ComplianceStatus.PASS
+            issues.append(CrossValidationIssue(
+                code="COMPLETED_WITHOUT_EVIDENCE",
+                severity="critical",
+                message=f"{labels.get(result.agent_id, '相关')}分析没有通过核验的资料引用。",
+                agent_ids=[result.agent_id],
+            ))
+    status = ComplianceStatus.REVIEW if any(
+        issue.severity in {"warning", "critical"} for issue in issues
+    ) else ComplianceStatus.PASS
     confidence = sum(result.confidence for result in scored) / len(scored) if scored else 0
     return CrossValidationResult(
         status=status,
@@ -582,34 +724,88 @@ async def verify_facts(
 ) -> list[AgentResult]:
     """最小事实核验器：剔除无来源或过期事实，并降低结果置信度。
 
-    这是可运行的基础实现，并不替代生产级实体消歧、报表口径核验、指标重算和
-    双源交叉验证。它先确保每一个 ``facts_used`` 都能在本次授权事实中找到，
+    这是可运行的基础实现，并不替代生产级实体消歧、报表口径核验和
+    指标重算。它先确保每一个 ``facts_used`` 都能在本次授权事实中找到，
     再按行情、新闻、评分、持仓与财务字段应用不同的时效阈值。
     """
-    # 先建立存在性集合，以 O(1) 复杂度发现智能体引用了不存在的事实 ID。
-    known_fact_ids = {fact.fact_id for fact in facts}
     # 全部使用带时区的 UTC，避免本地时区与数据源时区混用造成错误过期判断。
     current_time = now or datetime.now(timezone.utc)
-    # 只有来源明确、质量达标且未过期的事实才可继续支撑最终结论。
-    # 判据与自动取数复用共用 ``fact_is_current``，避免两处时效口径漂移。
-    valid_fact_ids = {fact.fact_id for fact in facts if _TAXONOMY.fact_is_current(fact, current_time)}
+    facts_by_id = {fact.fact_id: fact for fact in facts}
+    known_fact_ids = set(facts_by_id)
+    validity_cache: dict[str, bool] = {}
+
+    def valid_chain(fact_id: str, visiting: set[str]) -> bool:
+        cached = validity_cache.get(fact_id)
+        if cached is not None:
+            return cached
+        fact = facts_by_id.get(fact_id)
+        if fact is None or fact_id in visiting or not _TAXONOMY.fact_is_current(fact, current_time):
+            return False
+        if fact.source_id.upper().startswith("DERIVED_") and not fact.derived_from:
+            return False
+        visiting.add(fact_id)
+        valid = all(valid_chain(parent_id, visiting) for parent_id in fact.derived_from)
+        visiting.remove(fact_id)
+        validity_cache[fact_id] = valid
+        return valid
+
+    # 派生评分的每条原始输入也必须存在、可追溯、质量合格且仍在时效内。
+    valid_fact_ids = {fact_id for fact_id in known_fact_ids if valid_chain(fact_id, set())}
     verified: list[AgentResult] = []
     for result in results:
-        # invalid 表示根本无来源，stale 表示来源存在但已超过本版本允许的年龄。
-        invalid = set(result.facts_used) - known_fact_ids
-        stale = set(result.facts_used) - valid_fact_ids
-        if invalid or stale:
+        # 无效引用包括不存在、过期、低质量或派生链条不完整的事实。
+        rejected = set(result.facts_used) - valid_fact_ids
+        if rejected:
             # 深拷贝避免原始专业结果被就地修改，便于审计时保留原始响应。
             result = result.model_copy(deep=True)
             # 此结果仍可被展示，但必须标为降级并设置置信度上限。
+            rejected_count = len(rejected)
             result.status = TaskStatus.DEGRADED
-            result.confidence = min(result.confidence, 0.4)
-            result.confidence_reasons.append("存在无来源、低质量或过期事实")
-            result.risk_flags.append("证据质量不足")
-            # 删除不合格引用，确保 AdvicePackage.evidence 中不会含无效事实 ID。
             result.facts_used = [fact_id for fact_id in result.facts_used if fact_id in valid_fact_ids]
+            result.confidence = min(result.confidence, 0.4) if result.facts_used else 0
+            result.confidence_reasons.append("存在无来源、低质量或过期事实")
+            # 原观点和风险文字可能含被剔除事实，不能继续作为已核实结论展示。
+            result.opinion = "部分引用未通过核验，该维度暂不形成确定判断。"
+            result.score = None
+            result.risk_flags = ["证据质量不足"]
+            result.invalidation_conditions = ["刷新资料并重新核验"]
+            result.citations = sorted({
+                fact.source_id for fact in facts if fact.fact_id in result.facts_used
+            })
+            result.details = {"rejected_reference_count": rejected_count}
         verified.append(result)
     return verified
+
+
+def build_risk_conclusion(
+    compliance: ComplianceResult,
+    cross_validation: CrossValidationResult,
+    results: list[AgentResult],
+) -> str:
+    """只根据已核验结果、同源一致性和固定规则形成有边界的风险判断。"""
+
+    if compliance.status is ComplianceStatus.BLOCK:
+        return "风险检查已拦截，本次未形成投资风险结论。"
+
+    rules = set(compliance.matched_rules)
+    identified: list[str] = []
+    if "SINGLE_SECURITY_CONCENTRATION" in rules:
+        identified.append("持仓超过已确认的单标的比例上限，存在集中度风险")
+    if "RETURN_DRAWDOWN_MISMATCH" in rules:
+        identified.append("期望收益与可接受回撤明显不匹配")
+    if identified:
+        finding = "；".join(identified) + "；请先核对持仓与风险边界。"
+        if cross_validation.status is not ComplianceStatus.PASS:
+            finding += "同时资料交叉核验待完成，暂不形成完整的风险判断。"
+        return finding
+
+    if not any(result.facts_used for result in results):
+        return "缺少通过核验的资料引用，暂不能形成风险判断。"
+    if cross_validation.status is not ComplianceStatus.PASS:
+        return "本次资料的引用、时点、同项记录或分项观点存在待核对之处，暂不能形成可靠的风险判断。"
+    if compliance.status is not ComplianceStatus.PASS:
+        return "资料已完成交叉核验，但风险或适当性检查仍待复核，暂不能形成确定的风险判断。"
+    return "基于本次已核验资料与已确认画像，未触发已配置的硬性风险规则；这不表示标的没有投资风险。"
 
 
 async def basic_compliance_check(
@@ -669,14 +865,31 @@ async def basic_compliance_check(
     )
 
 
-def semantic_compliance(rules: list[str], reason: str) -> ComplianceResult:
-    """规则 ID 来自受限枚举，优先级由代码决定，模型不能自行放行。"""
-    hard_blocks = {"PRIVACY_AND_PERMISSION", "NO_RETURN_PROMISE", "SUITABILITY_R1_HIGH_RISK"}
-    status = (ComplianceStatus.BLOCK if hard_blocks.intersection(rules)
-              else ComplianceStatus.REVIEW if rules else ComplianceStatus.PASS)
+def semantic_compliance(
+    rules: list[str], reason: str, *, risk_level: str | None = None
+) -> ComplianceResult:
+    """规则 ID 来自受限枚举，优先级由代码决定，模型不能自行放行，也不能自行升级。
+
+    ``SUITABILITY_R1_HIGH_RISK`` 的拦截前提包含"用户是保守型（R1）"这一等级条件，
+    该条件由 :func:`is_conservative_profile` 用已确认画像校验：等级不满足时规则仍然
+    记录在 ``matched_rules`` 中供审计，但只降级为 REVIEW——既不放行，也不让一次措辞
+    误判把整份研究作废。隐私与收益保证类规则与画像无关，始终可以硬拦截。
+    """
+
+    normalized = sorted({rule.strip() for rule in rules if rule and rule.strip()})
+    adaptation_unverified = (
+        SUITABILITY_RULE in normalized and not is_conservative_profile(risk_level)
+    )
+    hard_blocks = {"PRIVACY_AND_PERMISSION", "NO_RETURN_PROMISE"}
+    if SUITABILITY_RULE in normalized and not adaptation_unverified:
+        hard_blocks.add(SUITABILITY_RULE)
+    status = (ComplianceStatus.BLOCK if hard_blocks.intersection(normalized)
+              else ComplianceStatus.REVIEW if normalized else ComplianceStatus.PASS)
+    # 等级前提不成立时用固定的中文说明替代模型的适当性推断，避免把内部推理原样交给用户。
+    explanation = SUITABILITY_REVIEW_REASON if adaptation_unverified and status is ComplianceStatus.REVIEW else reason
     return ComplianceResult(
-        status=status, matched_rules=sorted(set(rules)), reason=reason,
-        risk_notice=RISK_NOTICE, required_disclosures=[RISK_NOTICE], rule_version="semantic-1.0",
+        status=status, matched_rules=normalized, reason=explanation,
+        risk_notice=RISK_NOTICE, required_disclosures=[RISK_NOTICE], rule_version=SEMANTIC_RULE_VERSION,
     )
 
 

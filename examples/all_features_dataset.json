@@ -6,7 +6,7 @@
     "run": "python examples/run_all_features.py            # 全量（会调用真实模型/数据源）",
     "run_offline": "python examples/run_all_features.py --only-scenarios 27,29,30,31,32,37  # 不依赖外部服务的本地可复现子集",
     "list": "python examples/run_all_features.py --list",
-    "time_rule": "所有 facts 的 snapshot_time 由脚本按 snapshot_age_minutes 相对当前 UTC 重算（now - age），因此时效核验结果可复现：行情 60 秒、新闻/公告/研报 5 分钟、评分 15 分钟、持仓 1 天、财务 90 天。",
+    "time_rule": "所有 facts 的 snapshot_time 由脚本按 snapshot_age_minutes 相对当前 UTC 重算（now - age），因此时效核验结果可复现：行情 60 秒、新闻/公告/研报 5 分钟、评分 15 分钟（数据集内评分事实统一取 5 分钟，留出请求耗时余量）、持仓 1 天、财务 90 天。",
     "quality_rule": "quality >= 0.4 且 source_id 非空的事实才可能进入最终证据；否则被核验剔除并让相关节点降为 degraded。",
     "secrets": "本文件不含任何真实密钥、数据库口令或模型密钥；账号密码仅用于本地演示库。"
   },
@@ -91,19 +91,19 @@
       { "fact_id": "MACRO-PPI", "entity": "宏观数据", "field": "ppi", "value": -0.8, "snapshot_age_minutes": 40, "source_id": "USER_SUPPLIED:国家统计局月度公布", "quality": 0.9, "period": "202607" },
       { "fact_id": "MACRO-RATE", "entity": "宏观数据", "field": "interest_rate", "value": 1.5, "snapshot_age_minutes": 60, "source_id": "USER_SUPPLIED:全国银行间同业拆借中心 LPR", "quality": 0.9 },
       { "fact_id": "MACRO-SF", "entity": "宏观数据", "field": "social_financing", "value": 3.2, "snapshot_age_minutes": 120, "source_id": "USER_SUPPLIED:央行社会融资规模", "quality": 0.85, "period": "202607" },
-      { "fact_id": "MACRO-GROWTH-SCORE", "entity": "宏观数据", "field": "growth_score", "value": 56, "snapshot_age_minutes": 20, "source_id": "USER_SUPPLIED:研究员月度打分", "quality": 0.9, "period": "202607" },
-      { "fact_id": "MACRO-INFLATION-SCORE", "entity": "宏观数据", "field": "inflation_score", "value": 62, "snapshot_age_minutes": 20, "source_id": "USER_SUPPLIED:研究员月度打分", "quality": 0.9, "period": "202607" },
-      { "fact_id": "MACRO-LIQUIDITY-SCORE", "entity": "宏观数据", "field": "liquidity_score", "value": 58, "snapshot_age_minutes": 20, "source_id": "USER_SUPPLIED:研究员月度打分", "quality": 0.9, "period": "202607" },
-      { "fact_id": "MACRO-POLICY-SCORE", "entity": "宏观数据", "field": "policy_score", "value": 60, "snapshot_age_minutes": 20, "source_id": "USER_SUPPLIED:研究员月度打分", "quality": 0.9, "period": "202607" },
-      { "fact_id": "MACRO-RISK-SCORE", "entity": "宏观数据", "field": "risk_appetite_score", "value": 52, "snapshot_age_minutes": 20, "source_id": "USER_SUPPLIED:研究员月度打分", "quality": 0.9, "period": "202607" }
+      { "fact_id": "MACRO-GROWTH-SCORE", "entity": "宏观数据", "field": "growth_score", "value": 56, "snapshot_age_minutes": 5, "source_id": "USER_SUPPLIED:研究员月度打分", "quality": 0.9, "period": "202607" },
+      { "fact_id": "MACRO-INFLATION-SCORE", "entity": "宏观数据", "field": "inflation_score", "value": 62, "snapshot_age_minutes": 5, "source_id": "USER_SUPPLIED:研究员月度打分", "quality": 0.9, "period": "202607" },
+      { "fact_id": "MACRO-LIQUIDITY-SCORE", "entity": "宏观数据", "field": "liquidity_score", "value": 58, "snapshot_age_minutes": 5, "source_id": "USER_SUPPLIED:研究员月度打分", "quality": 0.9, "period": "202607" },
+      { "fact_id": "MACRO-POLICY-SCORE", "entity": "宏观数据", "field": "policy_score", "value": 60, "snapshot_age_minutes": 5, "source_id": "USER_SUPPLIED:研究员月度打分", "quality": 0.9, "period": "202607" },
+      { "fact_id": "MACRO-RISK-SCORE", "entity": "宏观数据", "field": "risk_appetite_score", "value": 52, "snapshot_age_minutes": 5, "source_id": "USER_SUPPLIED:研究员月度打分", "quality": 0.9, "period": "202607" }
     ],
 
     "industry_new_energy": [
-      { "fact_id": "IND-NE-PROSPERITY", "entity": "新能源车", "field": "prosperity_score", "value": 68, "snapshot_age_minutes": 25, "source_id": "USER_SUPPLIED:行业景气度月度跟踪", "quality": 0.88, "period": "202607" },
-      { "fact_id": "IND-NE-VALUATION", "entity": "新能源车", "field": "valuation_score", "value": 72, "snapshot_age_minutes": 25, "source_id": "USER_SUPPLIED:行业估值分位", "quality": 0.88, "period": "202607" },
-      { "fact_id": "IND-NE-FLOW", "entity": "新能源车", "field": "capital_flow_score", "value": 61, "snapshot_age_minutes": 25, "source_id": "USER_SUPPLIED:行业资金流向", "quality": 0.85, "period": "202607" },
-      { "fact_id": "IND-NE-CROWDING", "entity": "新能源车", "field": "crowding_score", "value": 45, "snapshot_age_minutes": 25, "source_id": "USER_SUPPLIED:行业拥挤度", "quality": 0.85, "period": "202607" },
-      { "fact_id": "IND-NE-POLICY", "entity": "新能源车", "field": "policy_score", "value": 66, "snapshot_age_minutes": 25, "source_id": "USER_SUPPLIED:行业政策跟踪", "quality": 0.85, "period": "202607" }
+      { "fact_id": "IND-NE-PROSPERITY", "entity": "新能源车", "field": "prosperity_score", "value": 68, "snapshot_age_minutes": 5, "source_id": "USER_SUPPLIED:行业景气度月度跟踪", "quality": 0.88, "period": "202607" },
+      { "fact_id": "IND-NE-VALUATION", "entity": "新能源车", "field": "valuation_score", "value": 72, "snapshot_age_minutes": 5, "source_id": "USER_SUPPLIED:行业估值分位", "quality": 0.88, "period": "202607" },
+      { "fact_id": "IND-NE-FLOW", "entity": "新能源车", "field": "capital_flow_score", "value": 61, "snapshot_age_minutes": 5, "source_id": "USER_SUPPLIED:行业资金流向", "quality": 0.85, "period": "202607" },
+      { "fact_id": "IND-NE-CROWDING", "entity": "新能源车", "field": "crowding_score", "value": 45, "snapshot_age_minutes": 5, "source_id": "USER_SUPPLIED:行业拥挤度", "quality": 0.85, "period": "202607" },
+      { "fact_id": "IND-NE-POLICY", "entity": "新能源车", "field": "policy_score", "value": 66, "snapshot_age_minutes": 5, "source_id": "USER_SUPPLIED:行业政策跟踪", "quality": 0.85, "period": "202607" }
     ],
 
     "security_600519": [
@@ -115,11 +115,11 @@
       { "fact_id": "FFIN-600519-PB", "entity": "600519", "field": "pb", "value": 7.8, "snapshot_age_minutes": 2880, "source_id": "USER_SUPPLIED:2026 年一季报", "quality": 0.9, "period": "2026Q1" },
       { "fact_id": "FFIN-600519-ROE", "entity": "600519", "field": "roe", "value": 0.31, "snapshot_age_minutes": 2880, "source_id": "USER_SUPPLIED:2026 年一季报", "quality": 0.9, "period": "2026Q1" },
       { "fact_id": "FFIN-600519-REVGROWTH", "entity": "600519", "field": "revenue_growth", "value": 0.14, "snapshot_age_minutes": 2880, "source_id": "USER_SUPPLIED:2026 年一季报", "quality": 0.9, "period": "2026Q1" },
-      { "fact_id": "FSCORE-600519-FUNDAMENTAL", "entity": "600519", "field": "fundamental_score", "value": 78, "snapshot_age_minutes": 20, "source_id": "USER_SUPPLIED:研究员基本面评分", "quality": 0.88, "period": "2026Q1" },
-      { "fact_id": "FSCORE-600519-TECHNICAL", "entity": "600519", "field": "technical_score", "value": 40, "snapshot_age_minutes": 20, "source_id": "USER_SUPPLIED:技术面评分", "quality": 0.85 },
-      { "fact_id": "FSCORE-600519-VALUATION", "entity": "600519", "field": "valuation_score", "value": 57, "snapshot_age_minutes": 20, "source_id": "USER_SUPPLIED:估值评分", "quality": 0.85, "period": "2026Q1" },
-      { "fact_id": "FSCORE-600519-EVENT", "entity": "600519", "field": "event_score", "value": 55, "snapshot_age_minutes": 20, "source_id": "USER_SUPPLIED:事件影响评分", "quality": 0.8 },
-      { "fact_id": "FSCORE-600519-GOVERNANCE", "entity": "600519", "field": "governance_score", "value": 80, "snapshot_age_minutes": 20, "source_id": "USER_SUPPLIED:公司治理评分", "quality": 0.8, "period": "2026Q1" },
+      { "fact_id": "FSCORE-600519-FUNDAMENTAL", "entity": "600519", "field": "fundamental_score", "value": 78, "snapshot_age_minutes": 5, "source_id": "USER_SUPPLIED:研究员基本面评分", "quality": 0.88, "period": "2026Q1" },
+      { "fact_id": "FSCORE-600519-TECHNICAL", "entity": "600519", "field": "technical_score", "value": 40, "snapshot_age_minutes": 5, "source_id": "USER_SUPPLIED:技术面评分", "quality": 0.85 },
+      { "fact_id": "FSCORE-600519-VALUATION", "entity": "600519", "field": "valuation_score", "value": 57, "snapshot_age_minutes": 5, "source_id": "USER_SUPPLIED:估值评分", "quality": 0.85, "period": "2026Q1" },
+      { "fact_id": "FSCORE-600519-EVENT", "entity": "600519", "field": "event_score", "value": 55, "snapshot_age_minutes": 5, "source_id": "USER_SUPPLIED:事件影响评分", "quality": 0.8 },
+      { "fact_id": "FSCORE-600519-GOVERNANCE", "entity": "600519", "field": "governance_score", "value": 80, "snapshot_age_minutes": 5, "source_id": "USER_SUPPLIED:公司治理评分", "quality": 0.8, "period": "2026Q1" },
       { "fact_id": "FNEWS-600519-1", "entity": "600519", "field": "news", "value": "公司披露 2026 年半年度经营数据，营业收入同比增长 14%。", "snapshot_age_minutes": 2, "source_id": "USER_SUPPLIED:公司公告", "quality": 0.85, "period": "2026-07-28" },
       { "fact_id": "FNEWS-600519-2", "entity": "600519", "field": "news", "value": "公司提示原材料价格波动可能影响下半年毛利率。", "snapshot_age_minutes": 2, "source_id": "USER_SUPPLIED:公司公告", "quality": 0.8, "period": "2026-07-28" },
       { "fact_id": "FREPORT-600519-1", "entity": "600519", "field": "research_report", "value": "某券商维持增持评级，目标价 1680 元，理由为直营渠道占比提升。", "snapshot_age_minutes": 3, "source_id": "USER_SUPPLIED:券商研报", "quality": 0.8, "period": "2026-07-29" },
@@ -143,16 +143,16 @@
     "fund_candidates": [
       { "fact_id": "FUND-510300-FEE", "entity": "沪深300ETF", "field": "fee_rate", "value": 0.15, "snapshot_age_minutes": 60, "source_id": "USER_SUPPLIED:基金合同费率", "quality": 0.9 },
       { "fact_id": "FUND-510300-TRACK", "entity": "沪深300ETF", "field": "tracking_error", "value": 0.25, "snapshot_age_minutes": 60, "source_id": "USER_SUPPLIED:基金季报", "quality": 0.85, "period": "2026Q1" },
-      { "fact_id": "FUND-510300-SCORE", "entity": "沪深300ETF", "field": "fund_score", "value": 84, "snapshot_age_minutes": 20, "source_id": "USER_SUPPLIED:基金综合评分", "quality": 0.85 },
+      { "fact_id": "FUND-510300-SCORE", "entity": "沪深300ETF", "field": "fund_score", "value": 84, "snapshot_age_minutes": 5, "source_id": "USER_SUPPLIED:基金综合评分", "quality": 0.85 },
       { "fact_id": "FUND-510300-RISK", "entity": "沪深300ETF", "field": "fund_risk_level", "value": 3, "snapshot_age_minutes": 60, "source_id": "USER_SUPPLIED:产品风险等级", "quality": 0.9 },
-      { "fact_id": "FUND-510300-LIQ", "entity": "沪深300ETF", "field": "liquidity_score", "value": 90, "snapshot_age_minutes": 20, "source_id": "USER_SUPPLIED:流动性评分", "quality": 0.85 },
+      { "fact_id": "FUND-510300-LIQ", "entity": "沪深300ETF", "field": "liquidity_score", "value": 90, "snapshot_age_minutes": 5, "source_id": "USER_SUPPLIED:流动性评分", "quality": 0.85 },
       { "fact_id": "FUND-588000-FEE", "entity": "科创50ETF", "field": "fee_rate", "value": 0.5, "snapshot_age_minutes": 60, "source_id": "USER_SUPPLIED:基金合同费率", "quality": 0.9 },
       { "fact_id": "FUND-588000-TRACK", "entity": "科创50ETF", "field": "tracking_error", "value": 0.6, "snapshot_age_minutes": 60, "source_id": "USER_SUPPLIED:基金季报", "quality": 0.85, "period": "2026Q1" },
-      { "fact_id": "FUND-588000-SCORE", "entity": "科创50ETF", "field": "fund_score", "value": 71, "snapshot_age_minutes": 20, "source_id": "USER_SUPPLIED:基金综合评分", "quality": 0.85 },
+      { "fact_id": "FUND-588000-SCORE", "entity": "科创50ETF", "field": "fund_score", "value": 71, "snapshot_age_minutes": 5, "source_id": "USER_SUPPLIED:基金综合评分", "quality": 0.85 },
       { "fact_id": "FUND-588000-RISK", "entity": "科创50ETF", "field": "fund_risk_level", "value": 5, "snapshot_age_minutes": 60, "source_id": "USER_SUPPLIED:产品风险等级", "quality": 0.9 },
       { "fact_id": "FUND-159915-FEE", "entity": "创业板ETF", "field": "fee_rate", "value": 0.3, "snapshot_age_minutes": 60, "source_id": "USER_SUPPLIED:基金合同费率", "quality": 0.9 },
       { "fact_id": "FUND-159915-TRACK", "entity": "创业板ETF", "field": "tracking_error", "value": 0.35, "snapshot_age_minutes": 60, "source_id": "USER_SUPPLIED:基金季报", "quality": 0.85, "period": "2026Q1" },
-      { "fact_id": "FUND-159915-SCORE", "entity": "创业板ETF", "field": "fund_score", "value": 76, "snapshot_age_minutes": 20, "source_id": "USER_SUPPLIED:基金综合评分", "quality": 0.85 },
+      { "fact_id": "FUND-159915-SCORE", "entity": "创业板ETF", "field": "fund_score", "value": 76, "snapshot_age_minutes": 5, "source_id": "USER_SUPPLIED:基金综合评分", "quality": 0.85 },
       { "fact_id": "FUND-159915-RISK", "entity": "创业板ETF", "field": "fund_risk_level", "value": 4, "snapshot_age_minutes": 60, "source_id": "USER_SUPPLIED:产品风险等级", "quality": 0.9 }
     ],
 
@@ -588,7 +588,7 @@
           "conversation_id": "conv-mismatch-001"
         }
       },
-      "expect": { "status": 200, "assert": { "json.compliance.status": "REVIEW", "json.compliance.matched_rules": "RETURN_DRAWDOWN_MISMATCH" } }
+      "expect": { "status": 200, "assert": { "json.compliance.status": "REVIEW", "json.compliance.matched_rules.0": "RETURN_DRAWDOWN_MISMATCH" } }
     },
     {
       "id": "29",

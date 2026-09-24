@@ -4,11 +4,16 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from backend.app.agents.coordinator import semantic_compliance, verify_facts
+from backend.app.agents.coordinator import (
+    SUITABILITY_REVIEW_REASON,
+    semantic_compliance,
+    verify_facts,
+)
 from backend.app.agents.rule_agents import FundAgent, MacroAgent, PortfolioAgent
 from backend.app.data_provider import SnapshotProvider
 from backend.app.models import (
     AgentResult,
+    ComplianceStatus,
     FactRecord,
     Intent,
     OrchestrationRequest,
@@ -146,6 +151,45 @@ async def test_compliance_blocks_privacy_request_before_other_rules(semantic) ->
 
     assert compliance.status.value == "BLOCK"
     assert compliance.matched_rules == ["PRIVACY_AND_PERMISSION"]
+
+
+@pytest.mark.parametrize("risk_level", ["R2", "R3", "R4", "R5", None, ""])
+def test_suitability_rule_never_hard_blocks_non_conservative_profile(risk_level: str | None) -> None:
+    """开发手册 9.2 的硬拦截条件是"R1 用户要求集中高风险标的"，等级前提必须由代码复核。
+
+    实测中该规则被模型用在 R4 用户的"横向比较"请求上，直接把整份分析作废；等级不满足时
+    规则仍写入 matched_rules 供审计，但只能降级为 REVIEW。
+    """
+
+    compliance = semantic_compliance(
+        ["SUITABILITY_R1_HIGH_RISK"], "模型判定存在期限错配", risk_level=risk_level
+    )
+
+    assert compliance.status is ComplianceStatus.REVIEW
+    assert compliance.matched_rules == ["SUITABILITY_R1_HIGH_RISK"]
+    assert compliance.reason == SUITABILITY_REVIEW_REASON
+
+
+def test_suitability_rule_blocks_confirmed_conservative_profile() -> None:
+    """已确认的 R1 画像要求集中高风险标的时仍必须硬拦截（大小写不敏感）。"""
+
+    compliance = semantic_compliance(
+        ["SUITABILITY_R1_HIGH_RISK"], "要求集中买入高波动标的", risk_level="r1"
+    )
+
+    assert compliance.status is ComplianceStatus.BLOCK
+    assert compliance.reason == "要求集中买入高波动标的"
+
+
+def test_privacy_rule_blocks_regardless_of_risk_level() -> None:
+    """隐私/权限规则与画像等级无关，不能被适当性降级逻辑削弱。"""
+
+    compliance = semantic_compliance(
+        ["PRIVACY_AND_PERMISSION", "SUITABILITY_R1_HIGH_RISK"], "索取他人持仓与密钥", risk_level="R4"
+    )
+
+    assert compliance.status is ComplianceStatus.BLOCK
+    assert compliance.matched_rules == ["PRIVACY_AND_PERMISSION", "SUITABILITY_R1_HIGH_RISK"]
 
 
 def test_orchestration_request_normalizes_query_and_rejects_duplicate_fact_ids() -> None:

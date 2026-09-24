@@ -10,7 +10,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 from uuid import NAMESPACE_URL, uuid5
 
-from backend.app.models import DataAcquisitionResult, FactRecord, Intent, OrchestrationRequest
+from backend.app.models import (
+    DataAcquisitionResult,
+    FactRecord,
+    Intent,
+    OrchestrationRequest,
+    ResearchCapability,
+)
 from backend.app.fact_taxonomy import fact_is_current, fact_max_age_seconds
 
 
@@ -30,6 +36,27 @@ class DataCall:
 # 只带查询摘要、没有任何业务字段的调用不算"已经取到资料"：这类返回不是结果，
 # 而是数据源的一次空手而归，下一轮必须重试。
 NON_SUBSTANTIVE_FIELDS = frozenset({"provider_response"})
+
+# 语义模型只能选择业务能力枚举；具体方法名由服务端固定映射，绝不接受模型
+# 输出的方法名、URL 或任意参数。这样具备工具选择能力，同时保留只读安全边界。
+CAPABILITY_METHODS: dict[ResearchCapability, str] = {
+    ResearchCapability.QUOTE: "get_quote",
+    ResearchCapability.FINANCIAL: "get_financial_metrics",
+    ResearchCapability.BASIC_INFO: "get_basic_info",
+    ResearchCapability.COMPANY_OPERATIONS: "get_company_operations",
+    ResearchCapability.SHAREHOLDER_EQUITY: "get_shareholder_equity",
+    ResearchCapability.EVENT: "get_event_data",
+    ResearchCapability.MACRO: "get_macro_data",
+    ResearchCapability.INSTITUTIONAL_RESEARCH: "get_institutional_research",
+    ResearchCapability.NEWS: "get_news",
+    ResearchCapability.RESEARCH_REPORT: "get_research_reports",
+    ResearchCapability.ANNOUNCEMENT: "get_announcements",
+    ResearchCapability.STOCK_SCREEN: "screen_stocks",
+    ResearchCapability.SECTOR_SCREEN: "screen_sectors",
+    ResearchCapability.FUND: "get_fund_candidates",
+    ResearchCapability.INDUSTRY: "get_industry_rank",
+    ResearchCapability.CONVERTIBLE: "get_convertible_bond",
+}
 
 
 def _target_key(target: str | None, query: str) -> str:
@@ -63,6 +90,7 @@ class AutomatedResearchPipeline:
         intent: Intent,
         *,
         target: str | None = None,
+        data_requirements: list[ResearchCapability] | None = None,
     ) -> tuple[OrchestrationRequest, DataAcquisitionResult]:
         """返回补齐事实后的请求以及不泄露底层异常的取数审计摘要。
 
@@ -93,7 +121,7 @@ class AutomatedResearchPipeline:
                 message="当前请求尚未通过画像/意图闸门，未调用外部数据源。",
             )
 
-        calls = self._calls_for(request, intent, target)
+        calls = self._calls_for(request, intent, target, data_requirements)
         requested = [call.label for call in calls]
         if self.provider is None:
             derived = derive_scoring_facts(base_facts, now=self.now())
@@ -240,7 +268,11 @@ class AutomatedResearchPipeline:
         return _target_key(target, request.query)
 
     def _calls_for(
-        self, request: OrchestrationRequest, intent: Intent, target: str | None = None
+        self,
+        request: OrchestrationRequest,
+        intent: Intent,
+        target: str | None = None,
+        data_requirements: list[ResearchCapability] | None = None,
     ) -> list[DataCall]:
         query_text = request.query
         research_target = self._research_scope(request, intent, target)
@@ -307,7 +339,54 @@ class AutomatedResearchPipeline:
                                  args=(entity,), key=f"get_financial_metrics@{holding_key}"),
                     )
                 )
+
+        # 固定意图路由保证专业节点的基础证据不缩水；语义模型只负责补充本轮问题
+        # 明确需要的能力（例如公告、主营构成或股东变化）。后端按方法去重，随后
+        # _split_reusable 会只执行从未取过或已经过期的调用。
+        planned_methods = {call.method for call in calls}
+        for raw_capability in data_requirements or []:
+            try:
+                capability = ResearchCapability(raw_capability)
+            except ValueError:
+                # 正常 API 路径已由 Pydantic 拦截；这里同时保护直接 Python 调用。
+                continue
+            method = CAPABILITY_METHODS[capability]
+            if method in planned_methods:
+                continue
+            calls.append(
+                self._capability_call(
+                    capability,
+                    request,
+                    research_target=research_target,
+                )
+            )
+            planned_methods.add(method)
         return calls
+
+    @staticmethod
+    def _capability_call(
+        capability: ResearchCapability,
+        request: OrchestrationRequest,
+        *,
+        research_target: str,
+    ) -> DataCall:
+        """把模型选择的白名单能力转换成后端控制的只读调用。"""
+
+        method = CAPABILITY_METHODS[capability]
+        if capability is ResearchCapability.FUND:
+            filters = {
+                "query": request.query,
+                "risk_level": request.profile.risk_level or "未指定",
+            }
+            args: tuple[Any, ...] = (filters,)
+        else:
+            args = (request.query,)
+        return DataCall(
+            label=capability.value,
+            method=method,
+            args=args,
+            key=f"{method}@{research_target}",
+        )
 
     def _portfolio_facts(self, request: OrchestrationRequest) -> list[FactRecord]:
         facts: list[FactRecord] = []

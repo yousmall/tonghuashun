@@ -1,7 +1,7 @@
 /* 问策智投 · 界面样式
  *
- * 设计口径：保留品牌酒红作为唯一强调色，其余层级走金融终端的中性冷灰，
- * 让数据与正文在高对比底色上呈现；红=风险/合规提示，绿=正常/已完成。
+ * 设计口径：以品牌酒红建立导航和重点区域，以暖白与深梅色区分阅读层级；
+ * 数据与正文保持清晰对比，红=风险/合规提示，绿=正常/已完成。
  *
  * 主题色与圆角、字号由 .streamlit/config.toml 提供，这里只处理它无法表达
  * 的部分：页面底色层次、卡片容器、侧栏导航、数据列与空状态。
@@ -140,6 +140,62 @@ hr, [data-testid="stDivider"] hr { border-color: var(--wence-line-soft); }
     outline: 2px solid var(--wence-brand); outline-offset: 2px;
 }
 
+/* 最近聊天标题可收起；紧凑样式与侧栏分组保持一致。 */
+[data-testid="stSidebar"] .st-key-recent-chats [data-testid="stExpander"],
+[data-testid="stSidebar"] [data-testid="stExpander"].st-key-recent-chats {
+    background: transparent;
+    border: 0;
+    border-radius: 0;
+    box-shadow: none;
+    overflow: visible;
+}
+[data-testid="stSidebar"] .st-key-recent-chats summary {
+    margin: .8rem .2rem .25rem;
+    padding: .2rem .15rem;
+    color: var(--wence-muted);
+    font-size: .86rem;
+    font-weight: 700;
+}
+
+/* 最近聊天：紧凑、可滚动的整行入口，当前会话使用柔和选中态。 */
+.st-key-recent-chat-list {
+    margin: .1rem 0 .6rem;
+}
+.st-key-recent-chat-list [data-testid="stVerticalBlock"] { gap: .15rem; }
+[data-testid="stSidebar"] .st-key-recent-chat-list .stButton > button {
+    min-height: 2.35rem;
+    justify-content: flex-start;
+    text-align: left;
+    padding: .38rem .65rem;
+    border: 1px solid transparent;
+    border-radius: 9px;
+    box-shadow: none;
+    font-size: .91rem;
+    font-weight: 500;
+    color: var(--wence-ink-2);
+}
+[data-testid="stSidebar"] .st-key-recent-chat-list .stButton > button p {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: .91rem;
+}
+.st-key-recent-chat-list .stButton > button[kind="tertiary"]:hover {
+    background: #eceef2;
+    color: var(--wence-ink);
+}
+.st-key-recent-chat-list .stButton > button[kind="primary"] {
+    background: var(--wence-brand-tint);
+    border-color: var(--wence-brand-line);
+    color: var(--wence-brand-strong);
+    font-weight: 650;
+}
+.st-key-recent-chat-list .stButton > button[kind="primary"]:hover {
+    background: #f6e3e7;
+    border-color: var(--wence-brand-line);
+    box-shadow: none;
+}
+
 /* 侧栏账号卡 */
 .side-user {
     margin-top: .9rem; padding: .8rem .9rem;
@@ -157,7 +213,7 @@ hr, [data-testid="stDivider"] hr { border-color: var(--wence-line-soft); }
 [data-testid="stSidebar"] .stButton > button p { font-size: 1rem; }
 
 /* ---------- 卡片与容器 ---------- */
-/* 底色换成玫红渐变后，卡片必须是实心白并带一点阴影，否则在粉底上会糊在一起。 */
+/* 水彩底色上的内容卡片保持实心白与轻阴影，保证正文可读。 */
 [data-testid="stForm"],
 [data-testid="stVerticalBlockBorderWrapper"] > div,
 [data-testid="stChatMessage"] {
@@ -456,13 +512,100 @@ button:focus-visible, input:focus-visible, textarea:focus-visible,
     border-top: 1px solid var(--wence-line-soft); line-height: 1.7;
 }
 
+/* 研究结论和正文分层：结论是阅读起点，风险提示仍由原组件渲染。 */
+.st-key-analysis-conclusion {
+    border-left: 4px solid var(--wence-brand) !important;
+    background: linear-gradient(110deg, #fffaf7, #ffffff 52%) !important;
+    box-shadow: 0 10px 28px rgba(81, 46, 55, .08) !important;
+}
+.analysis-kicker {
+    width: fit-content; padding: .27rem .55rem; border-radius: 6px;
+    color: var(--wence-brand-strong); background: #f7e8e8;
+    font-size: .72rem; font-weight: 750; letter-spacing: .09em;
+}
+
+/* ---------- 研究入口与业务概览 ---------- */
+.hero {
+    position: relative; display: grid; grid-template-columns: minmax(0, 1fr) 190px;
+    gap: 2rem; align-items: end; overflow: hidden;
+    padding: 2.2rem 2.35rem; margin: .25rem 0 .65rem;
+    color: #fff; border: 1px solid #593544; border-radius: 20px;
+    background: radial-gradient(circle at 88% 7%, rgba(221, 145, 153, .23), transparent 30%),
+                linear-gradient(115deg, #392936 0%, #623548 57%, #8b3c50 100%);
+    box-shadow: 0 16px 42px rgba(82, 42, 59, .18);
+}
+.hero::after {
+    content: ""; position: absolute; right: -4rem; bottom: -8rem;
+    width: 19rem; height: 19rem; border: 1px solid rgba(255,255,255,.12);
+    border-radius: 50%; pointer-events: none;
+}
+.hero h1 { color: #fff; margin: .7rem 0 .7rem; font-size: clamp(2rem, 3.5vw, 3.1rem); line-height: 1.25; }
+.hero p { color: #f2dfe3; max-width: 30rem; line-height: 1.75; }
+.hero .eyebrow { color: #f8ccd5; }
+.hero .eyebrow::before { background: #f8ccd5; }
+.hero-steps { display: grid; gap: .55rem; z-index: 1; padding-bottom: .15rem; }
+.hero-steps span {
+    display: flex; align-items: center; gap: .75rem;
+    padding: .55rem .7rem; border: 1px solid rgba(255,255,255,.2);
+    border-radius: 9px; background: rgba(255,255,255,.08);
+    color: #eed5dc; font-size: .75rem; font-variant-numeric: tabular-nums;
+}
+.hero-steps strong { color: #fff; font-size: .84rem; }
+[class*="st-key-starter-prompt-"] {
+    min-height: 118px; padding: .9rem 1rem; border: 1px solid #e5d4d7;
+    border-radius: 13px; background: #fffdfc;
+    box-shadow: 0 3px 14px rgba(71, 43, 49, .05);
+}
+[class*="st-key-starter-prompt-"] [data-testid="stCaptionContainer"] p {
+    color: var(--wence-brand-strong); font-size: .72rem; font-weight: 700;
+    letter-spacing: .08em;
+}
+[class*="st-key-starter-prompt-"] .stButton > button {
+    text-align: left; justify-content: space-between; min-height: 3rem;
+    border: 0; padding: .2rem 0; background: transparent; box-shadow: none;
+    color: var(--wence-ink);
+}
+[class*="st-key-starter-prompt-"] .stButton > button:hover {
+    background: transparent; color: var(--wence-brand-strong); box-shadow: none;
+}
+.stat-card.accent {
+    border-color: #593544;
+    background: linear-gradient(135deg, #432a38, #684052);
+}
+.stat-card.accent .k, .stat-card.accent .n { color: #e5cad2; }
+.stat-card.accent .v { color: #fff; }
+.watchlist-summary {
+    display: flex; flex-wrap: wrap; align-items: center; gap: .55rem;
+    padding: .75rem .95rem; margin: .2rem 0 .3rem;
+    border: 1px solid #e7d9d8; border-radius: 11px;
+    background: #fffaf6; color: var(--wence-muted); font-size: .78rem;
+}
+.watchlist-summary span:first-child { margin-right: .25rem; font-weight: 650; }
+.watchlist-summary span:not(:first-child) {
+    display: inline-flex; gap: .4rem; align-items: center;
+    padding: .22rem .55rem; border-radius: 7px;
+    background: #fff; border: 1px solid #e9e0df; color: var(--wence-ink-2);
+}
+.watchlist-summary strong { color: var(--wence-brand-strong); }
+[class*="st-key-watchlist-row-"] { border-left: 3px solid #a86c7b; }
+[class*="st-key-watchlist-row-"]:hover { border-color: #d0a6b0; box-shadow: 0 6px 20px rgba(80, 44, 54, .09); }
+.st-key-price-history-panel, .st-key-portfolio-donut {
+    background: linear-gradient(140deg, #fffdfb, #ffffff 60%) !important;
+    border-color: #e7d9d8 !important;
+    box-shadow: 0 6px 22px rgba(80, 44, 54, .06) !important;
+}
+.st-key-price-history-panel [data-testid="stVegaLiteChart"],
+.st-key-portfolio-donut [data-testid="stVegaLiteChart"] {
+    margin-top: .4rem;
+}
+
 /* ---------- 响应式 ---------- */
 @media (max-width: 900px) {
     [data-testid="stMainBlockContainer"] { padding: 1.5rem 1.2rem 3.5rem; }
     .brand-note { display: none; }
     .login-story { padding: .5rem 0 1rem; }
     .story-points { display: none; }
-    .hero { padding: .6rem 0 1.4rem; }
+    .hero { padding: 1.6rem; grid-template-columns: minmax(0, 1fr) 160px; gap: 1rem; }
     .logic-chain { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .logic-stage::after { display: none; }
 }
@@ -470,6 +613,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible,
     [data-testid="stMainBlockContainer"] { padding: 1.1rem .95rem 3rem; }
     .stat-grid, .profile-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .prompt-grid { grid-template-columns: 1fr; }
+    .hero { display: block; padding: 1.45rem; }
+    .hero-steps { grid-template-columns: repeat(3, 1fr); margin-top: 1.2rem; }
+    .hero-steps span { justify-content: center; padding: .45rem .3rem; }
+    .hero-steps strong { display: none; }
     .st-key-login-panel { padding: 1.2rem; }
     [data-testid="stForm"] { padding: 1rem; }
     .topbar { flex-wrap: wrap; }

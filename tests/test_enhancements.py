@@ -81,6 +81,99 @@ def test_cross_validation_detects_source_conflict_and_agent_dispersion() -> None
     assert validation.consensus_score == 55
 
 
+def test_cross_validation_without_verified_evidence_requires_review() -> None:
+    result = AgentResult(
+        agent_id="security", status=TaskStatus.DEGRADED,
+        opinion="资料不足", confidence=0, facts_used=[],
+    )
+    checked = cross_validate_results([result], [])
+    assert checked.status.value == "REVIEW"
+    assert {issue.code for issue in checked.issues} == {"NO_VERIFIED_EVIDENCE"}
+
+
+def test_single_authorized_source_can_pass_internal_consistency() -> None:
+    first = make_fact("valuation_score", 30, source="A")
+    result = AgentResult(
+        agent_id="security", status=TaskStatus.COMPLETED, opinion="已分析",
+        confidence=0.8, facts_used=[first.fact_id],
+    )
+    checked = cross_validate_results([result], [first])
+    assert checked.status.value == "PASS"
+    assert checked.issues == []
+
+
+def test_same_source_updates_and_unreferenced_facts_do_not_create_conflict() -> None:
+    latest = make_fact("valuation_score", 30, source="A")
+    older = latest.model_copy(update={
+        "fact_id": "F-old", "value": 20,
+        "snapshot_time": latest.snapshot_time - timedelta(seconds=10),
+    })
+    unrelated = make_fact("valuation_score", 80, source="B").model_copy(
+        update={"entity": "其他对象"}
+    )
+    result = AgentResult(
+        agent_id="security", status=TaskStatus.COMPLETED, opinion="已分析",
+        confidence=0.8, facts_used=[older.fact_id, latest.fact_id],
+    )
+    checked = cross_validate_results([result], [older, latest, unrelated])
+    assert checked.status.value == "PASS"
+    assert checked.issues == []
+
+
+def test_single_source_same_period_conflict_requires_review() -> None:
+    first = make_fact("pe_ttm", 20, source="A").model_copy(
+        update={"period": "2026Q2"}
+    )
+    changed = first.model_copy(update={
+        "fact_id": "F-revised", "value": 25,
+        "snapshot_time": first.snapshot_time + timedelta(seconds=5),
+    })
+    result = AgentResult(
+        agent_id="security", status=TaskStatus.COMPLETED, opinion="已分析",
+        confidence=0.8, facts_used=[first.fact_id],
+    )
+    checked = cross_validate_results([result], [first, changed])
+    assert checked.status.value == "REVIEW"
+    assert {issue.code for issue in checked.issues} == {"INTERNAL_VALUE_CONFLICT"}
+
+
+@pytest.mark.asyncio
+async def test_derived_score_requires_valid_original_evidence() -> None:
+    original = make_fact("pe_ttm", 20, age_seconds=100 * 86_400)
+    derived = make_fact("valuation_score", 60, source="DERIVED_RULE_V1").model_copy(
+        update={"derived_from": [original.fact_id]}
+    )
+    result = AgentResult(
+        agent_id="security", status=TaskStatus.COMPLETED,
+        opinion="估值已得到充分核实", confidence=0.9,
+        facts_used=[derived.fact_id],
+    )
+    verified = (await verify_facts([result], [original, derived]))[0]
+    assert verified.facts_used == []
+    assert verified.status is TaskStatus.DEGRADED
+    assert verified.confidence == 0
+    assert verified.opinion != result.opinion
+
+
+@pytest.mark.asyncio
+async def test_rejected_reference_cannot_support_opinion_risk_or_score() -> None:
+    valid = make_fact("valuation_score", 30)
+    result = AgentResult(
+        agent_id="security", status=TaskStatus.COMPLETED,
+        opinion="未经核实的收益断言", score=90, confidence=0.9,
+        facts_used=[valid.fact_id, "missing"], risk_flags=["未经核实的风险断言"],
+    )
+    verified = (await verify_facts([result], [valid]))[0]
+    assert verified.status is TaskStatus.DEGRADED
+    assert verified.facts_used == [valid.fact_id]
+    assert verified.opinion != result.opinion
+    assert verified.score is None
+    assert "未经核实的风险断言" not in verified.risk_flags
+    assert verified.details["rejected_reference_count"] == 1
+    checked = cross_validate_results([verified], [valid])
+    assert "EVIDENCE_REFERENCE_REJECTED" in {issue.code for issue in checked.issues}
+
+
 @pytest.mark.asyncio
 async def test_hybrid_agent_accepts_only_structured_authorized_llm_output() -> None:
     fact = make_fact("growth_score", 60)

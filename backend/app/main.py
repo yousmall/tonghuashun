@@ -12,13 +12,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from contextvars import ContextVar
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from contextlib import suppress
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from time import perf_counter
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi import Request, Response
+from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
 
 from backend.app.agents.coordinator import (
@@ -33,6 +37,7 @@ from backend.app.auth import TokenError, create_access_token, decode_access_toke
 from backend.app.database import (
     Database,
     DatabaseUnavailable,
+    ProfileVersionConflict,
     UsernameExists,
     WatchlistCapacityExceeded,
     WatchlistItemExists,
@@ -41,10 +46,14 @@ from backend.app.models import (
     AdvicePackage,
     AuthResponse,
     ConversationDetail,
+    ConversationRename,
     ConversationSummary,
     Credentials,
     DataFetchRequest,
     DataFetchResponse,
+    PriceHistoryRequest,
+    PriceHistoryPoint,
+    PriceHistoryResponse,
     Intent,
     OrchestrationRequest,
     ProfileAssessment,
@@ -143,6 +152,13 @@ coordinator, llm_enabled = build_coordinator()
 data_provider = IwencaiSkillHubProvider.from_env()
 research_pipeline = AutomatedResearchPipeline(data_provider)
 service_metrics = ServiceMetrics()
+analysis_progress: ContextVar[Callable[[str], None] | None] = ContextVar("analysis_progress", default=None)
+
+
+def _report_progress(stage: str) -> None:
+    callback = analysis_progress.get()
+    if callback is not None:
+        callback(stage)
 
 
 def _decode_session_token(token: str) -> dict[str, object]:
@@ -338,20 +354,37 @@ async def session_logout_beacon(request: Request) -> Response:
 @app.get("/api/v1/history", response_model=list[ConversationSummary], tags=["history"])
 def list_history(
     limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0, le=10000),
+    q: str = Query(default="", max_length=100),
     user: dict[str, object] = Depends(authenticated_user),
 ) -> list[ConversationSummary]:
-    return [ConversationSummary.model_validate(row) for row in database.list_conversations(int(user["id"]), limit)]
+    return [ConversationSummary.model_validate(row) for row in database.list_conversations(
+        int(user["id"]), limit, offset, q,
+    )]
 
 
 @app.get("/api/v1/history/{conversation_id}", response_model=ConversationDetail, tags=["history"])
 def history_detail(
     conversation_id: str,
+    before_id: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=40, ge=1, le=100),
     user: dict[str, object] = Depends(authenticated_user),
 ) -> ConversationDetail:
-    result = database.get_conversation(int(user["id"]), conversation_id)
+    result = database.get_conversation(int(user["id"]), conversation_id, before_id, limit)
     if not result:
         raise HTTPException(status_code=404, detail="对话记录不存在")
     return ConversationDetail.model_validate(result)
+
+
+@app.patch("/api/v1/history/{conversation_id}", tags=["history"])
+def rename_history(
+    conversation_id: str,
+    request: ConversationRename,
+    user: dict[str, object] = Depends(authenticated_user),
+) -> dict[str, str]:
+    if not database.rename_conversation(int(user["id"]), conversation_id, request.title):
+        raise HTTPException(status_code=404, detail="对话记录不存在")
+    return {"id": conversation_id, "title": request.title}
 
 
 @app.get("/api/v1/watchlist", response_model=list[WatchlistItem], tags=["watchlist"])
@@ -446,6 +479,44 @@ async def fetch_market_data(request: DataFetchRequest) -> DataFetchResponse:
     )
 
 
+@app.post("/api/v1/data/price-history", response_model=PriceHistoryResponse, tags=["data"])
+async def price_history(
+    request: PriceHistoryRequest,
+    user: dict[str, object] = Depends(authenticated_user),
+) -> PriceHistoryResponse:
+    """为已登录用户按需读取真实日期序列；不把走势当作投资结论。"""
+
+    del user
+    metric_label = "单位净值" if request.asset_type == "基金" else "收盘价"
+    common = {
+        "target": request.target, "asset_type": request.asset_type,
+        "metric_label": metric_label, "fetched_at": datetime.now(timezone.utc),
+    }
+    if data_provider is None:
+        return PriceHistoryResponse(
+            **common, status="unavailable",
+            message="尚未配置问财访问密钥，暂时无法加载历史走势。",
+        )
+    try:
+        facts = await data_provider.get_price_history(
+            request.target, request.asset_type, limit=request.limit,
+        )
+    except RuntimeError as exc:
+        return PriceHistoryResponse(**common, status="unavailable", message=str(exc))
+    points = [
+        PriceHistoryPoint(date=date.fromisoformat(str(fact.period)), value=float(fact.value))
+        for fact in facts if fact.period
+    ]
+    urls = {fact.source_url for fact in facts if fact.source_url}
+    return PriceHistoryResponse(
+        **common,
+        status="ok" if len(points) >= 2 else "empty",
+        points=points if len(points) >= 2 else [],
+        source_url=next(iter(urls)) if len(urls) == 1 else None,
+        message=None if len(points) >= 2 else "问财暂未返回足够的带日期数值，无法绘制走势。",
+    )
+
+
 @app.post("/api/v1/profile/assess", response_model=ProfileAssessment, tags=["profile"])
 async def assess_user_profile(request: ProfileAssessmentRequest) -> ProfileAssessment:
     """将问卷/文本转换为未确认画像草稿。
@@ -481,8 +552,12 @@ async def confirm_user_profile(
             int(user["id"]),
             confirmed.model_dump(mode="json"),
             confirmed.version,
+            request.profile.version,
         )
-        await asyncio.wrap_future(future)
+        try:
+            await asyncio.wrap_future(future)
+        except ProfileVersionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
     return confirmed
 
 
@@ -520,19 +595,36 @@ async def analyze_portfolio(
     """
 
     try:
+        _report_progress("核对投资偏好")
         if user:
-            request = request.model_copy(
-                update={"profile": request.profile.model_copy(update={"user_id": str(user["id"])})}
-            )
+            stored = await asyncio.wrap_future(session_thread_pool.submit(
+                str(user["_session_id"]), database.get_profile, int(user["id"]),
+            ))
+            if not stored or not stored["payload"].get("confirmed"):
+                raise HTTPException(status_code=409, detail="请先确认投资偏好，再开始分析。")
+            if request.profile.version != stored["version"]:
+                raise HTTPException(status_code=409, detail="投资偏好已更新，请重新打开投资偏好并确认后再分析。")
+            profile = UserProfile.model_validate({
+                **stored["payload"], "version": stored["version"], "user_id": str(user["id"]),
+            })
+            request = request.model_copy(update={"profile": profile})
+        _report_progress("理解问题")
         understanding = await coordinator.understand_request(request)
         # 请求风险和意图在一次模型调用中完成，风险请求不访问外部数据服务。
         fetch_intent = Intent.UNKNOWN if understanding.risk_rules else understanding.intent
+        _report_progress("查找资料")
         prepared_request, acquisition = await research_pipeline.prepare(
-            request, fetch_intent, target=understanding.target
+            request,
+            fetch_intent,
+            target=understanding.target,
+            data_requirements=understanding.data_requirements,
         )
-        advice = await coordinator.run(prepared_request, understanding=understanding)
-        # 记录送入模型的事实规模，避免"取数成功但研判降级"对用户不可解释。
-        model_slice = coordinator.last_model_slice or {}
+        model_slice: dict[str, object] = {}
+        advice = await coordinator.run(
+            prepared_request, understanding=understanding, metrics_sink=model_slice,
+            progress_sink=_report_progress,
+        )
+        # 指标属于本次请求；提前拦截时保持为零，不读取共享协调器状态。
         acquisition = acquisition.model_copy(
             update={
                 "model_fact_count": int(model_slice.get("selected") or 0),
@@ -547,10 +639,12 @@ async def analyze_portfolio(
         completed_advice = advice.model_copy(
             update={
                 "facts": prepared_request.facts,
+                "profile_version": request.profile.version,
                 "data_acquisition": acquisition,
             }
         )
         if user:
+            _report_progress("保存对话")
             # 历史记录只保留展示所需的轻量摘要：完整证据包可达数 MB，会撑大
             # messages 行宽并让列表/详情查询触发数据库排序内存告警。
             completed_payload = completed_advice.model_dump(mode="json")
@@ -565,10 +659,50 @@ async def analyze_portfolio(
                 summarise_advice(completed_payload, used_fact_ids_of(completed_payload)),
             )
             await asyncio.wrap_future(future)
+        _report_progress("已完成")
         return completed_advice
     except DatabaseUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except HTTPException:
+        raise
     except Exception as exc:
         # 不暴露异常细节（可能包含数据源地址或内部实现），同时保留服务端日志入口。
         # 当前本地版未配置日志器；正式环境应记录 trace_id、异常类型与脱敏上下文。
         raise HTTPException(status_code=500, detail="组合诊断服务暂时不可用，请稍后重试。") from exc
+
+
+@app.post("/api/v1/portfolio/analyze/stream", tags=["advice"])
+async def stream_portfolio_analysis(
+    request: OrchestrationRequest,
+    user: dict[str, object] | None = Depends(optional_authenticated_user),
+) -> StreamingResponse:
+    """逐阶段发送进度；只在全部核验完成后发送最终建议包。"""
+
+    async def events():
+        queue: asyncio.Queue[str] = asyncio.Queue()
+        token = analysis_progress.set(queue.put_nowait)
+        task = asyncio.create_task(analyze_portfolio(request, user))
+        analysis_progress.reset(token)
+        try:
+            while not task.done() or not queue.empty():
+                try:
+                    stage = await asyncio.wait_for(queue.get(), timeout=0.25)
+                except asyncio.TimeoutError:
+                    continue
+                yield json.dumps({"type": "progress", "stage": stage}, ensure_ascii=False) + "\n"
+            try:
+                advice = await task
+            except HTTPException as exc:
+                yield json.dumps({"type": "error", "message": exc.detail}, ensure_ascii=False) + "\n"
+            except Exception:
+                yield json.dumps({"type": "error", "message": "分析暂时无法完成，请稍后重试。"}, ensure_ascii=False) + "\n"
+            else:
+                yield json.dumps({"type": "result", "advice": advice.model_dump(mode="json")}, ensure_ascii=False) + "\n"
+        finally:
+            if not task.done():
+                task.cancel()
+
+    return StreamingResponse(
+        events(), media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )

@@ -3,7 +3,13 @@ from __future__ import annotations
 
 from typing import Any, Literal, Protocol
 from pydantic import BaseModel, ConfigDict, Field
-from backend.app.models import AgentResult, Intent, OrchestrationRequest, TaskStatus
+from backend.app.models import (
+    AgentResult,
+    Intent,
+    OrchestrationRequest,
+    ResearchCapability,
+    TaskStatus,
+)
 
 
 class JSONClient(Protocol):
@@ -29,6 +35,9 @@ class RequestUnderstanding(SemanticModel):
     # 资料本轮是否已经取过"的复用键，不改变发给数据源的查询文本，因此识别偏差
     # 的代价只是少复用一次，不会把数据取错。识别不出具体对象时留空。
     target: str | None = Field(default=None, max_length=60)
+    # 本轮问题明确需要、但固定意图路由未必覆盖的外部数据能力。模型只负责从
+    # 白名单中选择，后端会与基础能力合并，并只执行尚未查询或已经过期的调用。
+    data_requirements: list[ResearchCapability] = Field(default_factory=list, max_length=8)
     # 只在请求含有超出投资助手能力或安全边界的内容时返回用户原文中的最短连续片段。
     # 后端会校验它确实来自本轮输入，避免模型虚构或改写用户没有说过的内容。
     unsupported_part: str | None = Field(default=None, max_length=500)
@@ -55,8 +64,25 @@ class ProfilePatch(SemanticModel):
 
 class ProfileExtraction(SemanticModel):
     patch: ProfilePatch
-    evidence: dict[str, str]
+    # 证据值允许字符串或字符串列表：``constraints``、``investment_history``、
+    # ``behavioral_notes`` 本身是列表，模型为它们给出的证据通常也是列表。若这里只
+    # 接受字符串，一个列表证据就会让整次抽取校验失败，连带丢掉同一轮里已经正确
+    # 提取的期限、回撤和流动性。
+    evidence: dict[str, str | list[str]]
     confidence: float = Field(ge=0, le=1)
+
+
+def _evidence_fragments(value: Any) -> list[str]:
+    """把模型给出的证据统一成待核对的原文片段列表，忽略空白与非字符串项。"""
+
+    if isinstance(value, str):
+        raw: list[Any] = [value]
+    elif isinstance(value, (list, tuple)):
+        raw = list(value)
+    else:
+        return []
+    return [fragment for item in raw if isinstance(item, str)
+            and (fragment := item.strip())]
 
 
 SYSTEM = (
@@ -69,8 +95,13 @@ SYSTEM = (
 UNAVAILABLE_REASON = "语义判断服务暂时不可用，请稍后重试。"
 RISK_INSTRUCTIONS = (
     "风险映射：隐私或密钥=PRIVACY_AND_PERMISSION；收益保证=NO_RETURN_PROMISE；"
-    "以未核实传闻投资=UNVERIFIED_RUMOR；R1 高风险集中投入=SUITABILITY_R1_HIGH_RISK；"
-    "授权事实不支持的主张=UNSUPPORTED_CLAIM。科普、否定或批评上述行为不违规；无命中返回空数组。"
+    "以未核实传闻投资=UNVERIFIED_RUMOR；授权事实不支持的主张=UNSUPPORTED_CLAIM。"
+    "SUITABILITY_R1_HIGH_RISK 只在两个条件同时成立时命中：用户在 profile 中已确认的风险等级为 R1，"
+    "且本轮明确要求买入、加仓或集中配置高风险高波动标的。用户只是要求研究、比较、解读、举例或科普，"
+    "或者风险等级不是 R1（R2 及以上）时一律不命中该规则。资金用途、投资期限、波动与估值只属于风险"
+    "提示：写入 risk_flags 或 reason 即可，不得据此判定适当性违规；风险等级属于数据缺失时也不得命中。"
+    "该规则在 R1 以外的等级不会形成硬拦截，不要为了保险而标注。"
+    "科普、否定或批评上述行为不违规；无命中返回空数组。"
 )
 
 
@@ -118,6 +149,14 @@ class SemanticService:
                 "即使包含解释、测试或模拟字样；只有单纯询问概念和原理才归 education。"
                 "同时把本次想研究的具体对象（证券、基金或行业的名称/代码）写入 target；"
                 "用户用代词或省略指代时依据对话还原；没有明确对象时返回 null，不得猜测。"
+                "再识别本轮问题明确要求查询的数据类型，把需要的问财只读能力写入 "
+                "data_requirements：quote=行情，financial=财务估值，basic_info=基本资料，"
+                "company_operations=经营构成，shareholder_equity=股东股权，event=重大事件，"
+                "macro=宏观，institutional_research=机构观点，news=新闻，research_report=研报，"
+                "announcement=公告，stock_screen=A股筛选，sector_screen=板块筛选，fund=基金ETF，"
+                "industry=行业数据，convertible=可转债。只选回答本轮问题必要的最小集合；"
+                "概念讲解或不需要外部事实时返回空数组。不要判断资料是否过期，后端会根据"
+                "来源和时点只查询尚未取得或已经过期的数据。"
                 "unsupported_part 只填写用户本轮实际要求处理、但超出投资研究助手能力或安全边界的"
                 "最短连续原文，不要改写也不要带引号；可完整分析时返回 null。否定、引用或举例中"
                 "并未要求执行的内容不要标记。若请求包含无法处理且未映射为风险规则的部分，即使"
@@ -156,11 +195,18 @@ class SemanticService:
                 risk_rules=judged.risk_rules,
                 reason=judged.reason.strip() or UNAVAILABLE_REASON,
                 target=judged.target,
+                data_requirements=judged.data_requirements,
                 unsupported_part=judged.unsupported_part,
             )
         return judged
 
     async def extract_profile(self, narrative: str) -> tuple[dict[str, Any], list[str]]:
+        """抽取画像线索，并按字段核对原文证据。
+
+        "模型没回答"与"模型答了但某个字段没有原文支持"分开处理：前者无法推断任何
+        线索，只给统一提示；后者逐字段判定，证据对不上的字段单独丢弃，不再让一个
+        字段的类型或证据问题作废整轮已经核验过的其他线索。
+        """
         if not narrative.strip():
             return {}, []
         try:
@@ -172,14 +218,29 @@ class SemanticService:
                 "信息矛盾时省略对应字段；例如不再频繁交易不能提取成频繁交易。",
                 {"narrative": narrative},
             )
-            patch = result.patch.model_dump(exclude_none=True, exclude_unset=True)
-            patch = {key: value for key, value in patch.items() if value != []}
-            if any(not result.evidence.get(key, "").strip()
-                   or result.evidence[key] not in narrative for key in patch):
-                raise ValueError("画像证据不在原文中")
-            return patch, [f"从“{result.evidence[key]}”提取 {key}：{value}" for key, value in patch.items()]
         except (RuntimeError, ValueError, TypeError):
             return {}, ["语义提取不可用或不确定，未推测文本画像；请补充结构化信息或稍后重试。"]
+
+        patch = result.patch.model_dump(exclude_none=True, exclude_unset=True)
+        patch = {key: value for key, value in patch.items() if value != []}
+        if not patch:
+            return {}, ["未从你的描述中识别出明确的画像线索；请补充结构化信息。"]
+
+        kept: dict[str, Any] = {}
+        notes: list[str] = []
+        rejected: list[str] = []
+        for key, value in patch.items():
+            fragments = _evidence_fragments(result.evidence.get(key))
+            # 字段必须由原文连续片段作证；条件不成立只丢这一个字段。
+            if fragments and all(fragment in narrative for fragment in fragments):
+                kept[key] = value
+                shown = "、".join(str(item) for item in value) if isinstance(value, list) else value
+                notes.append(f"从“{'、'.join(fragments)}”提取 {key}：{shown}")
+            else:
+                rejected.append(key)
+        if rejected:
+            notes.append("以下线索缺少可核对的原文，未采用：" + "、".join(rejected))
+        return kept, notes
 
     async def review(self, request: OrchestrationRequest, results: list[AgentResult]) -> OutputReview | None:
         """审核所有专业输出的语义合规与实质矛盾。

@@ -8,7 +8,9 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from ipaddress import ip_address
+from urllib.parse import urlsplit
 from enum import StrEnum
 from typing import Any, Literal
 
@@ -30,6 +32,31 @@ class Intent(StrEnum):
     PORTFOLIO_REVIEW = "portfolio_review"
     EDUCATION = "education"
     UNKNOWN = "unknown"
+
+
+class ResearchCapability(StrEnum):
+    """语义模型可以请求的问财只读能力白名单。
+
+    模型只能返回这里的业务能力名；真正的方法映射和执行仍由后端控制，
+    避免自然语言或模型输出被当成任意函数名调用。
+    """
+
+    QUOTE = "quote"
+    FINANCIAL = "financial"
+    BASIC_INFO = "basic_info"
+    COMPANY_OPERATIONS = "company_operations"
+    SHAREHOLDER_EQUITY = "shareholder_equity"
+    EVENT = "event"
+    MACRO = "macro"
+    INSTITUTIONAL_RESEARCH = "institutional_research"
+    NEWS = "news"
+    RESEARCH_REPORT = "research_report"
+    ANNOUNCEMENT = "announcement"
+    STOCK_SCREEN = "stock_screen"
+    SECTOR_SCREEN = "sector_screen"
+    FUND = "fund"
+    INDUSTRY = "industry"
+    CONVERTIBLE = "convertible"
 
 
 class TaskStatus(StrEnum):
@@ -127,6 +154,8 @@ class FactRecord(BaseModel):
     snapshot_time: datetime
     # 数据来源标识；演示快照必须明确使用 DEMO_SNAPSHOT，不能伪装成实时源。
     source_id: str
+    # 可点击的原始资料链接；与数值事实分开，不参与冲突判断。
+    source_url: str | None = Field(default=None, max_length=2048)
     # 0 到 1 的证据质量分，供冲突处理、置信度计算和界面展示使用。
     quality: float = Field(ge=0, le=1)
     # 财务/经营数据的报告期，例如 2026Q1；行情数据可为空。
@@ -136,6 +165,25 @@ class FactRecord(BaseModel):
     # 产出这条事实的取数调用键（方法@研究目标）。仅用于判断能否复用已有资料、
     # 避免同一份数据被反复取回；不参与展示、评分或合规判断。
     produced_by: str | None = None
+
+    @field_validator("source_url")
+    @classmethod
+    def source_url_must_be_public_https(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        parsed = urlsplit(value.strip())
+        host = parsed.hostname or ""
+        if parsed.scheme != "https" or not host or parsed.username or parsed.password:
+            raise ValueError("原文链接必须是公开的 HTTPS 地址")
+        if host == "localhost" or host.endswith((".local", ".internal")):
+            raise ValueError("原文链接不能指向内部地址")
+        try:
+            ip_address(host)
+        except ValueError:
+            pass
+        else:
+            raise ValueError("原文链接不能使用 IP 地址")
+        return value.strip()
 
     @field_validator("snapshot_time")
     @classmethod
@@ -394,6 +442,39 @@ class DataFetchResponse(BaseModel):
     facts: list[FactRecord] = Field(default_factory=list)
 
 
+class PriceHistoryRequest(BaseModel):
+    """按一个明确标的读取有限条数的历史价格或净值。"""
+
+    target: str = Field(min_length=1, max_length=60)
+    asset_type: Literal["股票", "基金", "可转债"]
+    limit: Literal[30, 60] = 30
+
+    @field_validator("target")
+    @classmethod
+    def target_must_contain_visible_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("target 不能为空")
+        return normalized
+
+
+class PriceHistoryPoint(BaseModel):
+    date: date
+    value: float = Field(gt=0)
+
+
+class PriceHistoryResponse(BaseModel):
+    target: str
+    asset_type: Literal["股票", "基金", "可转债"]
+    metric_label: Literal["收盘价", "单位净值"]
+    status: Literal["ok", "empty", "unavailable"]
+    fetched_at: datetime
+    source_name: str = "同花顺问财"
+    source_url: str | None = None
+    points: list[PriceHistoryPoint] = Field(default_factory=list)
+    message: str | None = None
+
+
 class ConversationTurn(BaseModel):
     """一次可控的多轮上下文输入；只允许用户与助手文本。"""
 
@@ -423,7 +504,8 @@ class CrossValidationIssue(BaseModel):
 class CrossValidationResult(BaseModel):
     """跨智能体一致性、来源冲突和协调器共识摘要。"""
 
-    status: ComplianceStatus = ComplianceStatus.PASS
+    # 尚未执行核验时不得默认展示为通过。
+    status: ComplianceStatus = ComplianceStatus.REVIEW
     consensus_score: float | None = Field(default=None, ge=0, le=100)
     confidence: float = Field(default=0, ge=0, le=1)
     issues: list[CrossValidationIssue] = Field(default_factory=list)
@@ -461,6 +543,8 @@ class AdvicePackage(BaseModel):
     trace_id: str
     # 用于决定展示模板和后续追问策略的意图。
     intent: Intent
+    # 本次使用的已确认画像版本，供界面及历史记录核对。
+    profile_version: int | None = Field(default=None, ge=1)
     # 本次建议可引用事实中最新的时间；不可省略为“当前”。
     snapshot_time: datetime | None = None
     # 面向用户的综合结论；BLOCK 时只能说明拦截原因，不能给投资建议。
@@ -473,6 +557,8 @@ class AdvicePackage(BaseModel):
     facts: list[FactRecord] = Field(default_factory=list)
     # 单独记录自动取数是否成功，防止界面把演示/手工事实误标为实时数据。
     data_acquisition: DataAcquisitionResult = Field(default_factory=DataAcquisitionResult)
+    # 由事实核验、交叉核验和硬性规则生成的风险判断；不会将通过解读为无风险。
+    risk_conclusion: str | None = None
     # 去重后的风险提示列表。
     risks: list[str] = Field(default_factory=list)
     # 画像与本次结论的适配摘要；不足时应说明不适配/待确认，而非给精确仓位。

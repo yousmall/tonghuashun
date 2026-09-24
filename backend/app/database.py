@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote_plus
 
-from sqlalchemy import DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, create_engine, func, select
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, create_engine, func, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -16,6 +16,10 @@ from sqlalchemy.pool import StaticPool
 
 class DatabaseUnavailable(RuntimeError):
     """数据库未配置或暂时无法使用。"""
+
+
+class ProfileVersionConflict(ValueError):
+    """保存画像时客户端版本已经落后。"""
 
 
 class UsernameExists(ValueError):
@@ -46,6 +50,7 @@ class UserRow(Base):
 
 class ConversationRow(Base):
     __tablename__ = "conversations"
+    __table_args__ = (Index("ix_conversations_user_updated", "user_id", "updated_at"),)
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
     user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True)
@@ -76,6 +81,7 @@ class ProfileRow(Base):
 
 class MessageRow(Base):
     __tablename__ = "messages"
+    __table_args__ = (Index("ix_messages_user_conversation_id", "user_id", "conversation_id", "id"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     conversation_id: Mapped[str] = mapped_column(
@@ -154,6 +160,11 @@ class Database:
             return
         try:
             Base.metadata.create_all(self.engine)
+            # create_all 不会为已存在的表补建索引。
+            for table in (ConversationRow.__table__, MessageRow.__table__):
+                for index in table.indexes:
+                    if index.name in {"ix_conversations_user_updated", "ix_messages_user_conversation_id"}:
+                        index.create(self.engine, checkfirst=True)
             self.initialization_error = None
         except SQLAlchemyError as exc:
             self.initialization_error = type(exc).__name__
@@ -196,13 +207,21 @@ class Database:
             row = session.get(UserRow, user_id)
             return self._user_dict(row) if row else None
 
-    def save_profile(self, user_id: int, payload: dict[str, Any], version: int) -> None:
+    def save_profile(
+        self, user_id: int, payload: dict[str, Any], version: int,
+        expected_version: int | None = None,
+    ) -> None:
         """写入或更新账号的已确认画像。"""
 
         self.require_ready()
         assert self.session_factory is not None
         with self.session_factory.begin() as session:
-            row = session.get(ProfileRow, user_id)
+            row = session.scalar(
+                select(ProfileRow).where(ProfileRow.user_id == user_id).with_for_update()
+            )
+            current_version = int(row.version) if row is not None else 1
+            if expected_version is not None and expected_version != current_version:
+                raise ProfileVersionConflict("投资偏好已在其他页面更新，请重新打开投资偏好后再确认。")
             if row is None:
                 session.add(ProfileRow(user_id=user_id, payload=payload, version=version))
             else:
@@ -318,12 +337,17 @@ class Database:
             )
         return resolved_id
 
-    def list_conversations(self, user_id: int, limit: int = 50) -> list[dict[str, Any]]:
+    def list_conversations(
+        self, user_id: int, limit: int = 50, offset: int = 0, search: str = "",
+    ) -> list[dict[str, Any]]:
         self.require_ready()
         assert self.session_factory is not None
+        # 只对当前页的会话计数，避免先聚合该账号全部消息。
         count_query = (
-            select(MessageRow.conversation_id, func.count(MessageRow.id).label("message_count"))
-            .group_by(MessageRow.conversation_id).subquery()
+            select(func.count(MessageRow.id))
+            .where(MessageRow.user_id == user_id, MessageRow.conversation_id == ConversationRow.id)
+            .correlate(ConversationRow)
+            .scalar_subquery()
         )
         # 把“每个会话的最后一条消息”做成相关子查询并随列表一次取回，避免
         # 历史记录达到 50 条时产生 1 + 50 次数据库往返。
@@ -333,21 +357,23 @@ class Database:
                 MessageRow.conversation_id == ConversationRow.id,
                 MessageRow.user_id == user_id,
             )
-            .order_by(MessageRow.created_at.desc(), MessageRow.id.desc())
+            .order_by(MessageRow.id.desc())
             .limit(1)
             .correlate(ConversationRow)
             .scalar_subquery()
         )
+        query = (
+            select(ConversationRow, count_query.label("message_count"), last_message_query.label("last_message"))
+            .where(ConversationRow.user_id == user_id)
+        )
+        if search.strip():
+            slash = chr(92)
+            escaped = search.strip().replace(slash, slash * 2).replace("%", slash + "%").replace("_", slash + "_")
+            query = query.where(ConversationRow.title.like(f"%{escaped}%", escape=slash))
         with self.session_factory() as session:
             rows = session.execute(
-                select(
-                    ConversationRow,
-                    count_query.c.message_count,
-                    last_message_query.label("last_message"),
-                )
-                .join(count_query, count_query.c.conversation_id == ConversationRow.id, isouter=True)
-                .where(ConversationRow.user_id == user_id)
-                .order_by(ConversationRow.updated_at.desc()).limit(limit)
+                query.order_by(ConversationRow.updated_at.desc(), ConversationRow.id.desc())
+                .offset(offset).limit(limit)
             ).all()
             results = []
             for conversation, message_count, last_message in rows:
@@ -361,7 +387,9 @@ class Database:
                 )
             return results
 
-    def get_conversation(self, user_id: int, conversation_id: str) -> dict[str, Any] | None:
+    def get_conversation(
+        self, user_id: int, conversation_id: str, before_id: int | None = None, limit: int = 40,
+    ) -> dict[str, Any] | None:
         self.require_ready()
         assert self.session_factory is not None
         with self.session_factory() as session:
@@ -372,18 +400,20 @@ class Database:
             )
             if not conversation:
                 return None
-            messages = session.scalars(
-                select(MessageRow).where(
-                    MessageRow.conversation_id == conversation_id, MessageRow.user_id == user_id
-                )
-            ).all()
-            # 排序在 Python 侧完成：消息 payload 可能较大，交给数据库 filesort 会
-            # 触发 "Out of sort memory"（MySQL 默认 sort_buffer_size 256KB）。
-            messages.sort(key=lambda message: (self._utc(message.created_at), message.id))
+            query = select(MessageRow).where(
+                MessageRow.conversation_id == conversation_id, MessageRow.user_id == user_id
+            )
+            if before_id is not None:
+                query = query.where(MessageRow.id < before_id)
+            newest = session.scalars(query.order_by(MessageRow.id.desc()).limit(limit + 1)).all()
+            has_more = len(newest) > limit
+            messages = list(reversed(newest[:limit]))
             return {
                 "id": conversation.id, "title": conversation.title,
                 "created_at": self._utc(conversation.created_at),
                 "updated_at": self._utc(conversation.updated_at),
+                "has_more": has_more,
+                "next_before_id": messages[0].id if has_more and messages else None,
                 "messages": [
                     {
                         "id": message.id, "role": message.role, "content": message.content,
@@ -392,6 +422,18 @@ class Database:
                     for message in messages
                 ],
             }
+
+    def rename_conversation(self, user_id: int, conversation_id: str, title: str) -> bool:
+        self.require_ready()
+        assert self.session_factory is not None
+        with self.session_factory.begin() as session:
+            row = session.scalar(select(ConversationRow).where(
+                ConversationRow.id == conversation_id, ConversationRow.user_id == user_id,
+            ))
+            if row is None:
+                return False
+            row.title = title
+            return True
 
     @staticmethod
     def _utc(value: datetime) -> datetime:

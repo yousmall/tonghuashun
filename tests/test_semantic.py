@@ -7,7 +7,12 @@ import httpx
 import pytest
 
 from backend.app import main
-from backend.app.agents.coordinator import CoordinatorAgent, basic_compliance_check, verify_facts
+from backend.app.agents.coordinator import (
+    SUITABILITY_REVIEW_REASON,
+    CoordinatorAgent,
+    basic_compliance_check,
+    verify_facts,
+)
 from backend.app.agents.llm_agents import LLMConfig, OpenAICompatibleLLM
 from backend.app.agents.rule_agents import make_rule_agents
 from backend.app.models import (
@@ -16,6 +21,7 @@ from backend.app.models import (
     Intent,
     OrchestrationRequest,
     ProfileAssessmentRequest,
+    ResearchCapability,
 )
 from backend.app.semantic import UNAVAILABLE_REASON, SemanticService
 from backend.app.services.profile import assess_profile
@@ -135,6 +141,40 @@ async def test_understanding_exposes_research_target_as_reuse_key_only():
 
 
 @pytest.mark.asyncio
+async def test_understanding_selects_bounded_iwencai_data_requirements():
+    semantic, calls = service({
+        **understanding("security_research"),
+        "target": "贵州茅台",
+        "data_requirements": ["announcement", "company_operations"],
+    })
+
+    result = await semantic.understand(request("查贵州茅台最新公告和主营构成"))
+
+    assert result.data_requirements == [
+        ResearchCapability.ANNOUNCEMENT,
+        ResearchCapability.COMPANY_OPERATIONS,
+    ]
+    payload = json.loads(calls[0]["messages"][1]["content"])
+    choices = payload["required_schema"]["$defs"]["ResearchCapability"]["enum"]
+    assert "announcement" in choices
+    assert "company_operations" in choices
+    assert "不要判断资料是否过期" in calls[0]["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_unapproved_data_capability_cannot_become_a_tool_call():
+    semantic, _ = service({
+        **understanding("security_research"),
+        "data_requirements": ["run_shell"],
+    })
+
+    result = await semantic.understand(request("查一下数据"))
+
+    assert result.intent is Intent.UNKNOWN
+    assert result.data_requirements == []
+
+
+@pytest.mark.asyncio
 async def test_low_confidence_keeps_research_target():
     """置信度不足降级为追问时，研究对象不必一起丢掉。"""
 
@@ -249,12 +289,11 @@ async def test_profile_chinese_numbers_explicit_overrides_and_confirmation_gate(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("patch,evidence", [
     ({"horizon_months": -2}, {"horizon_months": "两年"}),
-    ({"horizon_months": 24}, {"horizon_months": "伪造的原文"}),
-    ({"horizon_months": 24}, {}),
     ({"confirmed": True, "risk_level": "R5"}, {}),
     ({"single_security_limit": 1}, {}),
 ])
-async def test_profile_rejects_invalid_values_fabricated_evidence_and_forbidden_fields(patch, evidence):
+async def test_profile_rejects_invalid_values_and_forbidden_fields(patch, evidence):
+    """越界数值与越权字段在结构校验处直接拒绝，不存在部分采信。"""
     semantic, _ = service({"patch": patch, "evidence": evidence, "confidence": 0.95})
     result = await assess_profile(ProfileAssessmentRequest(user_id="u", narrative="两年后需要用钱"), semantic)
     assert result.profile.horizon_months is None
@@ -262,6 +301,46 @@ async def test_profile_rejects_invalid_values_fabricated_evidence_and_forbidden_
     assert result.profile.single_security_limit == 0.2
     assert result.profile.confirmed is False
     assert "不可用" in result.evidence[0]
+
+
+@pytest.mark.asyncio
+async def test_unverifiable_evidence_drops_only_that_field():
+    """证据对不上的字段单独丢弃，同一轮里已经核验过的线索必须保留。"""
+    narrative = "我计划投资3年，2年后买房，最多接受8%的亏损"
+    semantic, _ = service({
+        "patch": {"horizon_months": 24, "liquidity_need": "高"},
+        "evidence": {"horizon_months": "伪造的原文", "liquidity_need": "2年后买房"},
+        "confidence": 0.95,
+    })
+    result = await assess_profile(ProfileAssessmentRequest(user_id="u", narrative=narrative), semantic)
+    assert result.profile.horizon_months is None
+    assert result.profile.liquidity_need == "高"
+    assert any("未采用" in item and "horizon_months" in item for item in result.evidence)
+
+
+@pytest.mark.asyncio
+async def test_list_evidence_for_list_field_keeps_whole_extraction():
+    """列表字段的列表证据曾让整次抽取校验失败，所有线索一起变成"待补充"。"""
+    narrative = "我计划投资3年，2年后买房，最多接受8%的亏损，希望年收益8%左右"
+    semantic, _ = service({
+        "patch": {"horizon_months": 36, "max_drawdown": 0.08, "liquidity_need": "高",
+                  "expected_annual_return": 0.08, "constraints": ["2年后买房"]},
+        "evidence": {"horizon_months": "我计划投资3年", "max_drawdown": "最多接受8%的亏损",
+                     "liquidity_need": "2年后买房", "expected_annual_return": "希望年收益8%左右",
+                     "constraints": ["2年后买房"]},
+        "confidence": 0.95,
+    })
+    result = await assess_profile(ProfileAssessmentRequest(
+        user_id="u", narrative=narrative, expected_annual_return=0.08,
+        questionnaire={key: 80 for key in (
+            "financial_capacity", "loss_tolerance", "investment_horizon",
+            "knowledge_experience", "behavior_stability")},
+    ), semantic)
+    assert result.profile.horizon_months == 36
+    assert result.profile.max_drawdown == 0.08
+    assert result.profile.liquidity_need == "高"
+    assert result.profile.constraints == ["2年后买房"]
+    assert not {"horizon_months", "liquidity_need", "max_drawdown"} & set(result.missing_fields)
 
 
 @pytest.mark.asyncio
@@ -273,6 +352,45 @@ async def test_empty_profile_does_not_call_model_and_missing_model_never_guesses
     assert (await unavailable.understand(request("持仓组合"))).intent is Intent.UNKNOWN
     draft = await assess_profile(ProfileAssessmentRequest(user_id="u", narrative="两年后买房"), unavailable)
     assert draft.profile.horizon_months is None
+
+
+@pytest.mark.asyncio
+async def test_suitability_flag_on_research_request_only_forces_review():
+    """回归：R4 用户的"横向比较"被模型标成适当性违规时，只能降级复核，不得作废整份分析。
+
+    真实故障中该规则把一次比较研究判成 BLOCK，前端因此只显示"暂时无法提供投资建议"。
+    等级前提由代码复核：非 R1 一律降级 REVIEW，同等级下 R1 仍保持硬拦截。
+    """
+
+    reason = "三只标的均为高波动权益资产，与两年内购房资金的高流动性需求存在期限错配"
+    semantic, _ = service({"confidence": 0.9, "risk_rules": ["SUITABILITY_R1_HIGH_RISK"],
+                           "conflicting_agents": [], "reason": reason})
+    coordinator = CoordinatorAgent(make_rule_agents(), verify_facts, basic_compliance_check, semantic=semantic)
+    from backend.app.semantic import RequestUnderstanding
+
+    def comparison(risk_level: str) -> OrchestrationRequest:
+        return OrchestrationRequest(
+            query="个股研究：请横向比较宁德时代、比亚迪、贵州茅台，说明各自特点、风险和适用情形",
+            profile={"user_id": "test", "confirmed": True, "risk_level": risk_level,
+                     "liquidity_need": "高", "horizon_months": 24},
+        )
+
+    reviewed = await coordinator.run(
+        comparison("R4"),
+        understanding=RequestUnderstanding(**understanding("security_research")),
+    )
+    assert reviewed.compliance.status == "REVIEW"
+    assert "SUITABILITY_R1_HIGH_RISK" in reviewed.compliance.matched_rules
+    assert reviewed.conclusion != "请求未通过合规或适当性审核，未生成投资建议。"
+    assert SUITABILITY_REVIEW_REASON in (reviewed.compliance.reason or "")
+    assert reviewed.task_plan.nodes != []
+
+    blocked = await coordinator.run(
+        comparison("R1"),
+        understanding=RequestUnderstanding(**understanding("security_research")),
+    )
+    assert blocked.compliance.status == "BLOCK"
+    assert blocked.conclusion == "请求未通过合规或适当性审核，未生成投资建议。"
 
 
 @pytest.mark.asyncio
@@ -354,8 +472,9 @@ async def test_degraded_node_is_not_treated_as_dissenting_opinion():
         request(facts=security_only),
         understanding=RequestUnderstanding(**understanding("portfolio_review")),
     )
-    assert result2.cross_validation.status != "REVIEW"
-    assert "SEMANTIC_AGENT_CONFLICT" not in {issue.code for issue in result2.cross_validation.issues}
+    issue_codes = {issue.code for issue in result2.cross_validation.issues}
+    assert "SEMANTIC_AGENT_CONFLICT" not in issue_codes
+    assert result2.cross_validation.status == "PASS"
     assert "CROSS_AGENT_INCONSISTENCY" not in result2.compliance.matched_rules
 
 

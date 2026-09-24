@@ -14,6 +14,7 @@ from typing import Any
 
 from backend.app.fact_taxonomy import (
     FAST_MARKET_FIELDS,
+    MULTI_VALUE_FIELDS,
     NEWS_FIELDS,
     PORTFOLIO_FIELDS,
     SCORE_FIELDS,
@@ -26,9 +27,8 @@ from backend.app.models import FactRecord, Intent
 MAX_MODEL_FACTS = 110
 
 # 同一字段允许多条并存（新闻、公告、研报天然一天多条）；其余字段只留最新一条。
-MULTI_RECORD_FIELDS = frozenset(
-    {"news", "announcement", "research_report", "news_summary", "announcement_summary", "research_report_summary", "event"}
-)
+# 口径由 fact_taxonomy 统一维护，避免与冲突核验的分组口径出现分歧。
+MULTI_RECORD_FIELDS = MULTI_VALUE_FIELDS
 MULTI_RECORD_LIMIT = 6
 
 # 各意图下优先送给模型的字段：越靠前越先保留。
@@ -55,7 +55,8 @@ INTENT_FIELD_PRIORITY: dict[Intent, tuple[str, ...]] = {
     ),
     Intent.SECURITY_RESEARCH: (
         "close_price", "change", "volume", "turnover_rate",
-        "pe_ttm", "pb", "roe", "revenue_growth", "fundamental_score", "technical_score",
+        "pe_ttm", "pe_static", "pe_dynamic", "pb", "roe", "roe_weighted",
+        "revenue_growth", "fundamental_score", "technical_score",
         "target_price", "rating", "earnings_forecast", "event",
         "industry", "news", "announcement", "research_report",
         "prosperity_score", "valuation_score", "policy_score",
@@ -67,11 +68,12 @@ INTENT_FIELD_PRIORITY: dict[Intent, tuple[str, ...]] = {
     Intent.CONVERTIBLE_BOND_ANALYSIS: (
         "close_price", "change", "conversion_premium_rate", "pure_bond_premium_rate",
         "yield_to_maturity", "remaining_size", "bond_rating", "conversion_price",
-        "pe_ttm", "pb", "roe", "news",
+        "pe_ttm", "pe_static", "pe_dynamic", "pb", "roe", "roe_weighted", "news",
     ),
     Intent.PORTFOLIO_REVIEW: (
         "weight", "portfolio_weight",
-        "close_price", "change", "pe_ttm", "pb", "roe", "revenue_growth",
+        "close_price", "change", "pe_ttm", "pe_static", "pe_dynamic", "pb",
+        "roe", "roe_weighted", "revenue_growth",
         "fundamental_score", "technical_score", "valuation_score",
         *_COMMON_SCORES,
         "industry", "news",

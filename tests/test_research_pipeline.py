@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi.testclient import TestClient
 
 import backend.app.main as main_module
-from backend.app.models import FactRecord, Intent, OrchestrationRequest
+from backend.app.models import FactRecord, Intent, OrchestrationRequest, ResearchCapability
 from backend.app.services import AutomatedResearchPipeline
 from backend.app.services import research as research_module
 
@@ -79,6 +79,10 @@ class FakeIwencaiProvider:
                           "crowding_score", "policy_score")
         ]
 
+    async def get_announcements(self, target: str) -> list[FactRecord]:
+        self.calls.append("announcement")
+        return [self._fact("ANN", "announcement_title", "测试公告")]
+
 
 def request_for_security(*, auto_fetch: bool = True) -> OrchestrationRequest:
     return OrchestrationRequest(
@@ -113,6 +117,54 @@ def test_pipeline_routes_live_data_and_preserves_derivation_lineage() -> None:
     assert {fact.entity for fact in derived} == {"示例科技"}
     assert all(fact.derived_from for fact in derived)
     assert all(parent.startswith("LIVE-") for fact in derived for parent in fact.derived_from)
+
+
+def test_model_selected_capability_fetches_only_when_not_already_searched() -> None:
+    """模型可追加固定路由未覆盖的问财能力，已有且有效时下一轮直接复用。"""
+
+    provider = FakeIwencaiProvider()
+    pipeline = AutomatedResearchPipeline(provider)
+    first, first_audit = asyncio.run(
+        pipeline.prepare(
+            request_for_security(),
+            Intent.SECURITY_RESEARCH,
+            target="示例科技",
+            data_requirements=[ResearchCapability.ANNOUNCEMENT],
+        )
+    )
+
+    assert provider.calls.count("announcement") == 1
+    assert "announcement" in first_audit.requested_capabilities
+    assert "announcement" in first_audit.successful_capabilities
+
+    provider.calls.clear()
+    _, second_audit = asyncio.run(
+        pipeline.prepare(
+            follow_up(first.facts, query="再看一下它的最新公告"),
+            Intent.SECURITY_RESEARCH,
+            target="示例科技",
+            data_requirements=[ResearchCapability.ANNOUNCEMENT],
+        )
+    )
+
+    assert provider.calls == []
+    assert "announcement" in second_audit.reused_capabilities
+
+
+def test_model_selected_existing_baseline_capability_is_not_called_twice() -> None:
+    provider = FakeIwencaiProvider()
+    pipeline = AutomatedResearchPipeline(provider)
+
+    asyncio.run(
+        pipeline.prepare(
+            request_for_security(),
+            Intent.SECURITY_RESEARCH,
+            data_requirements=[ResearchCapability.FINANCIAL, ResearchCapability.EVENT],
+        )
+    )
+
+    assert provider.calls.count("financial") == 1
+    assert provider.calls.count("event") == 1
 
 
 def test_pipeline_does_not_refresh_scores_from_stale_inputs() -> None:
@@ -168,6 +220,7 @@ def test_analyze_endpoint_returns_fetched_and_derived_facts(monkeypatch) -> None
     body = response.json()
     assert body["data_acquisition"]["mode"] == "live"
     assert body["data_acquisition"]["fetched_fact_count"] == 18
+    assert body["risk_conclusion"]
     assert any(fact["source_id"] == "IWENCAI_TEST" for fact in body["facts"])
     assert any(fact["source_id"] == "DERIVED_RULE_V1" for fact in body["facts"])
     assert set(body["evidence"]).issubset({fact["fact_id"] for fact in body["facts"]})
