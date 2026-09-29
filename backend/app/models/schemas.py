@@ -373,6 +373,10 @@ class ProfileAssessmentRequest(BaseModel):
     # 问卷维度使用 0-100；未知维度省略，服务会列入 missing_fields。
     questionnaire: dict[str, float] = Field(default_factory=dict)
     narrative: str | None = Field(default=None, max_length=2_000)
+    horizon_months: int | None = Field(default=None, ge=1)
+    max_drawdown: float | None = Field(default=None, ge=0, le=1)
+    liquidity_need: str | None = None
+    target: str | None = Field(default=None, max_length=200)
     investment_experience_years: float | None = Field(default=None, ge=0, le=100)
     investment_history: list[str] = Field(default_factory=list, max_length=50)
     holding_history: list[dict[str, Any]] = Field(default_factory=list, max_length=200)

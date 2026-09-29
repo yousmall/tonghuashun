@@ -78,18 +78,11 @@ hr, [data-testid="stDivider"] hr { border-color: var(--wence-line-soft); }
 /* 侧栏品牌区 */
 .side-brand {
     display: flex; align-items: center; gap: .68rem;
-    padding: .5rem .35rem 1rem;
+    padding: .15rem .35rem .7rem;
     margin-bottom: .35rem;
     border-bottom: 1px solid var(--wence-line-soft);
 }
-.side-brand .mark {
-    display: grid; place-items: center;
-    width: 38px; height: 38px; border-radius: 11px;
-    background: linear-gradient(140deg, #b84059, #8e2c40);
-    color: #fff; font-size: 21px; font-weight: 700;
-    box-shadow: 0 4px 12px rgba(142, 44, 64, .26);
-}
-.side-brand .name { font-weight: 750; font-size: 1.12rem; letter-spacing: .02em; }
+.side-brand .brand-image { display: block; width: 124px; height: 124px; object-fit: contain; mix-blend-mode: multiply; }
 .side-brand .tag { margin-left: auto; font-size: .78rem; color: var(--wence-faint); letter-spacing: .04em; }
 
 /* 侧栏分组标题 */
@@ -401,13 +394,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible,
 .topbar .chip.live .dot { background: var(--wence-brand); }
 
 /* 品牌行（登录页） */
-.brand { display: flex; align-items: center; gap: .7rem; margin-bottom: 1.8rem; }
-.brand-mark {
-    display: grid; place-items: center; width: 38px; height: 38px; border-radius: 11px;
-    background: linear-gradient(140deg, #b84059, #8e2c40); color: #fff; font-size: 21px; font-weight: 700;
-    box-shadow: 0 4px 14px rgba(142, 44, 64, .25);
-}
-.brand-name { font-weight: 750; font-size: 1.16rem; letter-spacing: .03em; }
+.brand { display: flex; align-items: center; gap: .7rem; margin-bottom: 1.3rem; }
+.brand .brand-image { display: block; width: 138px; height: 138px; object-fit: contain; mix-blend-mode: multiply; }
 .brand-note { margin-left: auto; color: var(--wence-muted); font-size: .8rem; }
 
 /* 首页标题区 */

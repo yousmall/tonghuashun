@@ -1000,11 +1000,19 @@ with patch.object(ui, 'api_request', side_effect=fake_api):
     assert len(app.radio) == 5
     assert all(item.options == [str(n) for n in range(11)] for item in app.radio)
     assert any(item.label == '风险态度' for item in app.expander)
+    next(field for field in app.number_input if field.label == '计划投资时间（个月）').set_value(24)
+    next(field for field in app.number_input if field.label == '最多可接受亏损（%）').set_value(8.0)
+    next(field for field in app.selectbox if field.label == '资金使用需求').set_value('高')
+    next(field for field in app.text_input if field.label == '资金用途或投资目标').set_value('两年后购房')
     app.radio[1].set_value(score)
     next(button for button in app.button if button.label == '立即评估').click().run(timeout=15)
     assert not app.exception
     assert app.session_state['assessment_payload']['questionnaire']['loss_tolerance'] == score * 10
     assert app.session_state['assessment_payload']['questionnaire']['financial_capacity'] == 50
+    assert app.session_state['assessment_payload']['horizon_months'] == 24
+    assert app.session_state['assessment_payload']['max_drawdown'] == 0.08
+    assert app.session_state['assessment_payload']['liquidity_need'] == '高'
+    assert app.session_state['assessment_payload']['target'] == '两年后购房'
     assert app.session_state['profile']['confirmed'] is False
     next(button for button in app.button if button.label == '确认并保存').click().run(timeout=15)
     assert not app.exception

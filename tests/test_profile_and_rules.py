@@ -24,6 +24,7 @@ from backend.app.models import (
     UserProfile,
 )
 from backend.app.services.profile import assess_profile, confirm_profile
+from backend.app.semantic import SemanticService
 
 
 def fact(field: str, value: object, *, entity: str = "示例", quality: float = 0.9) -> FactRecord:
@@ -61,6 +62,25 @@ async def test_profile_assessment_never_auto_confirms_and_extracts_low_ambiguity
     assert assessment.profile.max_drawdown == 0.08
     assert assessment.profile.liquidity_need == "高"
     assert "financial_capacity" in assessment.missing_fields
+
+
+@pytest.mark.asyncio
+async def test_explicit_plan_fields_work_without_model_and_override_extraction(semantic) -> None:
+    request = ProfileAssessmentRequest(
+        narrative="我 2 年后要买房，最多接受 8% 回撤。",
+        horizon_months=36,
+        max_drawdown=0.12,
+        liquidity_need="低",
+        target="三年后教育支出",
+    )
+    for service in (SemanticService(), semantic):
+        draft = await assess_profile(request, service)
+        assert draft.profile.confirmed is False
+        assert draft.profile.horizon_months == 36
+        assert draft.profile.max_drawdown == 0.12
+        assert draft.profile.liquidity_need == "低"
+        assert draft.profile.target == "三年后教育支出"
+        assert not {"horizon_months", "max_drawdown", "liquidity_need"} & set(draft.missing_fields)
 
 
 def test_confirm_profile_sets_gate_and_advances_version() -> None:

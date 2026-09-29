@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 import os
@@ -44,6 +45,16 @@ from frontend.presentation import (
 )
 
 DEFAULT_API_BASE = os.getenv("WENCE_API_BASE", "http://127.0.0.1:8000/api/v1")
+BRAND_LOGO = Path(__file__).resolve().parent / "assets" / "brand-logo.png"
+
+
+@st.cache_data(show_spinner=False)
+def brand_logo_uri(asset_version: int) -> str:
+    """为现有品牌行提供随项目发布的 Logo。"""
+
+    return "data:image/png;base64," + base64.b64encode(BRAND_LOGO.read_bytes()).decode("ascii")
+
+
 @st.cache_data(show_spinner=False)
 def app_styles(asset_version: int) -> str:
     """读取随项目保存的样式，不依赖临时路径或外部资源。"""
@@ -59,15 +70,15 @@ def render_app_styles() -> None:
 def render_login_brand() -> None:
     """登录门禁的品牌提示；登录后的主内容区只保留侧栏品牌。"""
 
-    st.html("""<div class="brand"><div class="brand-mark">问</div>
-        <div class="brand-name">问策智投</div><div class="brand-note">让每一次投资，多一分理解</div></div>""")
+    st.html(f"""<div class="brand"><img class="brand-image" src="{brand_logo_uri(BRAND_LOGO.stat().st_mtime_ns)}"
+        alt="问策智投 Logo"><div class="brand-note">让每一次投资，多一分理解</div></div>""")
 
 
 def render_brand_block() -> None:
     """侧栏品牌区：与主内容之间用一条细线分隔。"""
 
-    st.html("""<div class="side-brand"><div class="mark">问</div>
-        <div class="name">问策智投</div><div class="tag">投研助手</div></div>""")
+    st.html(f"""<div class="side-brand"><img class="brand-image" src="{brand_logo_uri(BRAND_LOGO.stat().st_mtime_ns)}"
+        alt="问策智投 Logo"><div class="tag">投研助手</div></div>""")
 
 
 def render_side_label(text: str) -> None:
@@ -957,6 +968,24 @@ def page_profile(api_base: str, *, view: str = "风险评估") -> None:
             key="profile_narrative",
             placeholder="例如：2 年后买房，最多接受 8% 亏损，期间可能随时需要使用这笔钱。",
         )
+        horizon_col, drawdown_col = st.columns(2)
+        horizon_months = horizon_col.number_input(
+            "计划投资时间（个月）", min_value=1, value=current.get("horizon_months"),
+            step=1, placeholder="请填写月数",
+        )
+        max_drawdown_percent = drawdown_col.number_input(
+            "最多可接受亏损（%）", min_value=0.0, max_value=100.0,
+            value=(float(current["max_drawdown"]) * 100 if current.get("max_drawdown") is not None else None),
+            step=0.5, placeholder="请填写百分比",
+        )
+        liquidity_options = ["低", "中", "高"]
+        current_liquidity = current.get("liquidity_need")
+        liquidity_need = st.selectbox(
+            "资金使用需求", liquidity_options,
+            index=liquidity_options.index(current_liquidity) if current_liquidity in liquidity_options else None,
+            placeholder="请选择资金使用需求",
+        )
+        target = st.text_input("资金用途或投资目标", value=current.get("target") or "", max_chars=200)
         profile_left, profile_right = st.columns(2)
         experience_years = profile_left.number_input(
             "投资经验（年）",
@@ -1007,6 +1036,10 @@ def page_profile(api_base: str, *, view: str = "风险评估") -> None:
             {
                 "narrative": narrative or None,
                 "questionnaire": questionnaire,
+                "horizon_months": horizon_months,
+                "max_drawdown": max_drawdown_percent / 100 if max_drawdown_percent is not None else None,
+                "liquidity_need": liquidity_need,
+                "target": target.strip() or None,
                 "investment_experience_years": experience_years,
                 "investment_history": [line.strip() for line in investment_history_text.splitlines() if line.strip()],
                 "holding_history": st.session_state.portfolio,
@@ -1029,7 +1062,8 @@ def page_profile(api_base: str, *, view: str = "风险评估") -> None:
         render_profile_summary(draft["profile"])
         if draft.get("missing_fields"):
             st.warning(f"仍缺少：{'、'.join(PROFILE_LABELS.get(key, '投资计划') for key in draft['missing_fields'])}")
-        if st.button("确认并保存", type="primary"):
+            st.caption("请补全上述信息并重新评估，再确认投资偏好。")
+        if st.button("确认并保存", type="primary", disabled=bool(draft.get("missing_fields"))):
             confirmed = api_request(api_base, "POST", "/profile/confirm", {"profile": st.session_state.profile})
             if confirmed:
                 st.session_state.profile = confirmed
@@ -1672,7 +1706,7 @@ def _render_service_unavailable(api_base: str) -> None:
 
 def main() -> None:
     """配置登录门禁、侧栏状态和产品页面。"""
-    st.set_page_config(page_title="问策智投", page_icon=":material/query_stats:", layout="wide")
+    st.set_page_config(page_title="问策智投", page_icon=str(BRAND_LOGO), layout="wide")
     init_session()
     render_app_styles()
     # 登录页固定在一个可替换的槽位，切换登录态时先清理旧表单。

@@ -47,13 +47,17 @@ async def assess_profile(request: ProfileAssessmentRequest, semantic: SemanticSe
     else:
         evidence.append("问卷维度不完整，未计算风险等级")
     explicit_values = {
+        "horizon_months": request.horizon_months,
+        "max_drawdown": request.max_drawdown,
+        "liquidity_need": request.liquidity_need,
+        "target": request.target,
         "investment_experience_years": request.investment_experience_years,
         "investment_history": request.investment_history,
         "holding_history": request.holding_history,
         "expected_annual_return": request.expected_annual_return,
     }
     for field, value in explicit_values.items():
-        if value not in (None, [], {}):
+        if value not in (None, "", [], {}):
             narrative_patch[field] = value
             evidence.append(f"已记录用户明确提交的 {field}")
 
