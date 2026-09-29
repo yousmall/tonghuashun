@@ -23,14 +23,9 @@
     --wence-sunken: #f5f6f8;
 }
 
-/* ---------- 页面底色：项目内置的水彩宣纸背景 ---------- */
+/* ---------- 页面与侧栏使用相同的浅灰背景 ---------- */
 .stApp {
-    background-color: #f8f1e5;
-    background-image: url("__APP_BACKGROUND_DATA_URI__");
-    background-repeat: no-repeat;
-    background-size: 100% 100vh;
-    background-position: center top;
-    background-attachment: fixed;
+    background: #f7f8fa;
     color: var(--wence-ink);
     font-family: "Microsoft YaHei", "PingFang SC", "Segoe UI", "Helvetica Neue", sans-serif;
     -webkit-font-smoothing: antialiased;
@@ -104,43 +99,85 @@ hr, [data-testid="stDivider"] hr { border-color: var(--wence-line-soft); }
     color: var(--wence-faint); text-transform: uppercase;
 }
 
-/* 侧栏导航：整行胶囊，选中态用品牌色 + 左侧强调条。
- * Streamlit 1.62 的 radio 结构为 stRadio > stWidgetLabel + stRadioGroup > stRadioOption。 */
+/* 侧栏导航：投资偏好为展开按钮，风险评估与风险调整是独立页面。 */
 .st-key-nav [data-testid="stElementContainer"] { width: 100%; }
-.st-key-nav [data-testid="stRadio"] { width: 100%; }
-.st-key-nav [data-testid="stRadioGroup"] {
-    display: flex; flex-direction: column; gap: .16rem; width: 100%;
-}
-.st-key-nav [data-testid="stRadioOption"] {
+.st-key-nav .stButton > button {
     width: 100%; min-height: 2.65rem;
-    display: flex; align-items: center; gap: 0;
-    padding: .5rem .75rem;
-    margin: 0;
-    border: 1px solid transparent;
-    border-radius: 9px;
-    background: transparent;
-    color: var(--wence-ink-2);
-    font-size: 1rem;
-    font-weight: 550;
-    letter-spacing: .01em;
-    cursor: pointer;
-    transition: background .15s ease, color .15s ease, border-color .15s ease;
+    justify-content: flex-start; text-align: left;
+    padding: .5rem .75rem; border-radius: 9px;
+    box-shadow: none; font-size: 1rem; font-weight: 550;
 }
-.st-key-nav [data-testid="stRadioOption"]:hover { background: #eceef2; color: var(--wence-ink); }
-.st-key-nav [data-testid="stRadioOption"]:has(input:checked) {
+.st-key-nav .stButton > button[kind="tertiary"] {
+    color: var(--wence-ink-2);
+}
+.st-key-nav .stButton > button[kind="tertiary"]:hover {
+    background: #eceef2; color: var(--wence-ink);
+}
+.st-key-nav .stButton > button[kind="primary"] {
     background: var(--wence-brand-tint);
     border-color: var(--wence-brand-line);
     color: var(--wence-brand-strong);
     font-weight: 700;
     box-shadow: inset 3px 0 0 var(--wence-brand);
 }
-/* 隐藏原生圆点，整行即选中态 */
-.st-key-nav [data-testid="stRadioOption"] > div > div > div:first-child { display: none; }
-.st-key-nav [data-testid="stRadioOption"]:focus-visible {
-    outline: 2px solid var(--wence-brand); outline-offset: 2px;
+.st-key-nav-preference-children { padding-left: 1rem; }
+.st-key-nav-preference-children .stButton > button {
+    min-height: 2.25rem; font-size: .92rem;
 }
 
-/* 最近聊天标题可收起；紧凑样式与侧栏分组保持一致。 */
+/* 风险评分：0 是清空入口，1—10 是十个格子，数字显示在格子上方。
+ * 保留原生 radio 输入及键盘操作，只替换它的视觉样式。 */
+.st-key-risk-score-grid [data-testid="stRadioGroup"] {
+    display: grid;
+    grid-template-columns: 2rem repeat(10, minmax(0, 1fr));
+    gap: .3rem;
+    width: 100%;
+}
+.st-key-risk-score-grid [data-testid="stRadioOption"] {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    margin: 0;
+    gap: .3rem;
+    padding: .15rem 0;
+    min-width: 0;
+    cursor: pointer;
+}
+.st-key-risk-score-grid [data-testid="stRadioOption"] > div > div > div:first-child { display: none; }
+.st-key-risk-score-grid [data-testid="stRadioOption"]::after {
+    content: "";
+    display: block;
+    width: 100%;
+    height: 1.6rem;
+    background: #fff;
+    border: 1px solid var(--wence-brand-line);
+    border-radius: 3px;
+}
+.st-key-risk-score-grid [data-testid="stRadioOption"]:first-child::after {
+    content: "○";
+    display: grid;
+    place-items: center;
+    background: transparent;
+    border-color: transparent;
+    color: var(--wence-muted);
+}
+.st-key-risk-score-grid [data-testid="stRadioOption"]:not(:first-child):has(input:checked)::after,
+.st-key-risk-score-grid [data-testid="stRadioOption"]:not(:first-child):has(~ [data-testid="stRadioOption"] input:checked)::after {
+    background: var(--wence-brand);
+    border-color: var(--wence-brand);
+}
+.st-key-risk-score-grid [data-testid="stRadioOption"]:has(input:checked) {
+    color: var(--wence-brand-strong);
+    font-weight: 700;
+}
+.st-key-risk-score-grid [data-testid="stRadioOption"]:first-child:has(input:checked)::after { content: "●"; }
+.st-key-risk-score-grid [data-testid="stRadioOption"]:hover::after,
+.st-key-risk-score-grid [data-testid="stRadioOption"]:has(input:focus-visible)::after {
+    outline: 2px solid var(--wence-brand);
+    outline-offset: 2px;
+}
+
+/* 最近咨询标题可收起；紧凑样式与侧栏分组保持一致。 */
 [data-testid="stSidebar"] .st-key-recent-chats [data-testid="stExpander"],
 [data-testid="stSidebar"] [data-testid="stExpander"].st-key-recent-chats {
     background: transparent;
@@ -157,7 +194,7 @@ hr, [data-testid="stDivider"] hr { border-color: var(--wence-line-soft); }
     font-weight: 700;
 }
 
-/* 最近聊天：紧凑、可滚动的整行入口，当前会话使用柔和选中态。 */
+/* 最近咨询：紧凑、可滚动的整行入口，当前会话使用柔和选中态。 */
 .st-key-recent-chat-list {
     margin: .1rem 0 .6rem;
 }
@@ -175,11 +212,20 @@ hr, [data-testid="stDivider"] hr { border-color: var(--wence-line-soft); }
     color: var(--wence-ink-2);
 }
 [data-testid="stSidebar"] .st-key-recent-chat-list .stButton > button p {
+    display: block;
+    max-width: 100%;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     font-size: .91rem;
 }
+[data-testid="stSidebar"] .st-key-recent-chat-list .stButton > button > div,
+[data-testid="stSidebar"] .st-key-recent-chat-list .stButton > button [data-testid="stMarkdownContainer"] {
+    min-width: 0;
+    overflow: hidden;
+}
+.st-key-confirmed-profile-stamp { display: flex; justify-content: flex-end; }
+.st-key-confirmed-profile-stamp [data-testid="stImage"] { opacity: .72; }
 .st-key-recent-chat-list .stButton > button[kind="tertiary"]:hover {
     background: #eceef2;
     color: var(--wence-ink);
@@ -513,7 +559,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible,
 }
 
 /* 研究结论和正文分层：结论是阅读起点，风险提示仍由原组件渲染。 */
-.st-key-analysis-conclusion {
+[class*="st-key-analysis-conclusion"] {
     border-left: 4px solid var(--wence-brand) !important;
     background: linear-gradient(110deg, #fffaf7, #ffffff 52%) !important;
     box-shadow: 0 10px 28px rgba(81, 46, 55, .08) !important;
@@ -611,6 +657,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible,
 }
 @media (max-width: 640px) {
     [data-testid="stMainBlockContainer"] { padding: 1.1rem .95rem 3rem; }
+    [data-testid="stChatMessage"] { padding: .75rem; }
+    [class*="st-key-analysis-conclusion"] { padding: .8rem; }
     .stat-grid, .profile-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .prompt-grid { grid-template-columns: 1fr; }
     .hero { display: block; padding: 1.45rem; }
@@ -624,4 +672,37 @@ button:focus-visible, input:focus-visible, textarea:focus-visible,
 }
 @media (prefers-reduced-motion: reduce) {
     button, .st-key-nav [data-testid="stRadio"] label { transition: none; }
+}
+
+
+/* 研究领域数据：白色面板与酒红重点保持统一，图表、指标与正文分层阅读。 */
+:is(.st-key-research-board-market, .st-key-research-board-industry,
+    .st-key-research-board-stock, .st-key-research-board-fund, .st-key-research-board-convertible) {
+    padding: 1.25rem;
+    background: linear-gradient(160deg, #ffffff 0%, #fffdfd 100%);
+    border: 1px solid var(--wence-line);
+    border-radius: 16px;
+    box-shadow: 0 5px 20px rgba(31, 36, 48, .035);
+}
+[class*="st-key-research-board-"] [data-testid="stMetric"] {
+    background: #fff;
+    border-color: #eee1e5;
+    border-radius: 12px;
+    padding: .85rem 1rem;
+    box-shadow: inset 0 3px 0 #f4e3e7;
+}
+[class*="st-key-research-board-"] [data-testid="stMetricValue"] {
+    font-variant-numeric: tabular-nums;
+    font-size: clamp(1.3rem, 2.2vw, 1.85rem);
+    font-weight: 700;
+}
+[class*="st-key-research-board-"] [data-testid="stDataFrame"] {
+    border-radius: 10px;
+    overflow: hidden;
+}
+[class*="st-key-research-board-"] h3 { font-size: 1.1rem; }
+[class*="st-key-research-board-"] [data-testid="stCaptionContainer"] { font-size: .8rem; }
+@media (max-width: 640px) {
+    :is(.st-key-research-board-market, .st-key-research-board-industry,
+        .st-key-research-board-stock, .st-key-research-board-fund, .st-key-research-board-convertible) { padding: .8rem; }
 }

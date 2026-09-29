@@ -16,7 +16,7 @@ from backend.app.models import FactRecord
 # 截断即可，不影响结论的可追溯性。
 MAX_STORED_EVIDENCE = 60
 
-_FACT_KEYS = ("fact_id", "entity", "field", "value", "snapshot_time", "source_id", "source_url", "quality", "period")
+_FACT_KEYS = ("fact_id", "entity", "entity_code", "field", "value", "snapshot_time", "source_id", "source_url", "source_field", "quality", "period", "derived_from")
 
 
 def summarise_advice(advice: dict[str, Any], used_fact_ids: set[str] | None = None) -> dict[str, Any]:
@@ -34,6 +34,8 @@ def summarise_advice(advice: dict[str, Any], used_fact_ids: set[str] | None = No
             break
 
     summary: dict[str, Any] = {
+        "history_version": 2,
+        "intent": advice.get("intent"),
         "trace_id": advice.get("trace_id"),
         "profile_version": advice.get("profile_version"),
         "snapshot_time": advice.get("snapshot_time"),
@@ -123,6 +125,7 @@ def _compact_agent_results(results: Any) -> list[dict[str, Any]]:
                     "risk_flags",
                     "invalidation_conditions",
                     "details",
+                    "facts_used",
                 )
                 if result.get(key) is not None
             }

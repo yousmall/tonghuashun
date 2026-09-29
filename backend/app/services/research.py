@@ -195,7 +195,8 @@ class AutomatedResearchPipeline:
         method = getattr(self.provider, call.method)
         facts = await method(*call.args)
         # 打上来源调用键：下一轮针对同一目标再提问时，据此判断能否直接沿用。
-        return [fact.model_copy(update={"produced_by": call.key}) for fact in facts]
+        return [fact.model_copy(update={"produced_by": call.key}) for fact in facts
+                if fact.field not in NON_SUBSTANTIVE_FIELDS]
 
     def _split_reusable(
         self,

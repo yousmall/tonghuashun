@@ -12,10 +12,13 @@ import math
 import os
 import re
 import secrets
-from collections.abc import Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
+from time import perf_counter
+
+from backend.app.services.call_tracking import calling_user_id
 
 import httpx
 
@@ -66,6 +69,8 @@ FIELD_ALIASES = {
     "综合评分排名": "fundamental_rank",
     "所属同花顺行业": "industry",
     "资金流向": "capital_flow",
+    "主力净买入额": "capital_flow",
+    "主力资金净流入": "capital_flow",
     "成交额": "turnover_value",
     "振幅": "amplitude",
     "开盘价_前复权": "open_price",
@@ -91,6 +96,13 @@ FIELD_ALIASES = {
     "风险等级": "fund_risk_level",
     "管理费率": "fee_rate",
     "跟踪误差": "tracking_error",
+    "单位净值增长率": "nav_change",
+    "净值增长率": "nav_change",
+    "单位净值": "fund_nav",
+    "最新净值日期": "nav_date",
+    "基金规模": "fund_size",
+    "基金经理": "fund_manager",
+    "成立日期": "inception_date",
     "居民消费价格指数": "cpi",
     "工业生产者出厂价格指数": "ppi",
     "采购经理指数": "pmi",
@@ -122,6 +134,8 @@ FIELD_ALIASES = {
     "纯债溢价率": "pure_bond_premium_rate",
     "到期收益率": "yield_to_maturity",
     "剩余规模": "remaining_size",
+    "债券余额": "remaining_size",
+    "转股价值": "conversion_value",
     "债券评级": "bond_rating",
     "转股价": "conversion_price",
 }
@@ -274,6 +288,7 @@ class IwencaiSkillHubProvider:
         # Provider 是应用级单例；复用一个异步客户端才能真正复用 TCP/TLS 连接池。
         # 每次调用仍生成独立追踪 ID，并保留原有超时、重试和熔断语义。
         self._client = httpx.AsyncClient(transport=transport, timeout=timeout_seconds)
+        self.call_observer: Callable[[dict[str, Any]], Awaitable[None]] | None = None
         self._failure_count = 0
         self._circuit_open_until: datetime | None = None
 
@@ -368,18 +383,13 @@ class IwencaiSkillHubProvider:
                     "X-Claw-Trace-Id": secrets.token_hex(32),
                 }
                 try:
-                    response = await self._client.post(
-                        f"{self.base_url}{path}", headers=headers, json=payload
+                    facts = await self._tracked_attempt(
+                        path, payload, headers, attempt=attempt, entity_hint=entity_hint,
+                        skill_id=skill_id, channel=channel, history_metric=history_metric,
+                        history_limit=history_limit,
                     )
-                    response.raise_for_status()
                     self._failure_count = 0
-                    payload = response.json()
-                    if history_metric:
-                        return _history_facts(
-                            payload, entity_hint=entity_hint, source_id=self.source_id,
-                            metric=history_metric, limit=history_limit,
-                        )
-                    return self._normalize(payload, entity_hint=entity_hint, channel=channel)
+                    return facts
                 except httpx.HTTPStatusError as exc:
                     last_error = exc
                     status_code = exc.response.status_code
@@ -396,6 +406,36 @@ class IwencaiSkillHubProvider:
         if self._failure_count >= 3:
             self._circuit_open_until = datetime.now(timezone.utc) + timedelta(seconds=30)
         raise RuntimeError(self._query_error_message(last_error)) from last_error
+
+    async def _tracked_attempt(
+        self, path: str, payload: dict[str, object], headers: dict[str, str], *,
+        attempt: int, entity_hint: str, skill_id: str, channel: str | None,
+        history_metric: str | None, history_limit: int,
+    ) -> list[FactRecord]:
+        started = perf_counter()
+        event: dict[str, Any] = {
+            "user_id": calling_user_id.get(), "endpoint": path, "skill_id": skill_id,
+            "attempt": attempt, "status": "failed", "status_code": None,
+            "fact_count": 0, "error_type": None, "created_at": datetime.now(timezone.utc),
+        }
+        try:
+            response = await self._client.post(f"{self.base_url}{path}", headers=headers, json=payload)
+            event["status_code"] = response.status_code
+            response.raise_for_status()
+            result = response.json()
+            facts = (_history_facts(result, entity_hint=entity_hint, source_id=self.source_id,
+                                    metric=history_metric, limit=history_limit)
+                     if history_metric else self._normalize(result, entity_hint=entity_hint, channel=channel))
+            event["status"] = "success" if facts else "empty"
+            event["fact_count"] = len(facts)
+            return facts
+        except BaseException as exc:
+            event["error_type"] = type(exc).__name__
+            raise
+        finally:
+            event["duration_ms"] = (perf_counter() - started) * 1000
+            if self.call_observer is not None:
+                await self.call_observer(event)
 
     @staticmethod
     def _query_error_message(error: Exception | None) -> str:
@@ -549,7 +589,14 @@ class IwencaiSkillHubProvider:
         # 找不到所需字段。
         expanded = _expand_indicator_rows(records)
         facts: list[FactRecord] = []
+        requested_codes = set(re.findall(r"(?<!\d)\d{6}(?!\d)", entity_hint)) if channel is None else set()
         for record in expanded[:100]:
+            returned_code = _entity_code_from_record(record)
+            # 上游会把已摘牌/不存在的代码模糊匹配成另一只证券，不能沿用为目标行情。
+            if requested_codes and returned_code:
+                matched = re.search(r"(?<!\d)\d{6}(?!\d)", returned_code)
+                if matched and matched.group() not in requested_codes:
+                    continue
             entity = _entity_from_record(record, entity_hint)
             # "一行即一条记录"的返回（综合搜索、机构调研/研报、事件等）整行共用
             # 一个逐条标识：同一份记录的多个字段共享 period，同一实体的多条记录
@@ -578,7 +625,9 @@ class IwencaiSkillHubProvider:
                         entity=entity,
                         field=field,
                         value=value,
-                        period=period,
+                        period=period if record_scope else (_field_period(str(raw_field)) or period),
+                        entity_code=_entity_code_from_record(record),
+                        source_field=str(raw_field),
                         snapshot_time=snapshot_time,
                         source_id=self.source_id,
                         source_url=source_url,
@@ -587,6 +636,8 @@ class IwencaiSkillHubProvider:
                 )
         if facts:
             return facts
+        if records:
+            return []
         # 即使供应商返回非表格答案，也保留为不可计算但可追溯的文本证据。
         summary = _first_scalar(payload)
         if summary is None:
@@ -727,8 +778,9 @@ def _expand_indicator_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]
                 indicator: value,
             }
             suffix = _period_suffix(raw_key)
-            if suffix:
-                row["报告期"] = suffix
+            observed_period = suffix or _period_from_record(record)
+            if observed_period:
+                row["报告期"] = observed_period
             expanded.append(row)
     return expanded
 
@@ -939,15 +991,36 @@ def _record_scope(record: dict[str, Any]) -> str:
 
 
 def _entity_from_record(record: dict[str, Any], fallback: str) -> str:
-    for key in ("证券简称", "名称", "股票简称", "代码", "证券代码", "股票代码"):
+    for key in ("证券简称", "名称", "股票简称", "基金简称", "基金名称", "指数简称", "指数名称",
+                "可转债简称", "债券简称", "转债简称", "行业名称", "板块名称",
+                "代码", "证券代码", "股票代码", "基金代码", "指数代码", "转债代码"):
         value = record.get(key)
         if value not in (None, ""):
             return str(value)
     return fallback
 
 
+def _entity_code_from_record(record: dict[str, Any]) -> str | None:
+    for key in ("证券代码", "股票代码", "基金代码", "指数代码", "可转债代码", "转债代码", "代码"):
+        value = record.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
+def _field_period(raw_field: str) -> str | None:
+    """保留供应商逐列日期，财报期与行情日期不能互相代替。"""
+    match = re.search(r"\[(\d{8})\]$", raw_field)
+    if match:
+        try:
+            return datetime.strptime(match.group(1), "%Y%m%d").date().isoformat()
+        except ValueError:
+            pass
+    return None
+
+
 def _period_from_record(record: dict[str, Any]) -> str | None:
-    for key in ("报告期", "日期", "时间"):
+    for key in ("报告期", "日期", "时间", "交易日期", "净值日期", "最新净值日期"):
         value = record.get(key)
         if value not in (None, ""):
             return str(value)

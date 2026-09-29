@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from contextvars import ContextVar
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from contextlib import suppress
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from time import perf_counter
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
@@ -72,6 +73,12 @@ from backend.app.services import (
     summarise_advice,
     used_fact_ids_of,
 )
+from backend.app.models.schemas import DataOverviewRequest, DataOverviewResponse, ComparisonRequest, ComparisonResponse, SnapshotOptions
+from backend.app.services.comparison import fetch_snapshots
+from backend.app.services.overview_cache import OverviewCache
+overview_cache = OverviewCache()
+from backend.app.services.admin import consultation_metadata
+from backend.app.services.call_tracking import calling_user_id
 from backend.app.session_pool import (
     SessionCapacityExceeded,
     SessionLeaseExpired,
@@ -106,6 +113,7 @@ async def lifespan(_: FastAPI):
         reaper.cancel()
         with suppress(asyncio.CancelledError):
             await reaper
+        await overview_cache.aclose()
         closers = []
         llm = getattr(coordinator.semantic, "llm", None)
         if llm is not None and hasattr(llm, "aclose"):
@@ -152,6 +160,22 @@ coordinator, llm_enabled = build_coordinator()
 data_provider = IwencaiSkillHubProvider.from_env()
 research_pipeline = AutomatedResearchPipeline(data_provider)
 service_metrics = ServiceMetrics()
+iwencai_tracking_errors = 0
+
+
+async def record_iwencai_attempt(event: dict[str, object]) -> None:
+    """统计写入异常只影响统计完整性，不改变现有投资研究与取数逻辑。"""
+    global iwencai_tracking_errors
+    try:
+        await asyncio.to_thread(database.record_iwencai_call, event)
+    except Exception:
+        iwencai_tracking_errors += 1
+        logging.getLogger(__name__).warning("问财调用统计写入失败")
+
+
+if data_provider is not None:
+    data_provider.call_observer = record_iwencai_attempt
+
 analysis_progress: ContextVar[Callable[[str], None] | None] = ContextVar("analysis_progress", default=None)
 
 
@@ -178,6 +202,7 @@ async def optional_authenticated_user(authorization: str | None = Header(default
     if not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="请使用 Bearer 登录令牌")
     session_id: str | None = None
+    context_token = None
     try:
         payload = _decode_session_token(authorization.split(" ", 1)[1].strip())
         session_id = str(payload["sid"])
@@ -189,12 +214,15 @@ async def optional_authenticated_user(authorization: str | None = Header(default
         if not user:
             raise TokenError("登录账号不存在")
         user["_session_id"] = session_id
+        context_token = calling_user_id.set(int(user["id"]))
         yield user
     except DatabaseUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except (TokenError, SessionLeaseExpired) as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     finally:
+        if context_token is not None:
+            calling_user_id.reset(context_token)
         if session_id is not None:
             session_thread_pool.finish(session_id)
 
@@ -204,6 +232,24 @@ def authenticated_user(
 ) -> dict[str, object]:
     if not user:
         raise HTTPException(status_code=401, detail="请先登录")
+    return user
+
+
+def admin_user(user: dict[str, object] = Depends(authenticated_user)) -> dict[str, object]:
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="仅管理员可以访问管理后台")
+    return user
+
+
+def customer_user(user: dict[str, object] = Depends(authenticated_user)) -> dict[str, object]:
+    if user.get("role") == "admin":
+        raise HTTPException(status_code=403, detail="管理员账号仅用于管理后台")
+    return user
+
+
+def optional_customer_user(user: dict[str, object] | None = Depends(optional_authenticated_user)):
+    if user and user.get("role") == "admin":
+        raise HTTPException(status_code=403, detail="管理员账号仅用于管理后台")
     return user
 
 
@@ -351,12 +397,61 @@ async def session_logout_beacon(request: Request) -> Response:
     return Response(status_code=204)
 
 
+def _statistics_since(days: int) -> datetime | None:
+    return datetime.now(timezone.utc) - timedelta(days=days) if days else None
+
+
+@app.get("/api/v1/admin/users", tags=["admin"])
+def admin_users(
+    days: int = Query(default=0, ge=0, le=3650),
+    q: str = Query(default="", max_length=50),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=100),
+    user: dict[str, object] = Depends(admin_user),
+) -> dict[str, object]:
+    return database.admin_users(session_thread_pool.online_users(), since=_statistics_since(days),
+                                search=q, offset=offset, limit=limit)
+
+
+@app.get("/api/v1/admin/statistics", tags=["admin"])
+def admin_statistics(
+    days: int = Query(default=0, ge=0, le=3650),
+    user: dict[str, object] = Depends(admin_user),
+) -> dict[str, object]:
+    return {**database.admin_statistics(since=_statistics_since(days)),
+            "online_users": len(session_thread_pool.online_users()),
+            "online_idle_seconds": session_thread_pool.idle_timeout_seconds}
+
+
+@app.get("/api/v1/admin/users/{username}/consultations", tags=["admin"])
+def admin_consultations(
+    username: str,
+    days: int = Query(default=0, ge=0, le=3650),
+    user: dict[str, object] = Depends(admin_user),
+) -> dict[str, object]:
+    target_user = database.get_user_by_username(username.lower())
+    if not target_user:
+        raise HTTPException(status_code=404, detail="账号不存在")
+    since = _statistics_since(days)
+    return {**database.admin_statistics(since=since, user_id=int(target_user["id"])),
+            "recent": database.admin_recent_consultations(int(target_user["id"]), since)}
+
+
+@app.get("/api/v1/admin/iwencai", tags=["admin"])
+def admin_iwencai(
+    days: int = Query(default=0, ge=0, le=3650),
+    user: dict[str, object] = Depends(admin_user),
+) -> dict[str, object]:
+    return {**database.admin_iwencai_statistics(_statistics_since(days)),
+            "tracking_errors_since_start": iwencai_tracking_errors}
+
+
 @app.get("/api/v1/history", response_model=list[ConversationSummary], tags=["history"])
 def list_history(
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0, le=10000),
     q: str = Query(default="", max_length=100),
-    user: dict[str, object] = Depends(authenticated_user),
+    user: dict[str, object] = Depends(customer_user),
 ) -> list[ConversationSummary]:
     return [ConversationSummary.model_validate(row) for row in database.list_conversations(
         int(user["id"]), limit, offset, q,
@@ -368,7 +463,7 @@ def history_detail(
     conversation_id: str,
     before_id: int | None = Query(default=None, ge=1),
     limit: int = Query(default=40, ge=1, le=100),
-    user: dict[str, object] = Depends(authenticated_user),
+    user: dict[str, object] = Depends(customer_user),
 ) -> ConversationDetail:
     result = database.get_conversation(int(user["id"]), conversation_id, before_id, limit)
     if not result:
@@ -380,7 +475,7 @@ def history_detail(
 def rename_history(
     conversation_id: str,
     request: ConversationRename,
-    user: dict[str, object] = Depends(authenticated_user),
+    user: dict[str, object] = Depends(customer_user),
 ) -> dict[str, str]:
     if not database.rename_conversation(int(user["id"]), conversation_id, request.title):
         raise HTTPException(status_code=404, detail="对话记录不存在")
@@ -388,7 +483,7 @@ def rename_history(
 
 
 @app.get("/api/v1/watchlist", response_model=list[WatchlistItem], tags=["watchlist"])
-def list_watchlist(user: dict[str, object] = Depends(authenticated_user)) -> list[WatchlistItem]:
+def list_watchlist(user: dict[str, object] = Depends(customer_user)) -> list[WatchlistItem]:
     """返回当前账号的自选标的。"""
 
     return [WatchlistItem.model_validate(row) for row in database.list_watchlist(int(user["id"]))]
@@ -397,7 +492,7 @@ def list_watchlist(user: dict[str, object] = Depends(authenticated_user)) -> lis
 @app.post("/api/v1/watchlist", response_model=WatchlistItem, tags=["watchlist"])
 def add_watchlist_item(
     request: WatchlistItemCreate,
-    user: dict[str, object] = Depends(authenticated_user),
+    user: dict[str, object] = Depends(customer_user),
 ) -> WatchlistItem:
     """新增自选标的；重复项和容量限制以可操作错误返回。"""
 
@@ -413,7 +508,7 @@ def add_watchlist_item(
 @app.delete("/api/v1/watchlist/{item_id}", tags=["watchlist"])
 def remove_watchlist_item(
     item_id: int,
-    user: dict[str, object] = Depends(authenticated_user),
+    user: dict[str, object] = Depends(customer_user),
 ) -> dict[str, str]:
     """删除当前账号自己的自选项。"""
 
@@ -433,7 +528,7 @@ async def metrics() -> dict[str, object]:
 
 
 @app.post("/api/v1/data/fetch", response_model=DataFetchResponse, tags=["data"])
-async def fetch_market_data(request: DataFetchRequest) -> DataFetchResponse:
+async def fetch_market_data(request: DataFetchRequest, user: dict[str, object] | None = Depends(optional_customer_user)) -> DataFetchResponse:
     """从问财只读接口调用项目允许的 SkillHub 能力并标准化为事实。"""
 
     if data_provider is None:
@@ -479,10 +574,31 @@ async def fetch_market_data(request: DataFetchRequest) -> DataFetchResponse:
     )
 
 
+@app.post("/api/v1/data/overview", response_model=DataOverviewResponse, tags=["data"])
+async def research_data_overview(
+    request: DataOverviewRequest, user: dict[str, object] = Depends(customer_user),
+) -> DataOverviewResponse:
+    """返回研究页面的公开事实概览；不修改用户画像或咨询上下文。"""
+    return await overview_cache.get(data_provider, request)
+
+
+@app.post("/api/v1/data/compare", response_model=ComparisonResponse, tags=["data"])
+async def compare_data(request: ComparisonRequest, user: dict[str, object] = Depends(customer_user)):
+    return await fetch_snapshots(overview_cache, data_provider,
+        [(target, request.asset_type, None) for target in request.targets], refresh=request.refresh)
+
+
+@app.post("/api/v1/data/watchlist-quotes", response_model=ComparisonResponse, tags=["data"])
+async def watchlist_quotes(request: SnapshotOptions, user: dict[str, object] = Depends(customer_user)):
+    items = database.list_watchlist(int(user["id"]))[:20]
+    return await fetch_snapshots(overview_cache, data_provider,
+        [(item["target"], item["asset_type"], item["id"]) for item in items], wait=request.wait, refresh=request.refresh)
+
+
 @app.post("/api/v1/data/price-history", response_model=PriceHistoryResponse, tags=["data"])
 async def price_history(
     request: PriceHistoryRequest,
-    user: dict[str, object] = Depends(authenticated_user),
+    user: dict[str, object] = Depends(customer_user),
 ) -> PriceHistoryResponse:
     """为已登录用户按需读取真实日期序列；不把走势当作投资结论。"""
 
@@ -518,7 +634,7 @@ async def price_history(
 
 
 @app.post("/api/v1/profile/assess", response_model=ProfileAssessment, tags=["profile"])
-async def assess_user_profile(request: ProfileAssessmentRequest) -> ProfileAssessment:
+async def assess_user_profile(request: ProfileAssessmentRequest, user: dict[str, object] | None = Depends(optional_customer_user)) -> ProfileAssessment:
     """将问卷/文本转换为未确认画像草稿。
 
     返回值始终是 ``confirmed=False``；这不是可直接用于精确仓位建议的授权，
@@ -531,7 +647,7 @@ async def assess_user_profile(request: ProfileAssessmentRequest) -> ProfileAsses
 @app.post("/api/v1/profile/confirm", response_model=UserProfile, tags=["profile"])
 async def confirm_user_profile(
     request: ProfileConfirmRequest,
-    user: dict[str, object] | None = Depends(optional_authenticated_user),
+    user: dict[str, object] | None = Depends(optional_customer_user),
 ) -> UserProfile:
     """显式确认画像、递增版本号并按账号持久化。
 
@@ -562,7 +678,7 @@ async def confirm_user_profile(
 
 
 @app.get("/api/v1/profile", response_model=ProfileAssessment, tags=["profile"])
-def read_user_profile(user: dict[str, object] = Depends(authenticated_user)) -> ProfileAssessment:
+def read_user_profile(user: dict[str, object] = Depends(customer_user)) -> ProfileAssessment:
     """读取当前账号已确认的画像；没有保存过时返回未确认的默认画像。"""
 
     try:
@@ -585,7 +701,7 @@ def read_user_profile(user: dict[str, object] = Depends(authenticated_user)) -> 
 )
 async def analyze_portfolio(
     request: OrchestrationRequest,
-    user: dict[str, object] | None = Depends(optional_authenticated_user),
+    user: dict[str, object] | None = Depends(optional_customer_user),
 ) -> AdvicePackage:
     """运行组合诊断闭环并返回可审计建议包。
 
@@ -654,7 +770,9 @@ async def analyze_portfolio(
                 int(user["id"]),
                 request.conversation_id,
                 request.query,
-                request.model_dump(mode="json"),
+                {**request.model_dump(mode="json"), "_analytics": consultation_metadata(
+                    understanding.intent, understanding.target, request.query,
+                )},
                 completed_advice.conclusion,
                 summarise_advice(completed_payload, used_fact_ids_of(completed_payload)),
             )
@@ -674,7 +792,7 @@ async def analyze_portfolio(
 @app.post("/api/v1/portfolio/analyze/stream", tags=["advice"])
 async def stream_portfolio_analysis(
     request: OrchestrationRequest,
-    user: dict[str, object] | None = Depends(optional_authenticated_user),
+    user: dict[str, object] | None = Depends(optional_customer_user),
 ) -> StreamingResponse:
     """逐阶段发送进度；只在全部核验完成后发送最终建议包。"""
 

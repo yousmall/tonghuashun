@@ -175,6 +175,15 @@ class SessionThreadPool(Generic[R]):
         with self._lock:
             return self._reap_expired_locked(self._clock())
 
+    def online_users(self) -> dict[int, int]:
+        """只读在线用户及其有效会话数，不刷新任何人的活动时间。"""
+        with self._lock:
+            self._reap_expired_locked(self._clock())
+            users: dict[int, int] = {}
+            for lease in self._leases.values():
+                users[lease.user_id] = users.get(lease.user_id, 0) + 1
+            return users
+
     def snapshot(self) -> dict[str, int | float]:
         """返回线程池容量和当前租约数量，供 readiness 与 metrics 观测。"""
 

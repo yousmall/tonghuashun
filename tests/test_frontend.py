@@ -16,6 +16,16 @@ from frontend.streamlit_app import (
 )
 
 
+@pytest.fixture(autouse=True)
+def offline_research_board(monkeypatch):
+    """界面回归不访问开发环境的真实问财服务；专用数据面板测试另行覆盖。"""
+    from frontend import streamlit_app as ui
+    monkeypatch.setattr(ui, "create_board_fetch", lambda base: lambda base, direction, target: {
+        "direction": direction, "target": target, "status": "unavailable", "sections": [], "fetched_at": None,
+    })
+    monkeypatch.setattr(ui, "snapshot_fetch_factory", lambda client, token: lambda base, path, payload: lambda refresh=False: {"status": "unavailable", "items": []})
+
+
 SETUP = """
 from unittest.mock import patch
 import streamlit as st
@@ -31,7 +41,7 @@ with patch.object(ui, 'api_request', return_value={'id': 1, 'username': 'test-us
 
 
 def test_login_renders_without_backend():
-    app = AppTest.from_file(str(Path(__file__).parents[1] / 'frontend/streamlit_app.py')).run()
+    app = AppTest.from_file(str(Path(__file__).parents[1] / 'frontend/streamlit_app.py')).run(timeout=15)
     assert not app.exception
     assert [tab.label for tab in app.tabs] == ['登录', '注册']
     assert not app.code
@@ -57,13 +67,24 @@ st.session_state.request_paths = paths
 def test_navigation_and_profile_call_to_action():
     app = AppTest.from_string(SETUP + MAIN).run()
     assert not app.exception
-    assert app.radio[0].options == ['投资问答', '自选研究', '持仓分析', '投资偏好']
-    assert app.chat_input[0].disabled
+    assert app.session_state['navigation'] == '主页'
+    assert not app.radio
+    assert not any(button.label in {'风险评估', '风险调整'} for button in app.button)
+    assert not app.chat_input
+    assert any('04 · 在底部提出问题' in item.value for item in app.markdown)
+    next(button for button in app.button if button.label == '投资偏好').click().run(timeout=15)
+    assert not app.exception
+    assert app.session_state['navigation'] == '主页'
+    assert {button.label for button in app.button} >= {'风险评估', '风险调整'}
+    next(button for button in app.button if button.label == '投资偏好').click().run(timeout=15)
+    assert app.session_state['navigation'] == '主页'
+    assert not any(button.label in {'风险评估', '风险调整'} for button in app.button)
     next(button for button in app.button if button.label == '填写投资偏好').click().run(timeout=15)
     assert not app.exception
-    assert app.title[0].value == '投资偏好'
+    assert app.title[0].value == '风险评估'
+    assert app.session_state['navigation'] == '风险评估'
     assert '用户标识' not in [field.label for field in app.text_input]
-    plan = next(field for field in app.text_area if field.label == '你的投资计划')
+    plan = next(field for field in app.text_area if field.label == '您的投资计划')
     assert plan.placeholder == '例如：2 年后买房，最多接受 8% 亏损，期间可能随时需要使用这笔钱。'
     assert '投资 3 年' not in plan.placeholder
     assert '期望年化收益' not in plan.placeholder
@@ -74,7 +95,9 @@ def test_analysis_details_remains_reachable_without_sidebar_history_entry():
     script = SETUP + """
 st.session_state.profile_restored = True
 st.session_state.watchlist_loaded = True
+st.session_state.navigation = '投资问答'
 st.session_state.advice = {'conclusion': '仍需核实。', 'compliance': {'status': 'REVIEW'}}
+st.session_state.conversation = [{'role': 'assistant', 'content': '仍需核实。'}]
 def fake_api(base, method, path, payload=None, **kwargs):
     if path == '/history?limit=20' or path == '/history':
         return []
@@ -86,7 +109,7 @@ with patch.object(ui, 'api_request', side_effect=fake_api), \\
 """
     app = AppTest.from_string(script).run(timeout=15)
     assert not app.exception
-    assert '历史记录' not in app.radio[0].options
+    assert not any(button.label == '历史记录' for button in app.button)
     next(button for button in app.button if button.label == '查看分析详情').click().run(timeout=15)
     assert not app.exception
     assert app.title[0].value == '历史记录'
@@ -98,7 +121,7 @@ with patch.object(ui, 'api_request', side_effect=fake_api), \\
 def test_home_hides_manual_research_fetch_and_uses_automatic_acquisition():
     script = SETUP + """
 st.session_state.profile['confirmed'] = True
-ui.page_home('http://localhost')
+ui.page_questions('http://localhost')
 """
     app = AppTest.from_string(script).run(timeout=15)
 
@@ -106,7 +129,10 @@ ui.page_home('http://localhost')
     assert not any('研究资料' in item.label for item in app.expander)
     assert not any(button.label == '查询并加入资料' for button in app.button)
     assert not any(field.label == '想查什么' for field in app.selectbox)
-    assert any('按需获取资料' in item.value for item in app.caption)
+    assert len(app.chat_input) == 1
+    assert not app.text_input
+    assert not app.text_area
+    assert not any('研究工作台' in item.label for item in app.expander)
 
 
 def test_advice_shown_once_and_all_risks_retained():
@@ -119,15 +145,16 @@ st.session_state.conversation = [
     {'role': 'user', 'content': '怎么看？'},
     {'role': 'assistant', 'content': advice['conclusion'], 'payload': advice}]
 st.session_state.advice = advice
-ui.page_home('http://localhost')
+ui.page_questions('http://localhost')
 """
     app = AppTest.from_string(script).run()
     assert not app.exception
     assert sum(item.value == '价格仍可能下跌。' for item in app.markdown) == 1
     assert not app.metric
-    assert len(app.warning) == 2
+    assert len(app.warning) == 1
+    assert "未能取得最新市场数据" in app.warning[0].value
     assert any('风险丁' in item.value for item in app.markdown)
-    assert any('其余需要注意' in item.label for item in app.expander)
+    assert not any('其余需要注意' in item.label for item in app.expander)
 
 
 def test_failed_analysis_does_not_append_or_send_result_payload():
@@ -202,7 +229,8 @@ ui.page_watchlist('http://localhost')
     next(field for field in app.text_input if field.label == '搜索自选').set_value('').run(timeout=15)
     next(field for field in app.selectbox if field.label == '筛选类型').set_value('股票').run(timeout=15)
     assert not app.exception
-    assert len([button for button in app.button if button.label == '开始研究']) == 2
+    assert len([button for button in app.button if button.label == '开始研究']) == 1
+    assert len(next(field for field in app.selectbox if field.label == '查看标的详情').options) == 2
     assert len(app.session_state['watchlist']) == 3
 
 
@@ -290,14 +318,14 @@ def test_profile_evidence_uses_friendly_language_without_internal_field_names():
     rendered = [profile_evidence_language(item) for item in evidence]
 
     assert rendered == [
-        '你提到“两年后准备买房”，因此评估为：计划投资约 2 年。',
-        '你提到“接受5%的年亏损”，因此评估为：最多可接受约 5% 的阶段性亏损。',
-        '你提到“两年后准备买房”，因此评估为：这笔资金可能需要随时使用。',
-        '你提到“两年后准备买房”，因此评估为：投资目标是买房。',
-        '根据你对五项风险问题的回答，已综合评估你的风险承受能力。',
-        '已记录你填写的投资经验。',
-        '已记录你填写的投资经历。',
-        '已记录你填写的期望年化收益。',
+        '您提到“两年后准备买房”，因此评估为：计划投资约 2 年。',
+        '您提到“接受5%的年亏损”，因此评估为：最多可接受约 5% 的阶段性亏损。',
+        '您提到“两年后准备买房”，因此评估为：这笔资金可能需要随时使用。',
+        '您提到“两年后准备买房”，因此评估为：投资目标是买房。',
+        '根据您对五项风险问题的回答，已综合评估您的风险承受能力。',
+        '已记录您填写的投资经验。',
+        '已记录您填写的投资经历。',
+        '已记录您填写的期望年化收益。',
     ]
     assert not any(
         token in item
@@ -371,7 +399,7 @@ with patch.object(ui, 'api_request', side_effect=fake_api), patch.object(ui, 're
     app = AppTest.from_string(script).run()
     next(button for button in app.button if button.label == '恢复并继续对话').click().run(timeout=15)
     assert not app.exception
-    assert app.radio[0].value == '投资问答'
+    assert app.session_state['navigation'] == '投资问答'
     assert app.session_state['conversation_id'] == 'saved'
     assert app.session_state['conversation'][1]['payload']['compliance']['status'] == 'REVIEW'
     assert len(app.warning) == 1
@@ -451,45 +479,109 @@ ui.render_materials_body('http://localhost')
     assert app.session_state['advice']['facts'][0]['value'] == '原始新闻'
 
 
-def test_quick_ask_submits_research_prefix():
-    """原“专题研究”已并入问答页的研究方向提问。"""
+@pytest.mark.parametrize("direction", ['市场解读', '行业分析', '个股研究', '基金筛选', '可转债分析'])
+def test_research_page_submits_bottom_input_with_direction_prefix(direction):
     script = SETUP + """
 st.session_state.profile['confirmed'] = True
-def fake_stream(base, payload):
-    st.session_state.sent_query = payload['query']
-    return {'trace_id': 'research-1', 'conclusion': '个股专属结果', 'compliance': {'status': 'PASS'}}
-with patch.object(ui, 'stream_analysis', side_effect=fake_stream):
-    ui.render_quick_ask('http://localhost')
+def fake_submit(base, direction, query):
+    st.session_state.sent = {'query': query, 'auto_fetch': True}
+with patch.object(ui, 'submit_chat_analysis', side_effect=fake_submit):
+    ui.page_questions('http://localhost')
 """
     app = AppTest.from_string(script).run(timeout=15)
-    app.segmented_control[0].select('个股研究').run(timeout=15)
-    next(field for field in app.text_input if field.label == '关注的对象或想了解的问题').set_value('分析测试股票')
-    next(button for button in app.button if button.label == '开始分析').click().run(timeout=15)
+    app.segmented_control[0].select(direction).run(timeout=15)
     assert not app.exception
-    assert app.session_state['sent_query'] == '个股研究：分析测试股票'
+    assert not app.text_input and not app.text_area
+    assert len(app.chat_input) == 1
+    app.chat_input[0].set_value('分析测试对象').run(timeout=15)
+    assert not app.exception
+    assert app.session_state['sent']['query'] == direction + '：分析测试对象'
+    assert app.session_state['sent']['auto_fetch'] is True
 
 
-def test_quick_ask_keeps_typed_question_when_direction_and_submit_share_one_run():
-    """方向按钮和输入框同在一个 form 里：点方向不会触发重跑，所以“选方向→填内容→提交”
-    对用户只是一次提交，上面的用例分两次 run 反而掩盖了真实路径。
-
-    此时输入框若没有固定 key，它的控件标识会随 placeholder（这里跟着研究方向变化）改变：
-    浏览器按旧标识回传内容，服务端按新标识找不到对应控件，用户输入被整段丢弃，只剩下默认问题。
-    """
+def test_five_research_pages_isolate_history_evidence_and_new_conversation():
     script = SETUP + """
 st.session_state.profile['confirmed'] = True
-def fake_stream(base, payload):
-    st.session_state.sent_query = payload['query']
-    return {'trace_id': 'research-2', 'conclusion': '个股专属结果', 'compliance': {'status': 'PASS'}}
-with patch.object(ui, 'stream_analysis', side_effect=fake_stream):
-    ui.render_quick_ask('http://localhost')
+st.session_state.setdefault('sent_payloads', [])
+def fake_submit(base, direction, question):
+    st.session_state.sent_payloads.append({'query': question, 'context_messages': [question],
+                                           'facts': list(st.session_state.facts)})
+    fact = {'fact_id': question, 'entity': question, 'field': 'news', 'value': question}
+    st.session_state.conversation.extend([
+        {'role': 'user', 'content': question},
+        {'role': 'assistant', 'content': question + '结果'}])
+    st.session_state.facts.append(fact)
+    st.session_state.advice = {'conclusion': question + '结果', 'facts': [fact]}
+    ui.save_research_session()
+with patch.object(ui, 'submit_chat_analysis', side_effect=fake_submit):
+    ui.page_questions('http://localhost')
 """
     app = AppTest.from_string(script).run(timeout=15)
-    app.segmented_control[0].select('个股研究')
-    next(field for field in app.text_input if field.label == '关注的对象或想了解的问题').set_value('分析测试股票')
-    next(button for button in app.button if button.label == '开始分析').click().run(timeout=15)
+    directions = ['市场解读', '行业分析', '个股研究', '基金筛选', '可转债分析']
+    ids = []
+    for direction in directions:
+        app.segmented_control[0].select(direction).run(timeout=15)
+        assert not app.exception
+        assert app.session_state['conversation'] == []
+        assert app.session_state['facts'] == []
+        assert app.session_state['advice'] is None
+        app.chat_input[0].set_value('独立问题').run(timeout=15)
+        assert not app.exception
+        ids.append(app.session_state['conversation_id'])
+        sent = app.session_state['sent_payloads'][-1]
+        assert len(sent['context_messages']) == 1
+        assert sent['facts'] == []
+    assert len(set(ids)) == 5
+    for direction in directions:
+        app.segmented_control[0].select(direction).run(timeout=15)
+        assert not app.exception
+        assert len(app.session_state['conversation']) == 2
+        assert app.session_state['conversation'][0]['content'] == direction + '：独立问题'
+        assert app.session_state['facts'][0]['entity'] == direction + '：独立问题'
+        assert app.session_state['advice']['conclusion'] == direction + '：独立问题结果'
+    next(button for button in app.button if button.label == '发起咨询').click().run(timeout=15)
     assert not app.exception
-    assert app.session_state['sent_query'] == '个股研究：分析测试股票'
+    assert app.session_state['conversation'] == []
+    assert app.session_state['advice'] is None
+    assert app.session_state['conversation_id'] not in ids
+    assert app.session_state['facts'][0]['entity'] == '可转债分析：独立问题'
+    app.segmented_control[0].select('行业分析').run(timeout=15)
+    assert app.session_state['conversation_id'] == ids[1]
+    assert len(app.session_state['conversation']) == 2
+
+
+def test_background_answer_returns_to_originating_research_direction():
+    from frontend.api_client import ApiResult
+
+    script = SETUP + """
+from concurrent.futures import Future
+from frontend.api_client import ApiResult
+st.session_state.profile['confirmed'] = True
+future = st.session_state.setdefault('async_future', Future())
+class FakeExecutor:
+    def submit(self, *args):
+        return future
+with patch.object(ui, 'analysis_executor', return_value=FakeExecutor()), \
+     patch.object(ui, 'backend_http_client', return_value=object()):
+    ui.finish_chat_analyses()
+    ui.page_questions('http://localhost')
+"""
+    app = AppTest.from_string(script).run(timeout=15)
+    app.chat_input[0].set_value('分析市场').run(timeout=15)
+    assert not app.exception
+    assert len(app.session_state['conversation']) == 1
+    assert '市场解读' in app.session_state['analysis_jobs']
+    app.segmented_control[0].select('行业分析').run(timeout=15)
+    app.session_state['async_future'].set_result(ApiResult(data={
+        'conclusion': '市场分析已完成', 'facts': [], 'compliance': {'status': 'REVIEW'},
+    }))
+    app.run(timeout=15)
+    assert not app.exception
+    assert app.session_state['conversation'] == []
+    app.segmented_control[0].select('市场解读').run(timeout=15)
+    assert not app.exception
+    assert len(app.session_state['conversation']) == 2
+    assert app.session_state['conversation'][1]['content'] == '市场分析已完成'
 
 
 def test_details_uses_selected_result_evidence_not_current_materials():
@@ -741,7 +833,7 @@ with patch.object(ui, 'api_request', side_effect=fake_api), \\
 """
     app = AppTest.from_string(script).run(timeout=15)
     assert not app.exception
-    assert any(button.label == '新建对话' for button in app.button)
+    assert any(button.label == '发起咨询' for button in app.button)
     assert any(button.label == '之前的问题' for button in app.button)
 
     next(button for button in app.button if button.label == '之前的问题').click().run(timeout=15)
@@ -750,7 +842,7 @@ with patch.object(ui, 'api_request', side_effect=fake_api), \\
     assert [turn['role'] for turn in app.session_state['conversation']] == ['user', 'assistant']
     assert app.session_state['facts'][0]['fact_id'] == 'prepared'
 
-    next(button for button in app.button if button.label == '新建对话').click().run(timeout=15)
+    next(button for button in app.button if button.label == '发起咨询').click().run(timeout=15)
     assert not app.exception
     assert app.session_state['conversation_id'] != 'saved-one'
     assert app.session_state['conversation'] == []
@@ -788,7 +880,7 @@ def test_question_page_no_longer_embeds_manual_materials_panel():
     """主页直接提问并自动取数，不再要求用户先手工查询或整理资料。"""
     home = AppTest.from_string(SETUP + """
 st.session_state.facts = [{'fact_id': 'f1', 'field': 'news', 'entity': '甲公司', 'value': '资料甲'}]
-ui.page_home('http://localhost')
+ui.page_questions('http://localhost')
 """).run(timeout=15)
     assert not home.exception
     assert not any(button.label == '查询并加入资料' for button in home.button)
@@ -796,14 +888,14 @@ ui.page_home('http://localhost')
     assert not any(field.label == '在资料里查找' for field in home.text_input)
     assert not any(tab.label in {'查询资料', '补充资料'} for tab in home.tabs)
     assert '查找资料' not in NAVIGATION
-    assert NAVIGATION[0] == '投资问答'
+    assert NAVIGATION[:4] == ['主页', '风险评估', '风险调整', '投资问答']
 
 
 def test_ask_controls_remain_after_materials_panel_is_removed():
     """移除手工备料面板后，研究方向和自由提问入口仍应保留。"""
     home = AppTest.from_string(SETUP + """
 st.session_state.facts = [{'fact_id': 'f1', 'field': 'news', 'entity': '甲公司', 'value': '资料甲'}]
-ui.page_home('http://localhost')
+ui.page_questions('http://localhost')
 """).run(timeout=15)
     assert not home.exception
     assert any(item.label == '研究方向' for item in home.segmented_control)
@@ -887,3 +979,153 @@ with patch.object(ui, 'api_request', side_effect=fake_api):
     next(button for button in app.button if button.label == '保存名称').click().run(timeout=15)
     assert not app.exception
     assert app.session_state['renamed_payload'] == {'title': '新的名称'}
+
+
+@pytest.mark.parametrize("score", [0, 5, 10])
+def test_risk_grid_submits_scaled_scores_and_requires_confirmation(score):
+    script = SETUP + """
+def fake_api(base, method, path, payload=None, **kwargs):
+    if path == '/profile/assess':
+        st.session_state.assessment_payload = payload
+        return {'profile': dict(st.session_state.profile, confirmed=False),
+                'missing_fields': [], 'evidence': []}
+    if path == '/profile/confirm':
+        return dict(payload['profile'], confirmed=True, version=2)
+with patch.object(ui, 'api_request', side_effect=fake_api):
+    ui.page_profile('http://localhost')
+"""
+    app = AppTest.from_string(script).run(timeout=15)
+    assert not app.exception
+    assert not app.slider
+    assert len(app.radio) == 5
+    assert all(item.options == [str(n) for n in range(11)] for item in app.radio)
+    assert any(item.label == '风险态度' for item in app.expander)
+    app.radio[1].set_value(score)
+    next(button for button in app.button if button.label == '立即评估').click().run(timeout=15)
+    assert not app.exception
+    assert app.session_state['assessment_payload']['questionnaire']['loss_tolerance'] == score * 10
+    assert app.session_state['assessment_payload']['questionnaire']['financial_capacity'] == 50
+    assert app.session_state['profile']['confirmed'] is False
+    next(button for button in app.button if button.label == '确认并保存').click().run(timeout=15)
+    assert not app.exception
+    assert app.session_state['profile']['confirmed'] is True
+
+
+def test_risk_adjustment_restores_plan_scores_and_retains_risk_limits():
+    script = SETUP + """
+st.session_state.profile.update(single_security_limit=0.1, industry_limit=0.25,
+                                constraints=['不使用杠杆'], confirmed=True)
+st.session_state.questionnaire = {'loss_tolerance': 80}
+def fake_api(base, method, path, payload=None, **kwargs):
+    if path == '/profile/assess':
+        return {'profile': dict(st.session_state.profile, single_security_limit=0.2,
+                               industry_limit=0.3, constraints=[], confirmed=False),
+                'missing_fields': [], 'evidence': []}
+with patch.object(ui, 'api_request', side_effect=fake_api):
+    ui.page_profile('http://localhost', view='风险调整')
+"""
+    app = AppTest.from_string(script).run(timeout=15)
+    assert not app.exception
+    assert app.title[0].value == '风险调整'
+    assert app.radio[1].value == 8
+    assert '24 个月' in app.text_area[0].value
+    assert '10% 亏损' in app.text_area[0].value
+    next(button for button in app.button if button.label == '立即调整').click().run(timeout=15)
+    assert not app.exception
+    assert app.session_state['profile']['single_security_limit'] == 0.1
+    assert app.session_state['profile']['industry_limit'] == 0.25
+    assert app.session_state['profile']['constraints'] == ['不使用杠杆']
+    assert app.session_state['profile']['confirmed'] is False
+
+
+def test_home_explains_workflow_and_opens_research_page():
+    app = AppTest.from_string(SETUP + MAIN).run(timeout=15)
+    assert not app.exception
+    assert app.title[0].value == '开始使用问策智投'
+    assert not app.chat_input and not app.text_input and not app.text_area
+    assert sum(' · ' in item.value for item in app.markdown if item.value.startswith('**0')) == 6
+    next(button for button in app.button if button.label == '进入投资问答').click().run(timeout=15)
+    assert not app.exception
+    assert app.title[0].value == '市场解读'
+    assert app.chat_input[0].disabled
+    assert not any('投资有疑问' in item.value for item in app.markdown)
+    assert not any('研究工作台' in item.label for item in app.expander)
+
+
+def test_restore_history_returns_to_its_direction_without_overwriting_other_page():
+    script = SETUP + """
+st.session_state.conversation = [{'role': 'user', 'content': '市场解读：已有市场问题'}]
+st.session_state.facts = [{'fact_id': 'market', 'field': 'news', 'value': '市场资料'}]
+ui.restore_conversation({'id': 'saved-fund', 'messages': [
+    {'role': 'user', 'content': '基金筛选：比较两只基金', 'created_at': '2026-09-26'},
+    {'role': 'assistant', 'content': '基金结果', 'created_at': '2026-09-26',
+     'payload': {'conclusion': '基金结果', 'facts': [{'fact_id': 'fund', 'value': '基金资料'}]}}]})
+st.session_state.restored_direction = st.session_state.research_direction
+ui.activate_research('市场解读')
+"""
+    app = AppTest.from_string(script).run(timeout=15)
+    assert not app.exception
+    assert app.session_state['restored_direction'] == '基金筛选'
+    assert app.session_state['conversation'][0]['content'] == '市场解读：已有市场问题'
+    assert app.session_state['facts'][0]['fact_id'] == 'market'
+    assert app.session_state['research_sessions']['基金筛选']['facts'][0]['fact_id'] == 'fund'
+
+
+def test_portfolio_analysis_does_not_enter_research_page_context():
+    script = SETUP + """
+st.session_state.profile['confirmed'] = True
+st.session_state.conversation = [{'role': 'user', 'content': '市场解读：原市场问题'}]
+st.session_state.facts = [{'fact_id': 'market', 'field': 'news', 'value': '市场资料'}]
+st.session_state.portfolio = [{'name': '测试基金', 'weight': .2}]
+def fake_stream(base, payload):
+    st.session_state.portfolio_sent = payload
+    return {'conclusion': '组合结果', 'compliance': {'status': 'REVIEW'}, 'facts': []}
+with patch.object(ui, 'stream_analysis', side_effect=fake_stream):
+    ui.page_portfolio('http://localhost')
+"""
+    app = AppTest.from_string(script).run(timeout=15)
+    next(button for button in app.button if button.label == '分析我的持仓').click().run(timeout=15)
+    assert not app.exception
+    assert app.session_state['portfolio_sent']['facts'] == []
+    assert len(app.session_state['portfolio_sent']['context_messages']) == 1
+    assert app.session_state['portfolio_advice']['conclusion'] == '组合结果'
+    assert app.session_state['conversation'][0]['content'] == '市场解读：原市场问题'
+    assert app.session_state['facts'][0]['fact_id'] == 'market'
+
+
+def test_watchlist_research_opens_matching_direction_without_previous_context():
+    script = SETUP + """
+st.session_state.profile['confirmed'] = True
+st.session_state.watchlist = [{'id': 1, 'target': '测试ETF', 'asset_type': '基金'}]
+st.session_state.conversation = [{'role': 'user', 'content': '市场解读：市场问题'}]
+def fake_stream(base, payload):
+    st.session_state.watchlist_sent = payload
+    return {'conclusion': '基金比较结果', 'compliance': {'status': 'REVIEW'}, 'facts': []}
+with patch.object(ui, 'stream_analysis', side_effect=fake_stream):
+    ui.page_watchlist('http://localhost')
+"""
+    app = AppTest.from_string(script).run(timeout=15)
+    next(button for button in app.button if button.label == '开始研究').click().run(timeout=15)
+    assert not app.exception
+    assert app.session_state['research_direction'] == '基金筛选'
+    assert app.session_state['pending_navigation'] == '投资问答'
+    assert app.session_state['watchlist_sent']['query'].startswith('基金筛选：')
+    assert len(app.session_state['watchlist_sent']['context_messages']) == 1
+    assert app.session_state['research_sessions']['市场解读']['conversation'][0]['content'] == '市场解读：市场问题'
+
+
+def test_logout_clears_all_independent_research_contexts():
+    script = SETUP + """
+ui.activate_research('基金筛选')
+st.session_state.conversation = [{'role': 'user', 'content': '基金筛选：私人问题'}]
+ui.save_research_session()
+with patch.object(ui, 'current_browser_session_id', return_value=None):
+    ui.reset_user_session()
+ui.init_session()
+"""
+    app = AppTest.from_string(script).run(timeout=15)
+    assert not app.exception
+    assert 'research_sessions' not in app.session_state
+    assert 'conversation_directions' not in app.session_state
+    assert not app.session_state['conversation']
+    assert not app.session_state['facts']

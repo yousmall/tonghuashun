@@ -10,6 +10,7 @@ __pycache__/
 .pytest_cache/
 # 测试与临时工具在工作区内使用的临时目录
 .tmp_pytest/
+.tmp_flow/
 tmp*/
 
 # Local artifact build and visual-QA workspaces

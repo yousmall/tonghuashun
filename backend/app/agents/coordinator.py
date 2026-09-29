@@ -664,6 +664,15 @@ def cross_validate_results(results: list[AgentResult], facts: list[FactRecord]) 
     labels = {"market": "市场", "industry": "行业", "security": "个股",
               "fund": "基金", "portfolio": "持仓"}
     for result in results:
+        # 有引用只说明这些资料可核对，不代表缺失维度已经补齐。
+        # 完全无引用的辅助节点不额外影响已有可用结论；其余证据闸门仍生效。
+        if result.facts_used and result.status in {TaskStatus.DEGRADED, TaskStatus.UNKNOWN}:
+            issues.append(CrossValidationIssue(
+                code="INCOMPLETE_ANALYSIS",
+                severity="warning",
+                message=f"{labels.get(result.agent_id, '相关')}分析的关键资料或判断尚不完整，需要补充资料后复核。",
+                agent_ids=[result.agent_id],
+            ))
         rejected = (result.details or {}).get("rejected_reference_count", 0)
         if isinstance(rejected, int) and rejected > 0:
             issues.append(CrossValidationIssue(

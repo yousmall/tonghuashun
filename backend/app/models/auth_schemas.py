@@ -24,6 +24,7 @@ class UserSummary(BaseModel):
     id: int
     username: str
     created_at: datetime
+    role: Literal["user", "admin"] = "user"
 
 
 class AuthResponse(BaseModel):

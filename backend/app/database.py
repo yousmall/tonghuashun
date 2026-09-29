@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote_plus
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, create_engine, func, select
+from sqlalchemy import Float, case, cast, DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, create_engine, func, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -46,6 +46,28 @@ class UserRow(Base):
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     conversations: Mapped[list["ConversationRow"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+
+
+class AdminRoleRow(Base):
+    """独立权限表，旧用户表无需修改；公开注册永远不会写入这里。"""
+    __tablename__ = "admin_roles"
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+
+
+class IwencaiCallRow(Base):
+    """每次真实 HTTP 尝试一条记录，包含重试与空结果。"""
+    __tablename__ = "iwencai_calls"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    endpoint: Mapped[str] = mapped_column(String(80))
+    skill_id: Mapped[str] = mapped_column(String(80))
+    attempt: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(16))
+    status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    duration_ms: Mapped[float] = mapped_column(Float)
+    fact_count: Mapped[int] = mapped_column(Integer, default=0)
+    error_type: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
 
 
 class ConversationRow(Base):
@@ -93,6 +115,17 @@ class MessageRow(Base):
     payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
     conversation: Mapped[ConversationRow] = relationship(back_populates="messages")
+
+
+class ConsultationRow(Base):
+    """与用户消息一一对应的轻量统计，不在统计排序中携带大 JSON。"""
+    __tablename__ = "consultation_stats"
+    __table_args__ = (Index("ix_consultation_domain_topic", "domain", "topic"),)
+    message_id: Mapped[int] = mapped_column(Integer, ForeignKey("messages.id", ondelete="CASCADE"), primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    domain: Mapped[str] = mapped_column(String(40), nullable=False)
+    topic: Mapped[str] = mapped_column(String(200), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
 class WatchlistRow(Base):
@@ -165,9 +198,30 @@ class Database:
                 for index in table.indexes:
                     if index.name in {"ix_conversations_user_updated", "ix_messages_user_conversation_id"}:
                         index.create(self.engine, checkfirst=True)
+            self._backfill_consultations()
             self.initialization_error = None
         except SQLAlchemyError as exc:
             self.initialization_error = type(exc).__name__
+
+    def _backfill_consultations(self) -> None:
+        """幂等补齐历史消息的轻量统计；缺少元数据时保留为未分类。"""
+        assert self.session_factory is not None
+        while True:
+            with self.session_factory.begin() as session:
+                rows = session.execute(select(
+                    MessageRow.id, MessageRow.user_id, MessageRow.created_at,
+                    cast(MessageRow.payload["_analytics"]["domain"].as_string(), String(40)),
+                    cast(MessageRow.payload["_analytics"]["topic"].as_string(), String(200)),
+                    func.substr(MessageRow.content, 1, 200),
+                ).outerjoin(ConsultationRow, ConsultationRow.message_id == MessageRow.id).where(
+                    MessageRow.role == "user", ConsultationRow.message_id.is_(None),
+                ).limit(200)).all()
+                if not rows:
+                    return
+                session.add_all([ConsultationRow(message_id=message_id, user_id=user_id,
+                                                 created_at=created, domain=domain or "unknown",
+                                                 topic=topic or content or "未命名主题")
+                                 for message_id, user_id, created, domain, topic, content in rows])
 
     def require_ready(self) -> None:
         if not self.configured:
@@ -175,7 +229,7 @@ class Database:
         if self.initialization_error:
             raise DatabaseUnavailable("MySQL 暂时不可用，请检查连接配置")
 
-    def create_user(self, username: str, password_hash: str) -> dict[str, Any]:
+    def create_user(self, username: str, password_hash: str, *, admin: bool = False) -> dict[str, Any]:
         self.require_ready()
         assert self.session_factory is not None
         with self.session_factory() as session:
@@ -184,6 +238,9 @@ class Database:
             row = UserRow(username=username, password_hash=password_hash)
             session.add(row)
             try:
+                if admin:
+                    session.flush()
+                    session.add(AdminRoleRow(user_id=row.id))
                 session.commit()
             except IntegrityError as exc:
                 session.rollback()
@@ -191,21 +248,21 @@ class Database:
                     raise UsernameExists("该账号已存在") from exc
                 raise
             session.refresh(row)
-            return self._user_dict(row)
+            return {**self._user_dict(row), "role": "admin" if admin else "user"}
 
     def get_user_by_username(self, username: str) -> dict[str, Any] | None:
         self.require_ready()
         assert self.session_factory is not None
         with self.session_factory() as session:
             row = session.scalar(select(UserRow).where(UserRow.username == username))
-            return self._user_dict(row, include_password=True) if row else None
+            return self._user_with_role(session, row, include_password=True) if row else None
 
     def get_user(self, user_id: int) -> dict[str, Any] | None:
         self.require_ready()
         assert self.session_factory is not None
         with self.session_factory() as session:
             row = session.get(UserRow, user_id)
-            return self._user_dict(row) if row else None
+            return self._user_with_role(session, row) if row else None
 
     def save_profile(
         self, user_id: int, payload: dict[str, Any], version: int,
@@ -323,18 +380,16 @@ class Database:
                 )
                 session.add(conversation)
             conversation.updated_at = datetime.now(timezone.utc)
-            session.add_all(
-                [
-                    MessageRow(
-                        conversation_id=resolved_id, user_id=user_id, role="user",
-                        content=query, payload=request_payload,
-                    ),
-                    MessageRow(
-                        conversation_id=resolved_id, user_id=user_id, role="assistant",
-                        content=answer, payload=response_payload,
-                    ),
-                ]
-            )
+            user_message = MessageRow(conversation_id=resolved_id, user_id=user_id,
+                                      role="user", content=query, payload=request_payload)
+            session.add_all([user_message, MessageRow(conversation_id=resolved_id, user_id=user_id,
+                                                     role="assistant", content=answer, payload=response_payload)])
+            session.flush()
+            metadata = request_payload.get("_analytics") or {}
+            session.add(ConsultationRow(message_id=user_message.id, user_id=user_id,
+                                        domain=metadata.get("domain") or "unknown",
+                                        topic=metadata.get("topic") or query[:200] or "未命名主题",
+                                        created_at=user_message.created_at))
         return resolved_id
 
     def list_conversations(
@@ -434,6 +489,134 @@ class Database:
                 return False
             row.title = title
             return True
+
+    def admin_users(self, online: dict[int, int], *, since: datetime | None = None,
+                    search: str = "", offset: int = 0, limit: int = 50) -> dict[str, Any]:
+        """全部注册账号分页展示，在线账号始终优先；聚合查询避免逐用户读取。"""
+        self.require_ready()
+        assert self.session_factory is not None
+        filters = [MessageRow.role == "user"]
+        if since:
+            filters.append(MessageRow.created_at >= since)
+        counts = select(
+            MessageRow.user_id.label("user_id"), func.count().label("consultations"),
+            func.count(func.distinct(MessageRow.conversation_id)).label("conversations"),
+            func.max(MessageRow.created_at).label("last_consultation"),
+        ).where(*filters).group_by(MessageRow.user_id).subquery()
+        users = select(UserRow, AdminRoleRow.user_id, counts.c.consultations,
+                       counts.c.conversations, counts.c.last_consultation).outerjoin(
+            AdminRoleRow, AdminRoleRow.user_id == UserRow.id,
+        ).outerjoin(counts, counts.c.user_id == UserRow.id)
+        conditions = []
+        if search.strip():
+            slash = chr(92)
+            escaped = search.strip().replace(slash, slash * 2).replace("%", slash + "%").replace("_", slash + "_")
+            conditions.append(UserRow.username.like(f"%{escaped}%", escape=slash))
+        with self.session_factory() as session:
+            total = session.scalar(select(func.count()).select_from(UserRow).where(*conditions)) or 0
+            rows = session.execute(users.where(*conditions).order_by(
+                case((UserRow.id.in_(list(online)), 0), else_=1), UserRow.created_at.desc(), UserRow.id.desc(),
+            ).offset(offset).limit(limit)).all()
+            return {"total": total, "items": [
+                {**self._user_dict(user), "role": "admin" if admin_id is not None else "user",
+                 "online": user.id in online, "online_sessions": online.get(user.id, 0),
+                 "consultations": int(count or 0), "conversations": int(conversations or 0),
+                 "last_consultation": self._utc(last) if last else None}
+                for user, admin_id, count, conversations, last in rows
+            ]}
+
+    def record_iwencai_call(self, event: dict[str, Any]) -> None:
+        self.require_ready()
+        assert self.session_factory is not None
+        with self.session_factory.begin() as session:
+            session.add(IwencaiCallRow(**event))
+
+    def admin_statistics(self, *, since: datetime | None = None, user_id: int | None = None) -> dict[str, Any]:
+        """每轮已保存咨询计一次；旧记录缺少领域时明确归入未分类。"""
+        from backend.app.services.admin import DOMAIN_LABELS
+
+        self.require_ready()
+        assert self.session_factory is not None
+        domain = ConsultationRow.domain
+        topic = ConsultationRow.topic
+        conditions = []
+        if since:
+            conditions.append(ConsultationRow.created_at >= since)
+        if user_id is not None:
+            conditions.append(ConsultationRow.user_id == user_id)
+        grouped = select(domain.label("domain"), topic.label("topic"),
+                         func.count().label("count"), func.count(func.distinct(ConsultationRow.user_id)).label("users"))
+        grouped = grouped.where(*conditions).group_by(domain, topic).subquery()
+        ranked = select(grouped, func.row_number().over(
+            partition_by=grouped.c.domain, order_by=(grouped.c.count.desc(), grouped.c.topic.asc()),
+        ).label("rank")).subquery()
+        with self.session_factory() as session:
+            total, active_users = session.execute(select(
+                func.count(), func.count(func.distinct(ConsultationRow.user_id)),
+            ).select_from(ConsultationRow).where(*conditions)).one()
+            domain_counts = dict(session.execute(select(domain, func.count()).where(*conditions).group_by(domain)).all())
+            top = session.execute(select(ranked).where(ranked.c.rank <= 5).order_by(ranked.c.domain, ranked.c.rank)).mappings().all()
+            daily = session.execute(select(func.date(ConsultationRow.created_at), func.count()).where(*conditions)
+                                    .group_by(func.date(ConsultationRow.created_at)).order_by(func.date(ConsultationRow.created_at))).all()
+            return {
+                "consultations": total, "consulting_users": active_users,
+                "domains": [{"domain": key, "label": label, "count": int(domain_counts.get(key, 0)),
+                             "top": [{"topic": item["topic"], "count": item["count"], "users": item["users"]}
+                                     for item in top if item["domain"] == key]}
+                            for key, label in DOMAIN_LABELS.items()],
+                "daily": [{"date": str(day), "count": count} for day, count in daily],
+            }
+
+    def admin_recent_consultations(self, user_id: int, since: datetime | None = None) -> list[dict[str, Any]]:
+        self.require_ready()
+        assert self.session_factory is not None
+        conditions = [MessageRow.role == "user", MessageRow.user_id == user_id]
+        if since:
+            conditions.append(MessageRow.created_at >= since)
+        with self.session_factory() as session:
+            rows = session.execute(select(MessageRow.content, MessageRow.created_at,
+                                          MessageRow.payload["_analytics"]["domain"].as_string())
+                                   .where(*conditions).order_by(MessageRow.id.desc()).limit(50)).all()
+            return [{"query": content, "created_at": self._utc(created), "domain": domain or "unknown"}
+                    for content, created, domain in rows]
+
+    def admin_iwencai_statistics(self, since: datetime | None = None) -> dict[str, Any]:
+        self.require_ready()
+        assert self.session_factory is not None
+        conditions = [IwencaiCallRow.created_at >= since] if since else []
+        c = IwencaiCallRow
+        aggregates = [func.count().label("total"),
+                      func.sum(case((c.status.in_(["success", "empty"]), 1), else_=0)).label("successful"),
+                      func.sum(case((c.status == "failed", 1), else_=0)).label("failed"),
+                      func.sum(case((c.status == "empty", 1), else_=0)).label("empty"),
+                      func.sum(case((c.attempt > 0, 1), else_=0)).label("retries"),
+                      func.avg(c.duration_ms).label("average_ms"), func.sum(c.fact_count).label("facts")]
+        def clean(row):
+            return {key: round(float(value), 2) if key == "average_ms" and value is not None else int(value or 0)
+                    for key, value in row.items()}
+        with self.session_factory() as session:
+            summary = clean(session.execute(select(*aggregates).where(*conditions)).mappings().one())
+            grouped = session.execute(select(c.endpoint, c.skill_id, *aggregates).where(*conditions)
+                                      .group_by(c.endpoint, c.skill_id).order_by(func.count().desc(), c.skill_id)).mappings().all()
+            errors = session.execute(select(c.error_type, c.status_code, func.count()).where(
+                *conditions, c.status == "failed",
+            ).group_by(c.error_type, c.status_code).order_by(func.count().desc())).all()
+            daily = session.execute(select(func.date(c.created_at), func.count(),
+                                           func.sum(case((c.status == "failed", 1), else_=0)))
+                                    .where(*conditions).group_by(func.date(c.created_at)).order_by(func.date(c.created_at))).all()
+            first = session.scalar(select(func.min(c.created_at)))
+            summary.update({
+                "by_interface": [{"endpoint": row["endpoint"], "skill_id": row["skill_id"],
+                                  **clean({k: v for k, v in row.items() if k not in {"endpoint", "skill_id"}})} for row in grouped],
+                "errors": [{"error_type": kind, "status_code": code, "count": count} for kind, code, count in errors],
+                "daily": [{"date": str(day), "count": count, "failed": int(failed or 0)} for day, count, failed in daily],
+                "first_recorded_at": self._utc(first) if first else None,
+            })
+            return summary
+
+    @classmethod
+    def _user_with_role(cls, session: Session, row: UserRow, include_password: bool = False) -> dict[str, Any]:
+        return {**cls._user_dict(row, include_password), "role": "admin" if session.get(AdminRoleRow, row.id) else "user"}
 
     @staticmethod
     def _utc(value: datetime) -> datetime:

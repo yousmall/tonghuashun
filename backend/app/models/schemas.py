@@ -156,6 +156,9 @@ class FactRecord(BaseModel):
     source_id: str
     # 可点击的原始资料链接；与数值事实分开，不参与冲突判断。
     source_url: str | None = Field(default=None, max_length=2048)
+    # 展示溯源元数据；不参与评分，也不替代原始值或报告期。
+    entity_code: str | None = None
+    source_field: str | None = None
     # 0 到 1 的证据质量分，供冲突处理、置信度计算和界面展示使用。
     quality: float = Field(ge=0, le=1)
     # 财务/经营数据的报告期，例如 2026Q1；行情数据可为空。
@@ -442,6 +445,39 @@ class DataFetchResponse(BaseModel):
     facts: list[FactRecord] = Field(default_factory=list)
 
 
+class DataOverviewRequest(BaseModel):
+    """五个研究页面的只读概览，方向限定为固定查询模板。"""
+
+    direction: Literal["market", "industry", "stock", "fund", "convertible"]
+    wait: bool = True
+    refresh: bool = False
+    target: str | None = Field(default=None, max_length=60)
+
+    @field_validator("target")
+    @classmethod
+    def normalize_target(cls, value: str | None) -> str | None:
+        return value.strip() or None if value is not None else None
+
+
+class DataOverviewSection(BaseModel):
+    key: str
+    title: str
+    status: Literal["ok", "empty", "unavailable", "loading"]
+    fetched_at: datetime | None = None
+    expires_at: datetime | None = None
+    facts: list[FactRecord] = Field(default_factory=list)
+    message: str | None = None
+
+
+class DataOverviewResponse(BaseModel):
+    direction: str
+    target: str | None = None
+    source_name: str = "同花顺问财"
+    fetched_at: datetime
+    status: Literal["ok", "partial", "empty", "unavailable", "loading"]
+    sections: list[DataOverviewSection] = Field(default_factory=list)
+
+
 class PriceHistoryRequest(BaseModel):
     """按一个明确标的读取有限条数的历史价格或净值。"""
 
@@ -575,3 +611,42 @@ class AdvicePackage(BaseModel):
     agent_results: list[AgentResult] = Field(default_factory=list)
     # 单独保留一致性审查，避免把专业分歧藏进一个平均分。
     cross_validation: CrossValidationResult = Field(default_factory=CrossValidationResult)
+
+
+class SnapshotOptions(BaseModel):
+    wait: bool = False
+    refresh: bool = False
+
+
+class ComparisonRequest(BaseModel):
+    asset_type: Literal["股票", "基金", "可转债", "行业"]
+    targets: list[str] = Field(min_length=2, max_length=4)
+    refresh: bool = False
+
+    @field_validator("targets")
+    @classmethod
+    def distinct_targets(cls, values):
+        normalized = [value.strip() for value in values]
+        if any(not value or len(value) > 60 for value in normalized):
+            raise ValueError("每个标的应为 1–60 个字符")
+        if len({value.casefold() for value in normalized}) != len(normalized):
+            raise ValueError("请选择不同标的")
+        return normalized
+
+
+class ComparisonItem(BaseModel):
+    target: str
+    asset_type: str
+    watchlist_id: int | None = None
+    entity: str | None = None
+    entity_code: str | None = None
+    status: Literal["ok", "partial", "empty", "unavailable", "loading"]
+    fetched_at: datetime | None = None
+    facts: list[FactRecord] = Field(default_factory=list)
+    message: str | None = None
+
+
+class ComparisonResponse(BaseModel):
+    fetched_at: datetime
+    status: Literal["ok", "partial", "empty", "unavailable", "loading"]
+    items: list[ComparisonItem] = Field(default_factory=list)

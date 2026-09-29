@@ -2,7 +2,7 @@
 base = "light"
 # 品牌主色保持不变；其余层级改为金融终端式的中性冷灰，让正文与数据回到高对比底色。
 primaryColor = "#AD384E"
-backgroundColor = "#FFFFFF"
+backgroundColor = "#F7F8FA"
 secondaryBackgroundColor = "#F5F6F8"
 textColor = "#1F2430"
 linkColor = "#9C3149"

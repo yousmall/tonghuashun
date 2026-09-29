@@ -11,14 +11,15 @@
 
 from __future__ import annotations
 
-import base64
 import json
 import math
 import os
 import re
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from html import escape
 from ipaddress import ip_address
 from pathlib import Path
@@ -31,548 +32,28 @@ import altair as alt
 import httpx
 import pandas as pd
 import streamlit as st
+from frontend.result_views import render_advice, cached_answer_images, answer_export_payload, show_status
+from frontend.api_client import backend_http_client, request_json, overview_fetch, snapshot_fetch_factory
+from frontend.research_board import cancel_board_prefetch, render_research_board, restore_board_scroll, start_board_prefetch
 from streamlit.runtime import get_instance
 from streamlit.runtime.scriptrunner import get_script_run_ctx
 
 
+from frontend.presentation import (
+    display_value, fact_label, fact_source, fact_time, fact_period, friendly_fact_rows, advice_facts, _status_code, analysis_chain_stages, source_trace_rows, _facts_used_by_result, render_chain_overview, render_conclusion_panel, _render_conclusion_content, render_logic_chain, render_source_trace, render_profile_summary, plain_language, profile_evidence_language, render_points, render_empty_state, RISK_LEVELS, PROFILE_LABELS, FIELD_LABELS, NAVIGATION, DATA_KINDS, QUICK_ASKS, QUICK_ASK_PROMPTS, RESEARCH_PREFIX, WATCHLIST_RESEARCH_PREFIX, TOPIC_LABELS, PROGRESS_LABELS
+)
+
 DEFAULT_API_BASE = os.getenv("WENCE_API_BASE", "http://127.0.0.1:8000/api/v1")
-RISK_LEVELS = ["R1", "R2", "R3", "R4", "R5"]
-PROFILE_LABELS = {
-    "risk_level": "风险等级",
-    "risk_score": "风险评分",
-    "horizon_months": "投资期限",
-    "max_drawdown": "最大可承受回撤",
-    "liquidity_need": "流动性需求",
-    "target": "投资目标",
-    "single_security_limit": "单一标的上限",
-    "industry_limit": "单一行业上限",
-    "investment_experience_years": "投资经验",
-    "expected_annual_return": "期望年化收益",
-}
-FIELD_LABELS = {
-    "growth_score": "经济增长",
-    "inflation_score": "通胀环境",
-    "liquidity_score": "市场流动性",
-    "policy_score": "政策环境",
-    "risk_appetite_score": "风险偏好",
-    "prosperity_score": "行业景气度",
-    "valuation_score": "估值水平",
-    "capital_flow_score": "资金流向",
-    "crowding_score": "交易拥挤度",
-    "fundamental_score": "基本面评分",
-    "technical_score": "技术面评分",
-    "fund_risk_level": "基金风险等级",
-    "fund_score": "基金综合评分",
-    "fee_rate": "费率",
-    "weight": "持仓权重",
-    "close_price": "最新价",
-}
-
-
-FIELD_LABELS.update({
-    "change": "涨跌幅", "change_amount": "涨跌额", "volume": "成交量", "turnover_rate": "换手率",
-    "pe_ttm": "市盈率TTM", "pe_static": "静态市盈率", "pe_dynamic": "动态市盈率", "pb": "市净率",
-    "roe": "净资产收益率", "roe_weighted": "加权净资产收益率",
-    "revenue_growth": "营业收入增长率", "tracking_error": "跟踪误差",
-    "news": "新闻", "announcement": "公告", "research_report": "研报", "provider_response": "查询摘要",
-    "company_name": "公司全称", "industry": "所属行业", "main_business": "主营业务", "listing_date": "上市日期",
-    "revenue_composition": "主营构成", "major_customer": "主要客户", "major_supplier": "主要供应商",
-    "major_contract": "重大合同", "controlling_shareholder": "控股股东", "actual_controller": "实际控制人",
-    "total_shares": "总股本", "float_shares": "流通股本", "shareholder_count": "股东人数",
-    "event": "重要事件", "institution": "研究机构", "rating": "机构评级", "target_price": "目标价",
-    "earnings_forecast": "盈利预测", "conversion_premium_rate": "转股溢价率", "pure_bond_premium_rate": "纯债溢价率",
-    "yield_to_maturity": "到期收益率", "remaining_size": "剩余规模", "bond_rating": "债券评级", "conversion_price": "转股价",
-    "cpi": "居民消费价格指数", "ppi": "工业生产者价格指数", "pmi": "采购经理指数",
-    "social_financing": "社会融资", "interest_rate": "利率", "event_score": "事件影响评分", "governance_score": "公司治理评分",
-})
-NAVIGATION = ["投资问答", "自选研究", "持仓分析", "投资偏好"]
-# 主页提问会由后端自动判断并获取所需资料；以下类型映射仅供保留的资料管理工具使用。
-DATA_KINDS = {"实时行情": "quote", "财务指标": "financial", "财经新闻": "news", "公告": "announcement",
-              "研报": "research_report", "基金 / ETF": "fund", "行业排名": "industry", "可转债": "convertible"}
-# 提问时的研究视角：由界面翻译成一句完整问题交给后端，用户不需要理解"智能体"。
-QUICK_ASKS = ["市场解读", "行业分析", "个股研究", "基金筛选", "可转债分析"]
-QUICK_ASK_PROMPTS = {
-    "市场解读": "请解读当前市场环境、主要机会与风险",
-    "行业分析": "请分析我关注行业的景气度与主要风险",
-    "个股研究": "请分析这只股票的经营情况、估值与风险：",
-    "基金筛选": "请帮我比较和筛选基金 / ETF：",
-    "可转债分析": "请分析这只可转债的价格、对应股票与风险：",
-}
-# 把用户问题转成完整研究请求时使用的前缀，与后端意图识别保持一致。
-RESEARCH_PREFIX = {"个股研究": "个股研究：", "行业分析": "行业分析：", "市场解读": "市场解读：",
-                   "基金筛选": "基金筛选：", "可转债分析": "可转债分析："}
-WATCHLIST_RESEARCH_PREFIX = {
-    "股票": "个股研究：",
-    "基金": "基金筛选：",
-    "行业": "行业分析：",
-    "可转债": "可转债分析：",
-}
-TOPIC_LABELS = {"market": "市场环境", "macro": "市场环境", "industry": "行业分析", "security": "个股研究",
-                "stock": "个股研究", "fund": "基金筛选", "portfolio": "持仓分析", "fact_verifier": "资料核对", "compliance": "风险检查"}
-PROGRESS_LABELS = {"completed": "已完成", "running": "正在分析", "pending": "等待处理", "degraded": "资料有限",
-                   "unknown": "待补充资料", "failed": "暂未完成", "skipped": "本次无需处理"}
-
-
 @st.cache_data(show_spinner=False)
 def app_styles(asset_version: int) -> str:
-    """读取随项目保存的样式与背景图，不依赖临时路径或外部资源。"""
+    """读取随项目保存的样式，不依赖临时路径或外部资源。"""
 
-    assets = Path(__file__).resolve().parent / "assets"
-    css = (assets / "app.css").read_text(encoding="utf-8")
-    background = base64.b64encode(
-        (assets / "watercolor-background.jpg").read_bytes()
-    ).decode("ascii")
-    return css.replace(
-        "__APP_BACKGROUND_DATA_URI__",
-        f"data:image/jpeg;base64,{background}",
-    )
+    return (Path(__file__).resolve().parent / "assets" / "app.css").read_text(encoding="utf-8")
 
 
 def render_app_styles() -> None:
-    assets = Path(__file__).resolve().parent / "assets"
-    version = sum(
-        (assets / filename).stat().st_mtime_ns
-        for filename in ("app.css", "watercolor-background.jpg")
-    )
-    st.html(f"<style>{app_styles(version)}</style>")
-
-
-def display_value(key: str, value: Any) -> str:
-    """将服务端字段转换为面向用户的简洁文本，不暴露原始结构。"""
-
-    if value is None or value == "":
-        return "待补充"
-    if key == "risk_level":
-        return {"R1": "保守型", "R2": "稳健型", "R3": "平衡型", "R4": "成长型", "R5": "进取型"}.get(str(value), "待评估")
-    if key in {
-        "max_drawdown", "single_security_limit", "industry_limit", "expected_annual_return", "weight", "fee_rate"
-    }:
-        if isinstance(value, str) and value.strip().endswith(("%", "％")):
-            return value.strip()
-        try:
-            return f"{float(value) * 100:g}%"
-        except (ValueError, TypeError):
-            return str(value)
-    if key == "horizon_months":
-        return f"{int(value)} 个月"
-    if key == "investment_experience_years":
-        return f"{float(value):g} 年"
-    if isinstance(value, bool):
-        return "是" if value else "否"
-    if isinstance(value, list):
-        return "、".join(str(item) for item in value) or "无"
-    return str(value)
-
-
-def fact_label(field: str) -> str:
-    return FIELD_LABELS.get(field) or (field if re.search(r"[\u4e00-\u9fff]", field) else "其他资料")
-
-
-def fact_source(fact: dict[str, Any]) -> str:
-    source = str(fact.get("source_id", ""))
-    if source.startswith("USER_SUPPLIED:"):
-        return "用户补充 · " + source.partition(":")[2]
-    if fact.get("source_note"):
-        return str(fact["source_note"])
-    if source.startswith("IWENCAI"):
-        return "同花顺问财"
-    if source.startswith("DERIVED"):
-        return "根据原始资料计算"
-    if source == "DEMO_SNAPSHOT":
-        return "示例数据"
-    if source.startswith("USER_") or source == "MANUAL_SNAPSHOT":
-        return "用户提供"
-    return "市场数据服务" if source else "来源待确认"
-
-
-def fact_time(value: Any) -> str:
-    if not value:
-        return "未提供"
-    try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        if parsed.tzinfo is not None:
-            return parsed.astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
-    except ValueError:
-        pass
-    return str(value)
-
-
-def fact_period(value: Any) -> str:
-    """把报告期转成可读日期；内部逐条标识不展示给用户。"""
-
-    text = str(value or "").strip()
-    if not text:
-        return "—"
-    if re.fullmatch(r"\d{8}", text):
-        return f"{text[:4]}-{text[4:6]}-{text[6:]}"
-    if re.fullmatch(r"\d{6}", text):
-        return f"{text[:4]}-{text[4:]}"
-    if text.startswith("REC-") or re.fullmatch(r"[A-Za-z0-9_\-]{8,}", text):
-        return "近期"
-    return text
-
-
-def friendly_fact_rows(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """展示全部业务资料，新闻及未映射指标也保留，不暴露内部标识。"""
-    rows = []
-    for fact in facts:
-        value = fact.get("value")
-        if isinstance(value, dict):
-            value = "；".join(f"{fact_label(str(key))}：{display_value(str(key), item)}"
-                             for key, item in value.items() if key not in {"trace_id", "fact_id", "source_id", "quality"})
-        rows.append({
-            "对象": fact.get("entity", "—"), "指标": fact_label(str(fact.get("field", ""))),
-            "内容 / 数值": display_value(str(fact.get("field", "")), value),
-            "数据时间（北京时间）": fact_time(fact.get("snapshot_time")),
-            "来源": fact_source(fact), "报告期": fact_period(fact.get("period")),
-        })
-    return rows
-
-
-def advice_facts(advice: dict[str, Any]) -> list[dict[str, Any]]:
-    # 显式空资料也属于该结果；只有旧格式缺少 facts 时兼容当前会话。
-    return advice["facts"] if "facts" in advice else st.session_state.get("facts", [])
-
-
-def _status_code(value: Any, *, uppercase: bool = False) -> str:
-    """兼容枚举、API 字符串和历史快照中的状态写法。"""
-
-    raw = getattr(value, "value", value)
-    code = str(raw or "").strip().split(".")[-1]
-    return code.upper() if uppercase else code.lower()
-
-
-def analysis_chain_stages(advice: dict[str, Any]) -> list[dict[str, str]]:
-    """把现有建议包映射为展示链路；只汇总，不生成或改写投资判断。"""
-
-    facts = advice_facts(advice)
-    available_ids = {str(fact.get("fact_id")) for fact in facts if fact.get("fact_id")}
-    used_ids = {str(item) for item in advice.get("evidence", [])}
-    used = [fact for fact in facts if str(fact.get("fact_id", "")) in used_ids]
-    results = advice.get("agent_results", [])
-    result_statuses = [_status_code(item.get("status")) for item in results]
-    terminal_statuses = {"completed", "degraded", "unknown", "failed", "skipped"}
-    reviewed = sum(status in terminal_statuses for status in result_statuses)
-    completed = result_statuses.count("completed")
-    limited = sum(status in {"degraded", "unknown"} for status in result_statuses)
-    failed = result_statuses.count("failed")
-    skipped = result_statuses.count("skipped")
-    active = len(results) - reviewed
-    review_notes = []
-    if completed:
-        review_notes.append(f"{completed} 项结论完整")
-    if limited:
-        review_notes.append(f"{limited} 项资料有限")
-    if failed:
-        review_notes.append(f"{failed} 项暂未形成结论")
-    if skipped:
-        review_notes.append(f"{skipped} 项本次无需处理")
-    if active:
-        review_notes.append(f"{active} 项仍在处理中")
-    facts_by_id = {str(fact.get("fact_id")): fact for fact in facts if fact.get("fact_id")}
-    source_ids: set[str] = set()
-
-    def collect_source(fact_id: str, visited: set[str]) -> None:
-        if fact_id in visited or fact_id not in facts_by_id:
-            return
-        visited.add(fact_id)
-        fact = facts_by_id[fact_id]
-        parents = fact.get("derived_from") or []
-        if parents:
-            for parent_id in parents:
-                collect_source(str(parent_id), visited)
-        elif fact.get("source_id"):
-            source_ids.add(str(fact["source_id"]))
-
-    for fact_id in used_ids:
-        collect_source(fact_id, set())
-    source_count = len(source_ids)
-    missing_evidence = used_ids - available_ids
-    rejected_count = sum(
-        count for result in results
-        if isinstance(result.get("details"), dict)
-        for count in [result["details"].get("rejected_reference_count")]
-        if isinstance(count, int) and count > 0
-    )
-    missing_count = max(len(missing_evidence), rejected_count)
-    cross_status = _status_code(
-        advice.get("cross_validation", {}).get("status"), uppercase=True
-    ) or "REVIEW"
-    if not results or not used:
-        cross_status = "REVIEW"
-    compliance_status = _status_code(
-        advice.get("compliance", {}).get("status"), uppercase=True
-    ) or "REVIEW"
-    status_label = {"PASS": "已通过", "REVIEW": "待复核", "BLOCK": "已拦截"}
-    cross_issues = {
-        item.get("code") for item in advice.get("cross_validation", {}).get("issues", [])
-        if isinstance(item, dict)
-    }
-    cross_note = (
-        "部分引用未通过核验" if "EVIDENCE_REFERENCE_REJECTED" in cross_issues
-        else "同项资料存在不一致" if cross_issues & {"INTERNAL_VALUE_CONFLICT", "SOURCE_VALUE_CONFLICT"}
-        else "发现数据或观点分歧" if cross_status == "REVIEW"
-        else "单一来源内核验通过" if cross_status == "PASS" and source_count == 1
-        else "已核对资料与观点" if cross_status == "PASS"
-        else "检查资料与观点是否一致"
-    )
-    return [
-        {
-            "number": "01",
-            "label": "数据基础",
-            "value": f"{len(used)} 条引用",
-            "note": " · ".join(filter(None, [
-                f"{source_count} 个来源" if used else "",
-                f"{missing_count} 条引用待补齐" if missing_count else "",
-            ])) or "暂无可引用资料",
-            "tone": "ok" if used and source_count and not missing_count else (
-                "review" if used or missing_count else "muted"
-            ),
-        },
-        {
-            "number": "02",
-            "label": "分项研判",
-            "value": f"{reviewed}/{len(results)} 已研判" if results else "未形成分项",
-            "note": " · ".join(review_notes) if results else "等待问题与资料",
-            "tone": "ok" if results and reviewed == len(results) and not limited and not failed else (
-                "review" if results else "muted"
-            ),
-        },
-        {
-            "number": "03",
-            "label": "交叉核验",
-            "value": status_label.get(str(cross_status), "待确认"),
-            "note": cross_note,
-            "tone": "ok" if cross_status == "PASS" else (
-                "block" if cross_status == "BLOCK" else "review"
-            ),
-        },
-        {
-            "number": "04",
-            "label": "风险结论",
-            "value": (
-                "规则未触发" if compliance_status == "PASS"
-                else status_label.get(str(compliance_status), "待确认")
-            ),
-            "note": "查看下方具体风险判断",
-            "tone": "ok" if compliance_status == "PASS" else (
-                "block" if compliance_status == "BLOCK" else "review"
-            ),
-        },
-    ]
-
-
-def source_trace_rows(advice: dict[str, Any]) -> list[dict[str, Any]]:
-    """按事实引用关系生成业务化溯源表，不向界面暴露内部 fact_id。"""
-
-    facts = advice_facts(advice)
-    used_ids = {str(item) for item in advice.get("evidence", [])}
-    supported_by: dict[str, list[str]] = {}
-    for result in advice.get("agent_results", []):
-        topic = TOPIC_LABELS.get(result.get("agent_id"), "相关分析")
-        for fact_id in result.get("facts_used", []):
-            labels = supported_by.setdefault(str(fact_id), [])
-            if topic not in labels:
-                labels.append(topic)
-    rows = []
-    for fact in facts:
-        fact_id = str(fact.get("fact_id", ""))
-        if fact_id not in used_ids:
-            continue
-        row = friendly_fact_rows([fact])[0]
-        row = {"支持分析": "、".join(supported_by.get(fact_id, [])) or "综合结论", **row}
-        row["原文"] = fact.get("source_url") or None
-        rows.append(row)
-    return rows
-
-
-def _facts_used_by_result(advice: dict[str, Any], result: dict[str, Any]) -> list[dict[str, Any]]:
-    # 展开页只展示最终建议包认可的 evidence，避免历史/异常数据把已剔除事实重新挂回观点。
-    verified = {str(item) for item in advice.get("evidence", [])}
-    wanted = {str(item) for item in result.get("facts_used", [])} & verified
-    return [fact for fact in advice_facts(advice) if str(fact.get("fact_id", "")) in wanted]
-
-
-def render_chain_overview(advice: dict[str, Any]) -> None:
-    cards = "".join(
-        "<div class='logic-stage " + escape(stage["tone"]) + "'>"
-        f"<div class='logic-step'>{escape(stage['number'])}</div>"
-        f"<div class='logic-label'>{escape(stage['label'])}</div>"
-        f"<div class='logic-value'>{escape(stage['value'])}</div>"
-        f"<div class='logic-note'>{escape(stage['note'])}</div></div>"
-        for stage in analysis_chain_stages(advice)
-    )
-    st.html(f"<section class='logic-chain'>{cards}</section>")
-
-
-def render_conclusion_panel(advice: dict[str, Any]) -> None:
-    """展示后端已审核的结论，不在前端重新计算建议。"""
-
-    with st.container(key="analysis-conclusion", border=True):
-        st.html("<div class='analysis-kicker'>研究结论 · 风险与依据</div>")
-        _render_conclusion_content(advice)
-
-
-def _render_conclusion_content(advice: dict[str, Any]) -> None:
-    compliance = advice.get("compliance", {})
-    facts = advice_facts(advice)
-    used_ids = set(advice.get("evidence", []))
-    used = [fact for fact in facts if fact.get("fact_id") in used_ids]
-    with st.container(horizontal=True, gap="xsmall"):
-        if compliance.get("status") == "PASS":
-            st.badge("风险检查已通过", icon=":material/verified:", color="green")
-        elif compliance.get("status") == "REVIEW":
-            st.badge("需要人工复核", icon=":material/fact_check:", color="orange")
-        else:
-            st.badge("未形成结论", icon=":material/do_not_disturb:", color="gray")
-        if advice.get("profile_version"):
-            st.badge(f"投资偏好 第 {advice['profile_version']} 版", icon=":material/person_check:", color="blue")
-        st.badge(f"引用 {len(used)} 条资料", icon=":material/rule:", color="primary" if used else "gray")
-        if advice.get("agent_results"):
-            st.badge(f"{len(advice['agent_results'])} 个分析维度", icon=":material/hub:", color="blue")
-    st.markdown("**分析结论**")
-    conclusion = plain_language(advice.get("conclusion")) or "现有资料不足，暂时无法作出判断。"
-    st.write(conclusion)
-    if advice.get("risk_conclusion"):
-        st.markdown("**风险结论**")
-        st.write(plain_language(advice["risk_conclusion"]))
-    if compliance.get("status") != "PASS" and compliance.get("reason"):
-        compliance_note = plain_language(compliance["reason"])
-        if compliance_note and compliance_note != conclusion:
-            st.caption(compliance_note)
-    issues = [item.get("message", "") for item in advice.get("cross_validation", {}).get("issues", [])]
-    render_points("需要注意", [*advice.get("risks", []), *issues])
-    render_points("接下来可以做", advice.get("next_steps", []))
-    if advice.get("user_fit"):
-        with st.expander("与你的投资偏好是否匹配", icon=":material/person_check:"):
-            st.write(plain_language(advice["user_fit"]))
-    if compliance.get("risk_notice"):
-        st.caption(plain_language(compliance["risk_notice"]))
-    source_rows = source_trace_rows(advice)
-    if source_rows:
-        st.markdown("**结论依据速览**")
-        st.dataframe(
-            [
-                {key: row[key] for key in ("对象", "指标", "内容 / 数值", "数据时间（北京时间）", "原文")}
-                for row in source_rows[:3]
-            ],
-            width="stretch", hide_index=True,
-            column_config={"原文": st.column_config.LinkColumn("原文", display_text="查看原文")},
-        )
-        if len(source_rows) > 3:
-            st.caption(f"其余 {len(source_rows) - 3} 条依据可在下方数据溯源中查看。")
-
-
-def render_logic_chain(advice: dict[str, Any]) -> None:
-    """逐级展示“事实 -> 分项观点 -> 核验 -> 合规”的既有执行结果。"""
-
-    st.markdown("**投资逻辑链**")
-    st.caption("依次展开每个分析维度，可查看观点、适用条件及其实际引用的数据。")
-    render_chain_overview(advice)
-    results = advice.get("agent_results", [])
-    if not results:
-        clarification = advice.get("task_plan", {}).get("clarification_question")
-        if clarification:
-            st.info(plain_language(clarification))
-        else:
-            st.caption("本次没有形成可展开的分项分析。")
-        return
-    for index, result in enumerate(results, start=1):
-        topic = TOPIC_LABELS.get(result.get("agent_id"), "相关分析")
-        result_status = _status_code(result.get("status"))
-        status = PROGRESS_LABELS.get(result_status, "待确认")
-        linked = _facts_used_by_result(advice, result)
-        label = f"{index:02d} · {topic} · {status} · {len(linked)} 条依据"
-        with st.expander(label, icon=":material/account_tree:"):
-            badge_color = {
-                "completed": "green", "degraded": "orange", "unknown": "orange",
-                "failed": "red", "running": "blue", "pending": "gray", "skipped": "gray",
-            }.get(result_status, "gray")
-            with st.container(horizontal=True, gap="xsmall"):
-                st.badge(status, icon=":material/task_alt:", color=badge_color)
-                confidence = result.get("confidence")
-                if isinstance(confidence, (int, float)) and 0 <= confidence <= 1:
-                    st.badge(f"可信度 {confidence:.0%}", icon=":material/monitoring:", color="blue")
-            st.write(plain_language(result.get("opinion")) or "资料不足，暂未形成结论。")
-            if linked:
-                st.markdown("**该观点引用的数据**")
-                st.dataframe(friendly_fact_rows(linked), width="stretch", hide_index=True)
-            else:
-                st.caption("这一分析维度没有通过核验的资料引用，因此只能作为有限参考。")
-            render_points("判断把握受哪些因素影响", result.get("confidence_reasons", []), visible=99)
-            render_points("相关风险", result.get("risk_flags", []), visible=99)
-            render_points("哪些变化需要重新判断", result.get("invalidation_conditions", []), visible=99)
-    issues = advice.get("cross_validation", {}).get("issues", [])
-    cross_validation = advice.get("cross_validation", {})
-    compliance = advice.get("compliance", {})
-    with st.expander("最后一步 · 交叉核验与风险检查", icon=":material/fact_check:"):
-        cross_status = _status_code(cross_validation.get("status"), uppercase=True) or "REVIEW"
-        compliance_status = _status_code(compliance.get("status"), uppercase=True) or "REVIEW"
-        status_text = {"PASS": "已通过", "REVIEW": "待复核", "BLOCK": "已拦截"}
-        status_color = {"PASS": "green", "REVIEW": "orange", "BLOCK": "red"}
-        with st.container(horizontal=True, gap="xsmall"):
-            st.badge(
-                f"观点核验：{status_text.get(cross_status, '待确认')}",
-                icon=":material/compare_arrows:", color=status_color.get(cross_status, "gray"),
-            )
-            st.badge(
-                f"风险检查：{status_text.get(compliance_status, '待确认')}",
-                icon=":material/shield:", color=status_color.get(compliance_status, "gray"),
-            )
-        st.caption("核验范围：本次可用资料的时效、引用、同项数值与分析观点；单一来源结果不代表独立来源验证。")
-        if issues:
-            render_points("发现的分歧或待核实问题", [item.get("message", "") for item in issues], visible=99)
-        elif cross_status == "PASS":
-            st.write("未发现需要单独提示的跨维度冲突。")
-        else:
-            st.caption("交叉核验尚未通过，请结合上方状态与风险检查结果复核。")
-        supporting = [
-            TOPIC_LABELS.get(item, "相关分析")
-            for item in cross_validation.get("supporting_agents", [])
-        ]
-        dissenting = [
-            TOPIC_LABELS.get(item, "相关分析")
-            for item in cross_validation.get("dissenting_agents", [])
-        ]
-        if supporting:
-            st.caption(f"一致支持的分析维度：{'、'.join(dict.fromkeys(supporting))}")
-        if dissenting:
-            st.warning(f"需要重点复核的分析维度：{'、'.join(dict.fromkeys(dissenting))}")
-        if compliance.get("reason"):
-            st.caption(plain_language(compliance["reason"]))
-
-
-def render_source_trace(advice: dict[str, Any], *, collapsed: bool = True) -> None:
-    rows = source_trace_rows(advice)
-
-    def body() -> None:
-        if rows:
-            st.caption("每条资料都标明它支持的分析维度、数据时间与来源；有原文地址时可直接打开。")
-            st.dataframe(
-                rows, width="stretch", hide_index=True,
-                column_config={"原文": st.column_config.LinkColumn("原文", display_text="查看原文")},
-            )
-        else:
-            render_empty_state("没有可溯源的结论依据", "当前结论没有通过核验的资料引用，请先补充数据。",
-                               ":material/rule:")
-
-    if collapsed:
-        with st.expander(f"数据溯源（{len(rows)} 条）", icon=":material/database:"):
-            body()
-    else:
-        body()
-
-
-def render_profile_summary(profile: dict[str, Any]) -> None:
-    labels = {"risk_level": "投资风格", "horizon_months": "计划投资多久", "max_drawdown": "最多接受亏损",
-              "liquidity_need": "随时用钱的需要", "target": "投资目标", "expected_annual_return": "期望每年收益"}
-    st.caption(f"当前投资偏好版本：第 {int(profile.get('version') or 1)} 版")
-    cards = "".join(
-        f"<div class='profile-card'><div class='profile-card-label'>{label}</div>"
-        f"<div class='profile-card-value'>{escape(display_value(key, profile.get(key)))}</div></div>"
-        for key, label in labels.items()
-    )
-    st.html(f"<div class='profile-grid'>{cards}</div>")
+    css_file = Path(__file__).resolve().parent / "assets" / "app.css"
+    st.html(f"<style>{app_styles(css_file.stat().st_mtime_ns)}</style>")
 
 
 def render_login_brand() -> None:
@@ -626,39 +107,38 @@ def render_stat_cards(cards: list[tuple[str, str, str]], *, accent_first: bool =
     st.html(f"<div class='stat-grid'>{blocks}</div>")
 
 
-def render_empty_state(title: str, detail: str, icon: str = ":material/inbox:") -> None:
-    """带图标的空状态，替代一行裸提示。"""
-
-    with st.container(border=True, horizontal_alignment="center"):
-        st.markdown(icon)
-        st.markdown(f"**{title}**")
-        st.caption(detail)
-
-
-def navigation_index() -> int:
-    """当前所在入口在 NAVIGATION 中的下标，用于把旧状态映射到侧栏导航。"""
-
-    current = st.session_state.get("navigation", NAVIGATION[0])
-    return NAVIGATION.index(current) if current in NAVIGATION else 0
+def toggle_preference_navigation() -> None:
+    """父入口只控制子菜单的展开状态，不改变当前页面。"""
+    st.session_state.preference_navigation_open = not st.session_state.get("preference_navigation_open", False)
 
 
 def page_navigation() -> str:
-    """侧栏导航：整行胶囊，选中态用品牌色标出。
-
-    控件键仍为 ``navigation``，这样"填写投资偏好"等入口只需写
-    ``st.session_state.navigation`` 就能在下一轮自动跳到目标页。
-    """
-
+    """侧栏主入口与投资偏好子菜单；页面状态仍由 navigation 保存。"""
+    st.session_state.setdefault("navigation", "主页")
+    current = st.session_state.navigation
+    if current == "投资偏好":  # 兼容旧浏览器会话
+        current = "风险评估"
+        st.session_state.navigation = current
+    st.session_state.setdefault("preference_navigation_open", current in {"风险评估", "风险调整"})
     with st.container(key="nav"):
-        choice = st.radio(
-            "功能",
-            NAVIGATION,
-            index=navigation_index(),
-            key="navigation",
-            label_visibility="collapsed",
-            on_change=close_history_view,
-        )
-    return str(choice)
+        st.button("主页", key="nav_home", width="stretch",
+                  type="primary" if current == "主页" else "tertiary",
+                  on_click=go_to, args=("主页",))
+        st.button("投资偏好", key="nav_preference", width="stretch",
+                  icon=":material/expand_less:" if st.session_state.preference_navigation_open else ":material/expand_more:",
+                  on_click=toggle_preference_navigation)
+        if st.session_state.preference_navigation_open:
+            with st.container(key="nav-preference-children"):
+                for page, key in (("风险评估", "nav_assessment"), ("风险调整", "nav_adjustment")):
+                    st.button(page, key=key, width="stretch",
+                              type="primary" if current == page else "tertiary",
+                              on_click=go_to, args=(page,))
+        for page, key in (("投资问答", "nav_questions"), ("自选研究", "nav_watchlist"),
+                          ("持仓分析", "nav_portfolio")):
+            st.button(page, key=key, width="stretch",
+                      type="primary" if current == page else "tertiary",
+                      on_click=go_to, args=(page,))
+    return str(st.session_state.get("navigation", current))
 
 
 def render_side_user(api_base: str) -> None:
@@ -676,7 +156,7 @@ def render_side_user(api_base: str) -> None:
 
 
 def recent_conversations(api_base: str) -> list[dict[str, Any]] | None:
-    """按浏览器会话短暂缓存当前账号的最近聊天，避免每次控件重跑都查库。"""
+    """按浏览器会话短暂缓存当前账号的最近咨询，避免每次控件重跑都查库。"""
 
     now = monotonic()
     loaded_at = st.session_state.get("recent_conversations_loaded_at", 0.0)
@@ -693,6 +173,12 @@ def recent_conversations(api_base: str) -> list[dict[str, Any]] | None:
 def restore_conversation(detail: dict[str, Any]) -> None:
     """恢复选中聊天及其最近分析，让后续提问沿用原会话上下文。"""
 
+    direction = st.session_state.get("conversation_directions", {}).get(detail["id"])
+    if direction not in QUICK_ASKS:
+        first_question = next((message["content"] for message in detail["messages"] if message["role"] == "user"), "")
+        direction = next((kind for kind, prefix in RESEARCH_PREFIX.items() if first_question.startswith(prefix)), QUICK_ASKS[0])
+    activate_research(direction)
+    st.session_state.research_direction = direction
     st.session_state.conversation_id = detail["id"]
     st.session_state.history_before_id = detail.get("next_before_id")
     st.session_state.conversation = [
@@ -702,21 +188,24 @@ def restore_conversation(detail: dict[str, Any]) -> None:
     ]
     assistant_messages = [message for message in st.session_state.conversation if message["role"] == "assistant"]
     st.session_state.advice = assistant_messages[-1].get("payload") if assistant_messages else None
+    if st.session_state.advice and "facts" in st.session_state.advice:
+        st.session_state.facts = [dict(fact) for fact in st.session_state.advice["facts"]]
+    save_research_session()
     st.session_state.pending_navigation = "投资问答"
     st.session_state.history_view = False
 
 
 def render_recent_chats(api_base: str) -> None:
-    with st.expander("最近聊天", expanded=True, key="recent-chats", type="compact",
+    with st.expander("最近咨询", expanded=True, key="recent-chats", type="compact",
                      icon=":material/history:", on_change="rerun") as section:
         if not section.open:
             return
         histories = recent_conversations(api_base)
         if histories is None:
-            st.caption("聊天记录暂不可用，请稍后重试。")
+            st.caption("咨询记录暂不可用，请稍后重试。")
             return
         if not histories:
-            st.caption("完成首次对话后，会显示在这里。")
+            st.caption("完成首次咨询后，会显示在这里。")
             return
         with st.container(height=360, border=False, key="recent-chat-list"):
             for item in histories:
@@ -733,7 +222,7 @@ def render_recent_chats(api_base: str) -> None:
                     if isinstance(detail, dict) and detail.get("id") == conversation_id:
                         restore_conversation(detail)
                         st.rerun()
-        if st.button("查看全部聊天", key="all_recent_chats", icon=":material/search:", width="stretch"):
+        if st.button("查看全部咨询", key="all_recent_chats", icon=":material/search:", width="stretch"):
             st.session_state.history_view = True
             st.rerun()
 
@@ -750,10 +239,11 @@ def render_sidebar(api_base: str, *, full: bool) -> str | None:
             if st.button("重试连接", width="stretch", icon=":material/refresh:"):
                 st.rerun()
             return None
-        st.button("新建对话", width="stretch", type="primary", on_click=new_conversation,
+        st.button("发起咨询", width="stretch", type="primary", on_click=new_conversation,
                   icon=":material/add_comment:")
         render_side_label("投资")
         page = page_navigation()
+        background_analysis_status()
         render_recent_chats(api_base)
         render_side_user(api_base)
         if st.button("退出登录", width="stretch", icon=":material/logout:"):
@@ -968,16 +458,6 @@ def format_api_error(detail: Any) -> str:
     return " ".join(messages) or "请求未通过校验，请检查填写内容后重试。"
 
 
-@st.cache_resource(show_spinner=False, max_entries=8)
-def backend_http_client(api_base: str) -> httpx.Client:
-    """复用后端连接池；鉴权头仍按当前浏览器会话逐次传入。"""
-
-    return httpx.Client(
-        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
-        timeout=httpx.Timeout(30.0, connect=10.0),
-    )
-
-
 def api_request(
     api_base: str,
     method: str,
@@ -992,48 +472,21 @@ def api_request(
     仍可在 Streamlit 终端看到完整异常。请求失败后返回 ``None``，调用方不要把
     它错误当作一个空的业务响应。``quiet=True`` 用于可选能力探测，不打扰用户。
     """
-    try:
-        headers = {}
-        if st.session_state.get("auth_token"):
-            headers["Authorization"] = f"Bearer {st.session_state.auth_token}"
-        # 分析包含取数及理解、专业分析、复核三个模型阶段，客户端须覆盖整条链路。
-        read_timeout = 240.0 if path == "/portfolio/analyze" else 65.0 if path == "/profile/assess" else 30.0
-        response = backend_http_client(api_base).request(
-            method,
-            f"{api_base}{path}",
-            json=payload,
-            headers=headers,
-            timeout=httpx.Timeout(read_timeout, connect=10.0),
-        )
-        response.raise_for_status()
-        return response.json()
-    except httpx.HTTPStatusError as exc:
-        if quiet:
-            return None
-        try:
-            error_body = exc.response.json()
-        except ValueError:
-            error_body = {}
-        detail = error_body.get("detail", "请求未成功，请稍后重试。")
-        if exc.response.status_code == 409 and path == "/profile/confirm":
-            st.session_state.profile_restored = False
-        message = format_api_error(detail)
-        st.error(message)
-        if exc.response.status_code == 401 and path not in {"/auth/login", "/auth/register"}:
-            reset_user_session()
-            st.session_state.auth_notice = message
-            st.rerun()
-    except httpx.HTTPError:
-        if not quiet:
-            st.error("暂时连接不上分析服务，请稍后再试。")
+    result = request_json(backend_http_client(api_base), api_base, method, path, payload,
+                          st.session_state.get("auth_token"))
+    if result.data is not None:
+        return result.data
+    if quiet:
+        return None
+    if result.status == 409 and path == "/profile/confirm":
+        st.session_state.profile_restored = False
+    message = format_api_error(result.detail)
+    st.error(message)
+    if result.status == 401 and path not in {"/auth/login", "/auth/register"}:
+        reset_user_session()
+        st.session_state.auth_notice = message
+        st.rerun()
     return None
-
-
-def show_status(status: str) -> None:
-    if status == "REVIEW":
-        st.warning("这份分析还需要进一步确认，请勿直接据此买卖。", icon=":material/fact_check:")
-    elif status != "PASS":
-        st.error("暂时无法提供投资建议，请先查看下方原因。", icon=":material/report:")
 
 
 def profile_ready() -> bool:
@@ -1046,170 +499,6 @@ def add_fact(fact: dict[str, Any]) -> None:
     facts = [row for row in st.session_state.facts if row["fact_id"] != fact["fact_id"]]
     facts.append(fact)
     st.session_state.facts = facts
-
-
-def plain_language(value: Any) -> str:
-    """将服务端文案转换成用户语言，并拦截内部诊断信息。"""
-    text = str(value or "").strip()
-    # 模型复核说明会保留给后台审计，但不能原样进入浏览器。它可能同时包含
-    # 状态枚举、节点字段、事实编号和合规规则代码；逐词替换仍会留下难以理解的
-    # 调试式长段落，因此在展示边界统一收口为简短、可行动的业务提示。
-    internal_markers = re.compile(
-        # Python 的 \b 会把中文也视为“单词字符”，无法识别“标记为degraded且”；
-        # 这里用 ASCII 标识符边界，覆盖中英文紧邻的真实模型输出。
-        r"(?:(?<![A-Za-z0-9_])(?:degraded|completed|unknown|failed|skipped|pending|running)(?![A-Za-z0-9_])"
-        r"|(?<![A-Za-z0-9_])(?:nodes_without_opinion|conflicting_agents|supporting_agents|dissenting_agents"
-        r"|agent_results|facts_used|fact_id|source_id|trace_id)(?![A-Za-z0-9_])"
-        r"|(?<![A-Za-z0-9_])(?:UNSUPPORTED_CLAIM|PRIVACY_SECRET|RETURN_GUARANTEE|UNVERIFIED_RUMOR"
-        r"|SUITABILITY_R1_HIGH_RISK)(?![A-Za-z0-9_])"
-        r"|(?<![A-Za-z0-9_-])IW-[A-Za-z0-9-]{8,}(?![A-Za-z0-9_-])"
-        r"|(?<![A-Za-z0-9_])(?:market|macro|industry|security|stock|fund|portfolio|fact_verifier|compliance)节点)",
-        re.IGNORECASE,
-    )
-    if internal_markers.search(text):
-        if re.search(r"UNSUPPORTED_CLAIM|证据支持不充分|跨时段|时点|口径", text, re.IGNORECASE):
-            return "部分表述与现有资料或数据时点不完全一致，暂不能作为投资判断依据。请使用同一时点的最新资料重新核对。"
-        return "现有资料有限，部分分析暂未形成可靠结论。请补充最新且可核验的数据后再作判断。"
-    text = re.sub(r"协调器置信加权共识分为\s*[\d.]+。?", "", text)
-    for code, label in {"market": "市场", "macro": "市场", "industry": "行业", "security": "个股", "stock": "个股",
-                        "fund": "基金", "portfolio": "持仓", "fact_verifier": "数据核对", "compliance": "风险检查"}.items():
-        text = re.sub(rf"\b{code}[：:]", f"{label}：", text)
-    replacements = {
-        "授权事实不足，暂不形成强结论。": "现有资料不足，暂时无法作出可靠判断。",
-        "补齐各专业智能体列出的缺失字段": "补充所分析的股票、基金名称及相关资料，再重新分析",
-        "补充有来源、含时间戳的事实后重新核验": "补充注明来源和日期的最新资料，再重新分析",
-        "在执行任何调整前复核风险标记和证伪条件": "调整持仓前，先确认风险以及哪些变化会让结论不再适用",
-        "关注证据时点与证伪条件，定期复核": "关注最新信息；情况变化时重新分析",
-        "已确认画像": "投资偏好", "画像适配": "是否适合你", "画像": "投资偏好",
-        "最大回撤": "最多可接受的阶段性亏损", "流动性需求": "随时用钱的需要",
-        "基本面与技术面": "公司经营情况与短期价格走势", "证伪条件": "结论不再适用的情况",
-        "授权事实": "已有资料", "事实不足": "资料不足", "证据不足": "资料不足",
-        "安全降级": "仅作有限参考", "快照时点": "数据日期", "快照": "数据",
-        "事实核验": "数据核对", "合规闸门": "风险检查", "适当性审核": "风险匹配检查",
-    }
-    replacements.update({
-        "专业智能体评分分散度较高，协调器保留分歧并要求人工复核。": "不同分析的看法差异较大，仍需进一步确认。",
-        "语义复核不可用或不确定，需要人工复核。": "部分判断尚未确认，请进一步核实后再作决定。",
-        "组合已完成规则型集中度诊断；调整应分批执行并在新快照下复核。": "已检查持仓是否过于集中。如需调整，请分步进行，并根据最新持仓重新分析。",
-        "单标的集中度超限": "某只股票或基金的占比超过了你设定的上限",
-        "单标的上限": "单只股票或基金的比例上限",
-        "可重算综合评分已生成；正反催化剂需随快照复核。": "已完成初步分析，利好和不利因素仍需结合最新资料确认。",
-        "的可用研究维度已按授权快照汇总。": "的已有研究资料已整理，仍需关注最新变化。",
-        "基于五个已授权宏观维度": "根据现有的经济、资金和政策资料",
-        "证据不足，仅可展示教育性说明。": "资料不足，以下内容只帮助理解相关知识。",
-    })
-    for original, friendly in sorted(replacements.items(), key=lambda item: -len(item[0])):
-        text = text.replace(original, friendly)
-    for field, label in FIELD_LABELS.items():
-        text = re.sub(rf"\b{re.escape(field)}\b", label, text)
-    text = re.sub(r"\b(?:market|industry|security|fund|portfolio) 声称完成但没有通过核验的事实引用。", "部分分析缺少可核对的资料，暂时不能据此作出判断。", text)
-    for code, name in zip(RISK_LEVELS, ["保守型", "稳健型", "平衡型", "成长型", "进取型"]):
-        text = re.sub(rf"\b{code}\b", name, text)
-    return text
-
-
-def profile_evidence_language(value: Any) -> str:
-    """把画像评估的审计文案转换为用户可直接理解的说明。"""
-
-    text = str(value or "").strip()
-    field_labels = {
-        **PROFILE_LABELS,
-        "investment_history": "投资经历",
-        "holding_history": "持仓经历",
-        "behavioral_notes": "投资行为说明",
-        "constraints": "投资限制",
-    }
-    extraction = re.fullmatch(
-        r"从“(?P<source>.+)”提取\s+(?P<field>[A-Za-z_][A-Za-z0-9_]*)[：:]\s*(?P<raw>.*)",
-        text,
-    )
-    if extraction:
-        source = extraction.group("source")
-        field = extraction.group("field")
-        raw = extraction.group("raw").strip()
-        if field == "horizon_months":
-            try:
-                months = int(float(raw))
-                duration = f"{months // 12:g} 年" if months % 12 == 0 else f"{months} 个月"
-            except (TypeError, ValueError):
-                duration = raw
-            detail = f"计划投资约 {duration}"
-        elif field == "max_drawdown":
-            detail = f"最多可接受约 {display_value(field, raw)} 的阶段性亏损"
-        elif field == "liquidity_need":
-            detail = {
-                "高": "这笔资金可能需要随时使用",
-                "中": "这笔资金需要保留一定的灵活性",
-                "低": "这笔资金可以较长期使用",
-            }.get(raw, f"资金使用需求为{raw}")
-        elif field == "target":
-            detail = f"投资目标是{raw}"
-        elif field == "expected_annual_return":
-            detail = f"期望的年收益约为 {display_value(field, raw)}（不代表保证收益）"
-        elif field == "investment_experience_years":
-            detail = f"投资经验约为 {display_value(field, raw)}"
-        elif field in {"constraints", "investment_history", "behavioral_notes"}:
-            detail = f"已记录{field_labels[field]}：{raw}"
-        else:
-            detail = f"已记录{field_labels.get(field, '相关信息')}：{display_value(field, raw)}"
-        return f"你提到“{source}”，因此评估为：{detail}。"
-
-    explicit = re.fullmatch(r"已记录用户明确提交的\s+(?P<field>[A-Za-z_][A-Za-z0-9_]*)", text)
-    if explicit:
-        label = field_labels.get(explicit.group("field"), "相关信息")
-        return f"已记录你填写的{label}。"
-
-    if text == "已按五项问卷加权公式计算风险分":
-        return "根据你对五项风险问题的回答，已综合评估你的风险承受能力。"
-    if text == "问卷维度不完整，未计算风险等级":
-        return "风险问题尚未全部回答，因此暂时无法评估你的风险承受能力。"
-    if text.startswith("以下线索缺少可核对的原文，未采用："):
-        fields = text.partition("：")[2].split("、")
-        labels = [field_labels.get(field.strip(), "相关信息") for field in fields if field.strip()]
-        return f"以下信息在你的描述中缺少明确依据，本次暂未采用：{'、'.join(labels)}。"
-    if text.startswith("语义提取不可用或不确定"):
-        return "暂时无法准确理解你的文字描述，请补充上方的具体选项，或稍后重试。"
-    if text.startswith("未从你的描述中识别出明确的画像线索"):
-        return "暂时没有从你的描述中识别出明确的投资计划，请补充投资期限、可接受亏损或资金用途。"
-    return plain_language(text)
-
-
-def render_points(title: str, items: list[str], *, visible: int = 3) -> None:
-    points = list(dict.fromkeys(plain_language(item) for item in items if item))
-    if not points:
-        return
-    st.markdown(f"**{title}**")
-    for point in points[:visible]:
-        st.write(f"- {point}")
-    if len(points) > visible:
-        with st.expander(f"其余{title}（{len(points) - visible}项）"):
-            for point in points[visible:]:
-                st.write(f"- {point}")
-
-
-def render_advice(advice: dict[str, Any]) -> None:
-    """所有页面共享精简结果；风险与数据不足提示始终保留。"""
-    compliance = advice.get("compliance", {})
-    show_status(compliance.get("status", "REVIEW"))
-    acquisition = advice.get("data_acquisition", {})
-    if acquisition.get("mode") == "unavailable":
-        st.warning("本次未能取得最新市场数据，分析可能不完整。")
-    elif acquisition.get("failed_capabilities") or acquisition.get("empty_capabilities"):
-        st.caption("部分资料暂未取得，相关判断仍需补充信息。")
-    elif acquisition.get("reused_capabilities"):
-        # 复用是正常路径，不是故障：资料仍在有效期内，没必要再取一遍。
-        st.caption("本次沿用了仍在有效期内的已有资料，未重复查询。")
-    if acquisition.get("mode") == "demo" or any(f.get("source_id") == "DEMO_SNAPSHOT" for f in advice.get("facts", [])):
-        st.warning("本结果含示例数据，仅用于演示。")
-    if acquisition.get("reason_code") == "MODEL_UNAVAILABLE":
-        st.caption("本次智能研判暂不可用，已改用可复算的规则口径给出结果。")
-    elif acquisition.get("facts_truncated"):
-        st.caption("本次资料较多，分析只选取了与问题最相关的部分，其余资料仍可在此查看。")
-    if advice.get("snapshot_time"):
-        st.caption(f"资料日期：{str(advice['snapshot_time'])[:10]}")
-    render_conclusion_panel(advice)
-    render_logic_chain(advice)
-    render_source_trace(advice)
 
 
 def stream_analysis(api_base: str, payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -1263,7 +552,7 @@ def stream_analysis(api_base: str, payload: dict[str, Any]) -> dict[str, Any] | 
 def run_analysis(api_base: str, query: str) -> dict[str, Any] | None:
     """携带最近多轮上下文调用统一分析端点，并更新会话历史。"""
     if not profile_ready():
-        st.warning("请先在“投资偏好”中确认你的情况，再开始分析。")
+        st.warning("请先在“投资偏好”中确认您的情况，再开始分析。")
         return None
     if not query.strip():
         st.warning("请先输入想了解的问题。")
@@ -1297,11 +586,102 @@ def run_analysis(api_base: str, query: str) -> dict[str, Any] | None:
     return advice
 
 
+@st.cache_resource(show_spinner=False)
+def analysis_executor() -> ThreadPoolExecutor:
+    """共享有界线程池；任务只接收提交时复制的数据与鉴权令牌。"""
+    return ThreadPoolExecutor(max_workers=4, thread_name_prefix="wence-analysis")
+
+
+def submit_chat_analysis(api_base: str, direction: str, query: str) -> None:
+    """立即显示问题，后台完成分析，避免等待期间锁住整页交互。"""
+    if not profile_ready():
+        st.warning("请先确认投资偏好，再开始分析。")
+        return
+    jobs = st.session_state.setdefault("analysis_jobs", {})
+    if direction in jobs:
+        return
+    user_turn = {"role": "user", "content": query, "created_at": utc_now()}
+    conversation_id = st.session_state.conversation_id
+    payload = {
+        "query": query,
+        "profile": dict(st.session_state.profile),
+        "facts": [dict(fact) for fact in st.session_state.facts],
+        "auto_fetch": True,
+        "portfolio": [dict(item) for item in st.session_state.portfolio],
+        "conversation_id": conversation_id,
+        "context_messages": [
+            {key: turn[key] for key in ("role", "content", "created_at") if key in turn}
+            for turn in [*st.session_state.conversation, user_turn][-20:]
+        ],
+    }
+    token = st.session_state.auth_token
+    client = backend_http_client(api_base)
+    future = analysis_executor().submit(request_json, client, api_base, "POST", "/portfolio/analyze", payload, token)
+    jobs[direction] = {"future": future, "conversation_id": conversation_id}
+    st.session_state.conversation.append(user_turn)
+    save_research_session()
+
+
+def finish_chat_analyses() -> bool:
+    """仅在 Streamlit 脚本线程合并结果；旧会话结果绝不写入新会话。"""
+    jobs = st.session_state.get("analysis_jobs", {})
+    changed = False
+    for direction, job in list(jobs.items()):
+        future = job["future"]
+        if not future.done():
+            continue
+        changed = True
+        jobs.pop(direction, None)
+        try:
+            result = future.result()
+        except Exception:
+            result = None
+        advice = result.data if result is not None and isinstance(result.data, dict) else None
+        same_page = (direction == st.session_state.get("active_research_direction", QUICK_ASKS[0])
+                     and job["conversation_id"] == st.session_state.get("conversation_id"))
+        saved = st.session_state.get("research_sessions", {}).get(direction)
+        target = st.session_state if same_page else saved if saved and saved.get("conversation_id") == job["conversation_id"] else None
+        if advice:
+            if target is not None:
+                advice.setdefault("facts", [dict(fact) for fact in target["facts"]])
+                facts_by_id = {fact.get("fact_id"): fact for fact in target["facts"]}
+                for fact in advice.get("facts", []):
+                    facts_by_id[fact.get("fact_id")] = fact
+                target["facts"] = list(facts_by_id.values())
+                target["advice"] = advice
+                target["conversation"].append({"role": "assistant", "content": advice["conclusion"],
+                    "created_at": utc_now(), "payload": advice})
+            st.session_state.recent_conversations_loaded_at = 0.0
+            st.session_state.pop("history_detail_cache", None)
+            st.session_state.analysis_notice = "后台分析已完成，可在最近咨询中查看。"
+        else:
+            st.session_state.analysis_notice = format_api_error(result.detail) if result is not None else "分析暂时无法完成，请稍后重试。"
+        if same_page:
+            save_research_session()
+    return changed
+
+
+@st.fragment(run_every=2)
+def background_analysis_status() -> None:
+    if finish_chat_analyses():
+        st.rerun()
+    jobs = st.session_state.get("analysis_jobs", {})
+    if jobs:
+        st.caption(f"{len(jobs)} 个问题正在后台分析，您可以继续使用其他功能。")
+    notice = st.session_state.pop("analysis_notice", None)
+    if notice:
+        st.info(notice)
+
+
 def close_history_view() -> None:
     st.session_state.history_view = False
 
 
 def go_to(page: str) -> None:
+    if page == "投资偏好":
+        page = "风险评估"
+    if page in {"风险评估", "风险调整"}:
+        st.session_state.preference_navigation_open = True
     if page == "历史记录":
         st.session_state.history_view = True
     else:
@@ -1309,160 +689,137 @@ def go_to(page: str) -> None:
         st.session_state.navigation = page
 
 
-def home_stat_cards() -> list[tuple[str, str, str]]:
-    """用会话里已有的资料生成概览卡片，不额外取数、不产生延迟。"""
-
-    cards: list[tuple[str, str, str]] = [
-        ("自选关注", str(len(st.session_state.get("watchlist", []))), "可一键发起研究"),
-        ("当前持仓", str(len(st.session_state.get("portfolio", []))), "用于集中度与压力测试"),
-    ]
-    facts = st.session_state.get("facts", [])
-    if facts:
-        cards.append(("研究资料", str(len(facts)), "本次提问会一并参考"))
-        latest = facts[-1]
-        value = display_value(str(latest.get("field", "")), latest.get("value"))
-        cards.append(("最近一条资料", value[:18], f"{latest.get('entity', '—')} · {fact_time(latest.get('snapshot_time'))}"))
-    else:
-        cards.append(("研究资料", "0", "提问后按需自动获取"))
-    cards.append(("投资偏好", "已确认" if profile_ready() else "未确认",
-                  "分析将按你的情况给出" if profile_ready() else "确认后即可开始分析"))
-    completed = sum(
-        1 for result in (st.session_state.get("advice") or {}).get("agent_results", [])
-        if result.get("status") == "completed"
-    )
-    if completed:
-        cards.append(("已完成分项", str(completed), "来自最近一次分析"))
-    return cards
+RESEARCH_SESSION_FIELDS = ("conversation", "conversation_id", "advice", "facts", "history_before_id")
 
 
-def render_home_workbench() -> None:
-    """首页工作台只汇总本地已有状态，不新增网络请求或模型调用。"""
+def save_research_session() -> None:
+    """保存当前方向；共享的投资偏好、自选和持仓不属于聊天上下文。"""
+    direction = st.session_state.get("active_research_direction", QUICK_ASKS[0])
+    sessions = st.session_state.setdefault("research_sessions", {})
+    sessions[direction] = {key: st.session_state.get(key) for key in RESEARCH_SESSION_FIELDS}
+    st.session_state.setdefault("conversation_directions", {})[st.session_state.conversation_id] = direction
 
-    st.subheader("研究工作台")
-    render_stat_cards(home_stat_cards(), accent_first=not st.session_state.get("facts"))
-    next_step, latest = st.columns([1.05, 1], gap="medium")
-    with next_step, st.container(border=True):
-        st.markdown("**下一步可以做什么**")
-        if not profile_ready():
-            st.caption("先确认投资偏好，系统才能按你的风险边界生成分析。")
-            st.button("完善投资偏好", type="primary", icon=":material/person_edit:",
-                      on_click=go_to, args=("投资偏好",), key="workbench_profile")
-        elif not st.session_state.get("watchlist"):
-            st.caption("添加关注标的后，可以直接研究或发起多标的对比。")
-            st.button("添加自选标的", type="primary", icon=":material/star:",
-                      on_click=go_to, args=("自选研究",), key="workbench_watchlist")
-        elif not st.session_state.get("portfolio"):
-            st.caption("已有自选关注；继续录入持仓即可查看集中度和压力情景。")
-            st.button("录入我的持仓", icon=":material/pie_chart:",
-                      on_click=go_to, args=("持仓分析",), key="workbench_portfolio")
-        else:
-            st.caption("资料、自选和持仓已经就绪，可以继续研究或诊断组合。")
-            with st.container(horizontal=True):
-                st.button("查看自选", icon=":material/star:", on_click=go_to,
-                          args=("自选研究",), key="workbench_open_watchlist")
-                st.button("诊断持仓", icon=":material/analytics:", on_click=go_to,
-                          args=("持仓分析",), key="workbench_open_portfolio")
-    with latest, st.container(border=True):
-        st.markdown("**最近研究状态**")
-        advice = st.session_state.get("advice") or st.session_state.get("portfolio_advice")
-        if advice:
-            status = advice.get("compliance", {}).get("status", "REVIEW")
-            status_text = {"PASS": "已完成风险检查", "REVIEW": "仍有事项待核实", "BLOCK": "请求未通过风险边界"}.get(
-                status, "状态待确认"
-            )
-            st.badge(status_text, color="green" if status == "PASS" else "orange")
-            st.caption(plain_language(str(advice.get("conclusion", "最近一次分析已完成。")))[:140])
-            st.button("查看分析详情", icon=":material/fact_check:", on_click=go_to,
-                      args=("历史记录",), key="workbench_details")
-        else:
-            st.caption("还没有分析记录。直接提问后，系统会按需获取资料并开始分析。")
-            if st.session_state.get("facts"):
-                latest_fact = st.session_state.facts[-1]
-                st.caption(
-                    f"最近资料：{latest_fact.get('entity', '—')} · "
-                    f"{fact_time(latest_fact.get('snapshot_time'))}"
-                )
+
+def activate_research(direction: str) -> None:
+    """切换完整研究上下文，避免问题、证据和结果跨方向混用。"""
+    if direction == st.session_state.get("active_research_direction", QUICK_ASKS[0]):
+        return
+    save_research_session()
+    sessions = st.session_state.research_sessions
+    if direction not in sessions:
+        sessions[direction] = {
+            "conversation": [], "conversation_id": str(uuid.uuid4()),
+            "advice": None, "facts": [], "history_before_id": None,
+        }
+    for key, value in sessions[direction].items():
+        st.session_state[key] = value
+    st.session_state.active_research_direction = direction
+
+
+def select_research_direction() -> None:
+    activate_research(st.session_state.research_direction)
+
+
+def continue_last_research(api_base: str, *, request) -> None:
+    """优先继续当前对话；重新登录后恢复账号最近保存的研究。"""
+    recent = st.session_state.get("recent_conversations") or []
+    if not st.session_state.get("conversation") and recent:
+        detail = request(api_base, "GET", f"/history/{recent[0]['id']}")
+        if isinstance(detail, dict) and detail.get("messages"):
+            restore_conversation(detail)
+    go_to("投资问答")
 
 
 def page_home(api_base: str) -> None:
-    render_page_header("投资问答 · 用日常语言提问")
-    if not st.session_state.conversation:
-        st.html("""<section class="hero"><div class="hero-copy">
-            <div class="eyebrow">问策智投 · 研究入口</div>
-            <h1>投资有疑问，<br>一起理清楚。</h1>
-            <p>从问题出发，整理资料、核对观点，再看适合你的风险边界。</p>
-            </div><div class="hero-steps" aria-label="研究流程">
-            <span>01 <strong>提出问题</strong></span><span>02 <strong>查证资料</strong></span>
-            <span>03 <strong>审视风险</strong></span></div></section>""")
-        if not profile_ready():
-            st.info("先花几分钟填写投资偏好，让分析更贴合你的情况。", icon=":material/person_edit:")
-            st.button("填写投资偏好", type="primary", on_click=go_to, args=("投资偏好",))
-        examples = ["现在的市场有哪些需要注意的风险？", "选择基金时，应该关注哪些方面？", "请帮我看看持仓是否过于集中"]
-        st.markdown("**可以这样问**")
-        for index, (col, example) in enumerate(zip(st.columns(3), examples), start=1):
-            with col, st.container(key=f"starter-prompt-{index}"):
-                st.caption(("市场风险", "基金选择", "持仓诊断")[index - 1])
-                clicked = st.button(example, width="stretch", disabled=not profile_ready(),
-                                    icon=":material/arrow_outward:", key=f"starter-question-{index}")
-            if clicked:
-                if run_analysis(api_base, example):
-                    st.rerun()
-        render_home_workbench()
-    else:
-        with st.expander("研究工作台", expanded=False, icon=":material/dashboard:"):
-            render_home_workbench()
-        with st.container(horizontal=True, vertical_alignment="center"):
-            st.markdown(f"**对话中 · {len(st.session_state.conversation)} 条消息**")
-            st.space("stretch")
-            st.button("新建对话", icon=":material/add_comment:", on_click=new_conversation)
-        before_id = st.session_state.get("history_before_id")
-        if before_id and st.button("加载更早消息", key="load_older_chat"):
-            older = api_request(
-                api_base, "GET", f"/history/{st.session_state.conversation_id}?before_id={before_id}",
-            )
-            if isinstance(older, dict):
-                st.session_state.conversation = [
-                    {"role": item["role"], "content": item["content"],
-                     "created_at": item["created_at"], "payload": item.get("payload")}
-                    for item in older.get("messages", [])
-                ] + st.session_state.conversation
-                st.session_state.history_before_id = older.get("next_before_id")
-                st.rerun()
-        for turn in st.session_state.conversation:
-            with st.chat_message(turn["role"]):
-                if turn["role"] == "assistant" and turn.get("payload"):
-                    render_advice(turn["payload"])
-                else:
-                    st.write(plain_language(turn["content"]) if turn["role"] == "assistant" else turn["content"])
-    # 问题会携带 auto_fetch=True；后端按意图与模型选择的白名单能力自动补齐资料。
+    from frontend.home_page import render_home
+    render_home(api_base, ready=profile_ready(), header=render_page_header, go_to=go_to,
+                recent=st.session_state.get("recent_conversations", []), fetch=create_board_fetch(api_base),
+                resume=partial(continue_last_research, request=api_request))
+
+
+def page_questions(api_base: str) -> None:
     render_quick_ask(api_base)
-    query = st.chat_input("输入股票、基金名称，或直接说说你的疑问…", disabled=not profile_ready())
-    if query and run_analysis(api_base, query.strip()):
-        st.rerun()
-    st.html("<div class='legal-strip'>分析仅供参考，不保证收益。投资前，请结合自己的情况判断。</div>")
 
 
 def render_quick_ask(api_base: str) -> None:
-    """把原来的"专题研究"并入问答页：选视角、填对象、直接提问。"""
+    """五个方向共用布局，各自拥有独立页面和底部输入框。"""
+    st.session_state.setdefault("research_direction", st.session_state.get("active_research_direction", QUICK_ASKS[0]))
+    direction = st.segmented_control(
+        "研究方向", QUICK_ASKS, key="research_direction", required=True,
+        on_change=select_research_direction, width="stretch", persist_state="session",
+    )
+    activate_research(direction or QUICK_ASKS[0])
+    render_research_page(api_base, direction or QUICK_ASKS[0])
 
-    with st.expander("按研究方向提问", expanded=not st.session_state.conversation, icon=":material/travel_explore:"):
-        st.caption("选一个方向，填写想了解的对象或问题，结果会出现在上面的对话里。")
-        with st.form("quick_ask"):
-            kind = st.segmented_control("研究方向", QUICK_ASKS, default=QUICK_ASKS[0], key="quick_ask_kind")
-            # 输入框必须显式给 key。Streamlit 对没有 key 的控件是按全部参数（含 placeholder）
-            # 算控件标识的，而这里的 placeholder 随研究方向变化；方向选择又在同一个 form 里，
-            # 点击方向不会触发重跑，浏览器仍按旧 placeholder 算出的标识回传内容，服务端按新
-            # placeholder 算出的标识对不上，用户输入就被整段丢弃，只剩默认问题。
-            target = st.text_input("关注的对象或想了解的问题",
-                                   placeholder=QUICK_ASK_PROMPTS[kind or QUICK_ASKS[0]], max_chars=200,
-                                   key="quick_ask_target")
-            submitted = st.form_submit_button("开始分析", type="primary", disabled=not profile_ready(),
-                                              icon=":material/play_arrow:")
-        if submitted:
-            chosen = kind or QUICK_ASKS[0]
-            question = target.strip() or QUICK_ASK_PROMPTS[chosen]
-            if run_analysis(api_base, RESEARCH_PREFIX[chosen] + question):
-                st.rerun()
+
+def create_board_fetch(api_base: str):
+    return overview_fetch(backend_http_client(api_base), st.session_state.get("auth_token"))
+
+
+def prefetch_research_board_data(api_base: str) -> None:
+    """登录后捕获令牌并启动五个方向的只读后台任务。"""
+    start_board_prefetch(api_base, create_board_fetch(api_base))
+
+
+def fetch_research_board_data(api_base: str, direction: str, target: str | None) -> dict | None:
+    return create_board_fetch(api_base)(api_base, direction, target)
+
+
+def render_research_page(api_base: str, direction: str) -> None:
+    render_page_header(direction)
+    st.title(direction)
+    # 空白页先展示本方向的数据；已有对话中将数据折叠，方便继续阅读回答。
+    if st.session_state.conversation:
+        with st.expander("本页领域数据", expanded=False, on_change="rerun", icon=":material/monitoring:") as section:
+            if section.open:
+                render_research_board(api_base, direction, create_board_fetch(api_base))
+    else:
+        render_research_board(api_base, direction, create_board_fetch(api_base))
+    if not profile_ready():
+        st.info("请先确认投资偏好，再开始分析。", icon=":material/person_edit:")
+        st.button("填写投资偏好", type="primary", on_click=go_to, args=("投资偏好",))
+    if st.session_state.conversation:
+        with st.container(horizontal=True, vertical_alignment="center"):
+            st.markdown(f"**对话中 · {len(st.session_state.conversation)} 条消息**")
+            st.space("stretch")
+            st.button("发起咨询", icon=":material/add_comment:", on_click=new_conversation)
+            st.button("查看分析详情", icon=":material/fact_check:", on_click=go_to, args=("历史记录",))
+    before_id = st.session_state.get("history_before_id")
+    if before_id and st.button("加载更早消息", key="load_older_chat"):
+        older = api_request(api_base, "GET", f"/history/{st.session_state.conversation_id}?before_id={before_id}")
+        if isinstance(older, dict):
+            st.session_state.conversation = [
+                {"role": item["role"], "content": item["content"],
+                 "created_at": item["created_at"], "payload": item.get("payload")}
+                for item in older.get("messages", [])
+            ] + st.session_state.conversation
+            st.session_state.history_before_id = older.get("next_before_id")
+            save_research_session()
+            st.rerun()
+    latest_answer = next((index for index in range(len(st.session_state.conversation)-1, -1, -1)
+                          if st.session_state.conversation[index].get("role") == "assistant"), -1)
+    for turn_index, turn in enumerate(st.session_state.conversation):
+        with st.chat_message(turn["role"]):
+            if turn["role"] == "assistant" and turn.get("payload"):
+                previous = st.session_state.conversation[turn_index - 1] if turn_index else {}
+                render_advice(turn["payload"], export_key=f"chat_{turn_index}", compact=turn_index != latest_answer,
+                              question=previous.get("content", "") if previous.get("role") == "user" else "")
+            else:
+                content = turn["content"]
+                if turn["role"] == "user":
+                    content = content.removeprefix(RESEARCH_PREFIX[direction])
+                st.write(plain_language(content) if turn["role"] == "assistant" else content)
+    # 必须在页面顶层调用，Streamlit 才会将唯一输入框固定在底部。
+    query = st.chat_input(QUICK_ASK_PROMPTS[direction], key=f"research_chat_{direction}",
+                          disabled=not profile_ready() or direction in st.session_state.get("analysis_jobs", {}),
+                          width="stretch")
+    if query and query.strip():
+        submit_chat_analysis(api_base, direction, RESEARCH_PREFIX[direction] + query.strip())
+        st.rerun()
+    if direction in st.session_state.get("analysis_jobs", {}):
+        st.info("正在后台核对资料与风险。您可以切换页面，完成后会自动显示结果。")
+    st.html("<div class='legal-strip'>分析仅供参考，不保证收益。投资前，请结合自己的情况判断。</div>")
+    restore_board_scroll(direction, has_conversation=bool(st.session_state.conversation))
 
 
 def render_materials_panel(api_base: str) -> None:
@@ -1574,15 +931,30 @@ def render_materials_body(api_base: str) -> None:
                     st.rerun()
 
 
-def page_profile(api_base: str) -> None:
+def page_profile(api_base: str, *, view: str = "风险评估") -> None:
     """画像中心：将抽取、用户核对和确认做成不可跳过的两步流程。"""
-    st.title("投资偏好")
-    render_page_header("投资偏好 · 目标与承受能力")
-    st.caption("告诉我们你的目标与承受能力，核对后即可开始分析。")
+    render_page_header(view)
+    st.title(view)
+    st.caption("请根据您的实际情况填写，评估后核对并确认。" if view == "风险评估"
+               else "请调整您的风险态度与投资计划，重新评估后核对并确认。")
     current = st.session_state.profile
+    plan = st.session_state.get("profile_plan", "")
+    if view == "风险调整" and not plan:
+        parts = []
+        if current.get("horizon_months") is not None:
+            parts.append(f"计划投资 {current['horizon_months']} 个月")
+        if current.get("max_drawdown") is not None:
+            parts.append(f"最多接受 {current['max_drawdown'] * 100:g}% 亏损")
+        if current.get("liquidity_need"):
+            parts.append(f"流动性需求{current['liquidity_need']}")
+        if current.get("target"):
+            parts.append(f"投资目标：{current['target']}")
+        plan = "，".join(parts)
     with st.form("profile_assessment"):
         narrative = st.text_area(
-            "你的投资计划",
+            "您的投资计划",
+            value=plan,
+            key="profile_narrative",
             placeholder="例如：2 年后买房，最多接受 8% 亏损，期间可能随时需要使用这笔钱。",
         )
         profile_left, profile_right = st.columns(2)
@@ -1605,17 +977,28 @@ def page_profile(api_base: str) -> None:
             value="\n".join(current.get("investment_history", [])),
             placeholder="例如：2024 年开始定投宽基 ETF",
         )
-        with st.expander("了解你对风险的态度", expanded=True):
-            st.caption("0 表示完全不符合，100 表示完全符合。请按真实情况选择。")
-            questionnaire = {
-                "financial_capacity": st.slider("即使这笔投资亏损，也不影响日常生活", 0, 100, 50),
-                "loss_tolerance": st.slider("我能接受投资暂时亏损", 0, 100, 50),
-                "investment_horizon": st.slider("这笔钱可以长期不用", 0, 100, 50),
-                "knowledge_experience": st.slider("我了解股票、基金的收益和风险", 0, 100, 50),
-                "behavior_stability": st.slider("市场下跌时，我仍能冷静判断", 0, 100, 50),
+        with st.expander("风险态度", expanded=True):
+            st.caption("0 表示完全不符合，10 表示完全符合。点击数字下方的格子选择；选择 0 表示不选任何格子。")
+            questions = {
+                "financial_capacity": "即使这笔投资亏损，也不影响日常生活",
+                "loss_tolerance": "我能接受投资暂时亏损",
+                "investment_horizon": "这笔钱可以长期不用",
+                "knowledge_experience": "我了解股票、基金的收益和风险",
+                "behavior_stability": "市场下跌时，我仍能冷静判断",
             }
-        create_draft = st.form_submit_button("查看评估结果", type="primary")
+            questionnaire = {}
+            with st.container(key="risk-score-grid"):
+                for field, label in questions.items():
+                    previous = st.session_state.questionnaire.get(field, 50)
+                    score = st.radio(
+                        label, range(11), index=max(0, min(10, round(previous / 10))),
+                        horizontal=True, width="stretch", key=f"risk_score_{field}",
+                    )
+                    # 界面使用 0—10 分；后端仍按原有 0—100 分计算风险等级。
+                    questionnaire[field] = int(score) * 10
+        create_draft = st.form_submit_button("立即调整" if view == "风险调整" else "立即评估", type="primary")
     if create_draft:
+        st.session_state.profile_plan = narrative
         st.session_state.questionnaire = questionnaire
         result = api_request(
             api_base,
@@ -1632,13 +1015,17 @@ def page_profile(api_base: str) -> None:
         )
         if result:
             result["profile"]["version"] = int(current.get("version") or 1)
+            if view == "风险调整":
+                for field in ("single_security_limit", "industry_limit", "constraints"):
+                    if field in current:
+                        result["profile"][field] = current[field]
             st.session_state.profile = result["profile"]
             st.session_state.profile["confirmed"] = False
             st.session_state.profile_draft = result
 
     draft = st.session_state.get("profile_draft")
     if draft:
-        st.subheader("请核对你的投资偏好")
+        st.subheader("请核对您的投资偏好")
         render_profile_summary(draft["profile"])
         if draft.get("missing_fields"):
             st.warning(f"仍缺少：{'、'.join(PROFILE_LABELS.get(key, '投资计划') for key in draft['missing_fields'])}")
@@ -1655,16 +1042,15 @@ def page_profile(api_base: str) -> None:
         with st.expander("查看评估依据"):
             for item in draft["evidence"]:
                 st.write(profile_evidence_language(item))
-    with st.expander("更多投资偏好"):
-        profile = st.session_state.profile
-        st.write(f"单只股票或基金的比例上限：{display_value('single_security_limit', profile.get('single_security_limit'))}")
-        st.write(f"单个行业的比例上限：{display_value('industry_limit', profile.get('industry_limit'))}")
-        if profile.get("constraints"):
-            render_points("你的限制条件", profile["constraints"])
     if not draft:
         status = "已确认" if profile_ready() else "未确认"
         with st.expander(f"当前投资偏好 · {status}", expanded=profile_ready()):
             render_profile_summary(st.session_state.profile)
+            if profile_ready():
+                with st.container(horizontal=True, key="confirmed-profile-stamp"):
+                    st.space("stretch")
+                    st.image(str(Path(__file__).resolve().parent / "assets" / "confirmed-stamp.png"),
+                             width=110)
 
 
 def available_analyses() -> list[tuple[str, dict[str, Any]]]:
@@ -1810,134 +1196,15 @@ def _watchlist_compare_prefix(items: list[dict[str, Any]]) -> str:
     types = {str(item.get("asset_type", "股票")) for item in items}
     if len(types) == 1:
         return WATCHLIST_RESEARCH_PREFIX.get(types.pop(), "个股研究：")
-    return "个股研究："
+    raise ValueError("横向比较需选择相同类型的标的。")
 
 
 def page_watchlist(api_base: str) -> None:
-    """账号级自选研究：收藏、单项研究和最多四项横向比较。"""
-
-    st.title("自选研究")
-    render_page_header("自选 · 关注与对比研究")
-    st.caption("收藏经常关注的股票、基金、行业或可转债，下次登录仍可继续研究。")
-    with st.form("watchlist_add", border=True):
-        with st.container(horizontal=True, vertical_alignment="bottom"):
-            asset_type = st.selectbox(
-                "标的类型", list(WATCHLIST_RESEARCH_PREFIX), key="watchlist_asset_type"
-            )
-            target = st.text_input(
-                "名称或代码", placeholder="例如：贵州茅台 / 600519", max_chars=60,
-                key="watchlist_target",
-            )
-            submitted = st.form_submit_button("加入自选", type="primary", icon=":material/star:")
-    if submitted:
-        if not target.strip():
-            st.warning("请输入股票、基金、行业或可转债的名称或代码。")
-        else:
-            result = api_request(
-                api_base,
-                "POST",
-                "/watchlist",
-                {"target": target.strip(), "asset_type": asset_type},
-            )
-            if isinstance(result, dict) and result.get("id") is not None:
-                st.session_state.watchlist = [
-                    result,
-                    *[item for item in st.session_state.watchlist if item.get("id") != result["id"]],
-                ]
-                st.toast("已加入自选", icon=":material/check_circle:")
-
-    items = st.session_state.get("watchlist", [])
-    if not items:
-        render_empty_state(
-            "还没有自选标的",
-            "添加后可以一键发起研究，也可以选择多个标的进行横向比较。",
-            ":material/star:",
-        )
-        return
-
-    st.subheader(f"我的自选 · {len(items)}")
-    type_counts = {kind: sum(item.get("asset_type", "股票") == kind for item in items)
-                   for kind in WATCHLIST_RESEARCH_PREFIX}
-    summary = "".join(
-        f"<span><strong>{escape(kind)}</strong>{count}</span>"
-        for kind, count in type_counts.items() if count
-    )
-    st.html(f"<div class='watchlist-summary'><span>关注概览</span>{summary}</div>")
-    search_col, type_col = st.columns([2, 1], gap="small")
-    with search_col:
-        search = st.text_input("搜索自选", placeholder="按名称或代码查找", icon=":material/search:")
-    with type_col:
-        asset_filter = st.selectbox("筛选类型", ["全部", *[kind for kind, count in type_counts.items() if count]])
-    visible_items = [
-        item for item in items
-        if search.strip().casefold() in str(item.get("target", "")).casefold()
-        and (asset_filter == "全部" or item.get("asset_type", "股票") == asset_filter)
-    ]
-    if not visible_items:
-        st.info("没有找到匹配的自选标的，可以调整搜索词或类型。")
-    for item in visible_items:
-        item_id = int(item["id"])
-        target_name = str(item.get("target", "—"))
-        asset_name = str(item.get("asset_type", "股票"))
-        with st.container(key=f"watchlist-row-{item_id}", border=True,
-                          horizontal=True, vertical_alignment="center"):
-            st.markdown(f"**{target_name}**")
-            st.badge(asset_name, color="blue" if asset_name == "基金" else "gray")
-            st.caption(f"加入时间 {fact_time(item.get('created_at'))}")
-            st.space("stretch")
-            if st.button(
-                "开始研究",
-                key=f"watchlist_research_{item_id}",
-                icon=":material/travel_explore:",
-                disabled=not profile_ready(),
-            ):
-                prefix = WATCHLIST_RESEARCH_PREFIX.get(asset_name, "个股研究：")
-                if run_analysis(api_base, f"{prefix}请分析{target_name}的主要机会与风险"):
-                    st.session_state.pending_navigation = "投资问答"
-                    st.rerun()
-            if st.button(
-                "移除",
-                key=f"watchlist_remove_{item_id}",
-                icon=":material/delete:",
-            ):
-                removed = api_request(api_base, "DELETE", f"/watchlist/{item_id}")
-                if removed is not None:
-                    st.session_state.watchlist = [
-                        saved for saved in items if int(saved.get("id", -1)) != item_id
-                    ]
-                    st.toast("已从自选移除", icon=":material/check_circle:")
-                    st.rerun()
-
-    render_price_history_panel(api_base, items)
-
-    if len(items) >= 2:
-        st.subheader("横向比较")
-        labels = {
-            int(item["id"]): f"{item.get('target', '—')} · {item.get('asset_type', '股票')}"
-            for item in items
-        }
-        with st.form("watchlist_compare", border=True):
-            selected_ids = st.multiselect(
-                "选择 2–4 个标的",
-                list(labels),
-                format_func=lambda item_id: labels[item_id],
-                max_selections=4,
-            )
-            compare = st.form_submit_button(
-                "生成对比研究",
-                icon=":material/compare_arrows:",
-                disabled=not profile_ready(),
-            )
-        if compare:
-            selected = [item for item in items if int(item["id"]) in selected_ids]
-            if len(selected) < 2:
-                st.warning("请至少选择两个标的进行比较。")
-            else:
-                names = "、".join(str(item["target"]) for item in selected)
-                prefix = _watchlist_compare_prefix(selected)
-                if run_analysis(api_base, f"{prefix}请横向比较{names}，说明各自特点、风险和适用情形"):
-                    st.session_state.pending_navigation = "投资问答"
-                    st.rerun()
+    from frontend.watchlist_page import render_watchlist
+    render_watchlist(api_base, {"api": api_request, "analysis": run_analysis, "activate": activate_research,
+        "save": save_research_session, "ready": profile_ready, "go_to": go_to, "add_fact": add_fact,
+        "header": render_page_header, "history": render_price_history_panel,
+        "factory": snapshot_fetch_factory(backend_http_client(api_base), st.session_state.get("auth_token"))})
 
 
 def render_price_history_panel(api_base: str, items: list[dict[str, Any]]) -> None:
@@ -2045,7 +1312,7 @@ def render_portfolio_risk_dashboard(portfolio: list[dict[str, Any]]) -> None:
                    for index, name in enumerate(names)]
         with st.container(key="portfolio-donut", border=True):
             st.markdown("**持仓构成**")
-            st.caption("按你录入的组合占比计算；灰色部分表示尚未配置的比例。"
+            st.caption("按您录入的组合占比计算；灰色部分表示尚未配置的比例。"
                        + ("其余持仓已合并显示，完整权重见下方。" if len(ranked) > 5 else ""))
             donut = (
                 alt.Chart(pd.DataFrame(slices))
@@ -2117,7 +1384,7 @@ def page_portfolio(api_base: str) -> None:
     """组合页只收集权重和发起诊断；任何调整建议均由后端合规层控制。"""
     st.title("持仓分析")
     render_page_header("持仓 · 集中度与资产分配")
-    st.caption("填入你持有的股票或基金，看看资金是否过于集中。")
+    st.caption("填入您持有的股票或基金，看看资金是否过于集中。")
     if st.session_state.portfolio:
         render_stat_cards(portfolio_stat_cards(st.session_state.portfolio))
     with st.form("portfolio_form"):
@@ -2158,12 +1425,17 @@ def page_portfolio(api_base: str) -> None:
                            ":material/pie_chart:")
     if st.button("分析我的持仓", type="primary", disabled=not st.session_state.portfolio or not profile_ready(),
                  icon=":material/analytics:"):
-        result = run_analysis(api_base, "请诊断我的持仓组合")
+        previous_direction = st.session_state.get("active_research_direction", QUICK_ASKS[0])
+        activate_research("持仓分析")
+        try:
+            result = run_analysis(api_base, "请诊断我的持仓组合")
+        finally:
+            activate_research(previous_direction)
         if result:
             st.session_state.portfolio_advice = result
     if st.session_state.get("portfolio_advice"):
         result = st.session_state.portfolio_advice
-        render_advice(result)
+        render_advice(result, export_key="portfolio", question="请诊断我的持仓组合")
         if result.get("allocation"):
             st.subheader("资产分配参考")
             st.dataframe(
@@ -2199,19 +1471,32 @@ def _restore_profile(api_base: str) -> None:
 
 def reset_user_session() -> None:
     """退出时清理仅属于当前账号的浏览器状态。"""
+    cancel_board_prefetch()
+    for job in st.session_state.get("analysis_jobs", {}).values():
+        job["future"].cancel()
+    for key in list(st.session_state):
+        if key.startswith("snapshot_"):
+            value = st.session_state.pop(key, None)
+            if key.endswith("_task") and value is not None:
+                value.cancel()
     session_id = current_browser_session_id()
     if session_id:
         browser_session_reclaimer().unregister(session_id)
     for key in (
+        "service_unavailable", "last_error", "watchlist_compare_ids",
         "auth_token", "session_beacon_token", "auth_user", "conversation", "advice", "facts", "portfolio",
-        "watchlist", "watchlist_loaded", "price_history",
-        "profile", "profile_draft", "questionnaire", "portfolio_advice", "navigation", "pending_navigation",
-        "history_view",
+        "watchlist", "watchlist_loaded", "price_history", "watchlist_focus", "watchlist_comparison_request", "watchlist_comparison_advice", "comparison_chart_choice", "comparison_polling",
+        "profile", "profile_draft", "profile_plan", "questionnaire", "portfolio_advice", "navigation", "preference_navigation_open", "pending_navigation",
+        "history_view", "research_sessions", "active_research_direction", "research_direction", "conversation_directions", "research_board_cache",
         "research_results", "market_query_result", "data_selected", "auth_notice",
         "recent_conversations", "recent_conversations_loaded_at", "history_detail_cache",
         "history_before_id", "history_offset", "history_last_search", "history_search",
+        "analysis_jobs", "analysis_notice",
     ):
         st.session_state.pop(key, None)
+    for key in list(st.session_state):
+        if key.startswith(("risk_score_", "research_chat_", "board_target_", "board_refresh_", "board_poll_", "admin_")) or key == "profile_narrative":
+            st.session_state.pop(key, None)
     st.session_state.conversation_id = str(uuid.uuid4())
     # 账号标识只来自服务端令牌，浏览器状态里不保存用户 id。
     st.session_state.profile = {"risk_level": "R3", "risk_score": None,
@@ -2224,52 +1509,54 @@ def page_login(api_base: str) -> None:
     """登录门禁；注册成功后同样直接进入系统。"""
     render_login_brand()
     story, panel = st.columns([1.15, 1], gap="large")
-    with story:
-        st.html("""<section class="login-story"><div class="eyebrow">你的投资研究伙伴</div>
-            <h1>看懂投资，<br>从容做选择。</h1><p>从一个简单的问题开始，了解市场变化，梳理投资思路。</p>
-            <div class="story-points">
-            <div class="story-point"><span>01</span><div><strong>说出你的疑问</strong><p>股票、基金、市场，用日常语言直接提问。</p></div></div>
-            <div class="story-point"><span>02</span><div><strong>看懂分析与风险</strong><p>重点清楚，依据可查，帮助你独立判断。</p></div></div>
-            <div class="story-point"><span>03</span><div><strong>随时接着聊</strong><p>保存研究记录，让每次思考都有迹可循。</p></div></div>
-            </div></section>""")
     with panel, st.container(key="login-panel"):
         st.subheader("欢迎来到问策智投")
-        st.caption("登录，开始你的投资研究。")
+        st.caption("登录，开始您的投资研究。")
         with st.container(horizontal=True, gap="xsmall"):
             st.badge("资料可追溯", icon=":material/rule:", color="primary")
             st.badge("不下单", icon=":material/block:", color="gray")
         notice = st.session_state.pop("auth_notice", None)
         if notice:
             st.warning(notice)
-        login_tab, register_tab = st.tabs(["登录", "注册"])
-        with login_tab:
-            with st.form("login_form"):
-                username = st.text_input("账号", key="login_username")
-                password = st.text_input("密码", type="password", key="login_password")
-                submitted = st.form_submit_button("登录", type="primary", width="stretch")
-            if submitted:
-                result = api_request(
-                    api_base, "POST", "/auth/login", {"username": username.strip(), "password": password}
-                )
-                if result:
-                    complete_login(result)
-                    st.rerun()
-        with register_tab:
-            with st.form("register_form"):
-                username = st.text_input("新账号", help="3-50 位字母、数字、下划线或连字符")
-                password = st.text_input("新密码", type="password", help="至少 8 位")
-                confirmation = st.text_input("确认密码", type="password")
-                submitted = st.form_submit_button("注册并登录", type="primary", width="stretch")
-            if submitted:
-                if password != confirmation:
-                    st.error("两次输入的密码不一致。")
-                else:
+        login_tab, register_tab = st.tabs(["登录", "注册"], on_change="rerun")
+        if login_tab.open:
+            with login_tab:
+                with st.form("login_form"):
+                    username = st.text_input("账号", key="login_username")
+                    password = st.text_input("密码", type="password", key="login_password")
+                    submitted = st.form_submit_button("登录", type="primary", width="stretch")
+                if submitted:
                     result = api_request(
-                        api_base, "POST", "/auth/register", {"username": username.strip(), "password": password}
+                        api_base, "POST", "/auth/login", {"username": username.strip(), "password": password}
                     )
                     if result:
                         complete_login(result)
                         st.rerun()
+        if register_tab.open:
+            with register_tab:
+                with st.form("register_form"):
+                    username = st.text_input("新账号", help="3-50 位字母、数字、下划线或连字符")
+                    password = st.text_input("新密码", type="password", help="至少 8 位")
+                    confirmation = st.text_input("确认密码", type="password")
+                    submitted = st.form_submit_button("注册并登录", type="primary", width="stretch")
+                if submitted:
+                    if password != confirmation:
+                        st.error("两次输入的密码不一致。")
+                    else:
+                        result = api_request(
+                            api_base, "POST", "/auth/register", {"username": username.strip(), "password": password}
+                        )
+                        if result:
+                            complete_login(result)
+                            st.rerun()
+    with story:
+        st.html("""<section class="login-story"><div class="eyebrow">您的投资研究伙伴</div>
+            <h1>看懂投资，<br>从容做选择。</h1><p>从一个简单的问题开始，了解市场变化，梳理投资思路。</p>
+            <div class="story-points">
+            <div class="story-point"><span>01</span><div><strong>说出您的疑问</strong><p>股票、基金、市场，用日常语言直接提问。</p></div></div>
+            <div class="story-point"><span>02</span><div><strong>看懂分析与风险</strong><p>重点清楚，依据可查，帮助您独立判断。</p></div></div>
+            <div class="story-point"><span>03</span><div><strong>随时接着聊</strong><p>保存研究记录，让每次思考都有迹可循。</p></div></div>
+            </div></section>""")
 
 
 def complete_login(result: dict[str, Any]) -> None:
@@ -2278,9 +1565,20 @@ def complete_login(result: dict[str, Any]) -> None:
     账号归属由后端根据令牌判定，前端不保存、也不展示用户标识。
     """
 
+    identity = {"username": result["user"]["username"], "role": result["user"].get("role", "user")}
+    if (st.session_state.get("auth_token") == result["access_token"]
+            and st.session_state.get("session_beacon_token") == result["session_beacon_token"]
+            and st.session_state.get("auth_user") == identity):
+        return
+    reset_user_session()
+    for key in ("service_unavailable", "pending_navigation", "watchlist_compare_ids", "profile_restored", "last_error"):
+        st.session_state.pop(key, None)
+    for key in ("research_sessions", "active_research_direction", "research_direction", "conversation_directions", "research_board_cache"):
+        st.session_state.pop(key, None)
+    st.session_state.navigation = "主页"
     st.session_state.auth_token = result["access_token"]
     st.session_state.session_beacon_token = result["session_beacon_token"]
-    st.session_state.auth_user = {"username": result["user"]["username"]}
+    st.session_state.auth_user = identity
     st.session_state.conversation = []
     st.session_state.advice = None
     st.session_state.watchlist = []
@@ -2292,6 +1590,8 @@ def complete_login(result: dict[str, Any]) -> None:
     st.session_state.pop("history_detail_cache", None)
     st.session_state.history_before_id = None
     st.session_state.profile_restored = False
+    if st.session_state.auth_user["role"] != "admin":
+        prefetch_research_board_data(st.session_state.api_base)
 
 
 def page_conversations(api_base: str) -> None:
@@ -2352,10 +1652,12 @@ def page_conversations(api_base: str) -> None:
             detail["next_before_id"] = older.get("next_before_id")
             st.session_state.history_detail_cache = detail
             st.rerun()
-    for message in detail["messages"]:
+    for message_index, message in enumerate(detail["messages"]):
         with st.chat_message(message["role"]):
             if message["role"] == "assistant" and message.get("payload"):
-                render_advice(message["payload"])
+                previous = detail["messages"][message_index - 1] if message_index else {}
+                render_advice(message["payload"], export_key=f"history_{message_index}",
+                              question=previous.get("content", "") if previous.get("role") == "user" else "")
             else:
                 st.write(plain_language(message["content"]) if message["role"] == "assistant" else message["content"])
 
@@ -2365,7 +1667,7 @@ def _render_service_unavailable(api_base: str) -> None:
 
     render_sidebar(api_base, full=False)
     st.warning("暂时连接不上分析服务，请稍后重试。")
-    st.caption("你的登录状态仍保留在本机；服务恢复后重新打开页面即可继续。")
+    st.caption("您的登录状态仍保留在本机；服务恢复后重新打开页面即可继续。")
 
 
 def main() -> None:
@@ -2373,9 +1675,13 @@ def main() -> None:
     st.set_page_config(page_title="问策智投", page_icon=":material/query_stats:", layout="wide")
     init_session()
     render_app_styles()
+    # 登录页固定在一个可替换的槽位，切换登录态时先清理旧表单。
+    login_screen = st.empty()
     if not st.session_state.get("auth_token"):
-        page_login(st.session_state.api_base)
+        with login_screen.container():
+            page_login(st.session_state.api_base)
         return
+    login_screen.empty()
     api_base = st.session_state.api_base
     # 登录响应已经保存了展示所需的账号信息；普通组件交互无需每次重跑都再查
     # 一遍数据库。旧会话缺少该字段时才补查，令牌有效性仍由下方定时片段校验。
@@ -2392,6 +1698,10 @@ def main() -> None:
         # 状态接口不查询用户表，比每次调用 /auth/me 更轻；连接失败时仍沿用原兜底页。
         _render_service_unavailable(api_base)
         return
+    if st.session_state.auth_user.get("role") == "admin":
+        from frontend.admin import render_admin
+        render_admin(api_base, api_request, reset_user_session)
+        return
     if not st.session_state.get("profile_restored"):
         st.session_state.profile_restored = True
         _restore_profile(api_base)
@@ -2405,25 +1715,30 @@ def main() -> None:
     page = render_sidebar(api_base, full=True)
     if st.session_state.get("history_view"):
         page = "历史记录"
-    if page in {"投资问答", "自选研究"}:
+    if page in {"主页", "自选研究"}:
         ensure_watchlist_loaded(api_base)
     pages = {
-        "投资问答": lambda: page_home(api_base),
+        "主页": lambda: page_home(api_base),
+        "投资问答": lambda: page_questions(api_base),
         "自选研究": lambda: page_watchlist(api_base),
         "持仓分析": lambda: page_portfolio(api_base),
         "历史记录": lambda: page_insights(api_base),
-        "投资偏好": lambda: page_profile(api_base),
+        "风险评估": lambda: page_profile(api_base),
+        "风险调整": lambda: page_profile(api_base, view="风险调整"),
     }
     pages.get(page, lambda: page_home(api_base))()
 
 
 def new_conversation() -> None:
+    direction = st.session_state.get("research_direction", QUICK_ASKS[0])
+    activate_research(direction)
     st.session_state.conversation = []
     st.session_state.advice = None
     st.session_state.conversation_id = str(uuid.uuid4())
     st.session_state.history_before_id = None
     st.session_state.history_view = False
     st.session_state.navigation = "投资问答"
+    save_research_session()
 
 
 if __name__ == "__main__":
