@@ -43,7 +43,7 @@ with patch.object(ui, 'api_request', return_value={'id': 1, 'username': 'test-us
 def test_login_renders_without_backend():
     app = AppTest.from_file(str(Path(__file__).parents[1] / 'frontend/streamlit_app.py')).run(timeout=15)
     assert not app.exception
-    assert [tab.label for tab in app.tabs] == ['登录', '注册']
+    assert [tab.label for tab in app.tabs] == ['账号登录', '微信扫码', '注册']
     assert not app.code
 
 
@@ -84,11 +84,9 @@ def test_navigation_and_profile_call_to_action():
     assert app.title[0].value == '风险评估'
     assert app.session_state['navigation'] == '风险评估'
     assert '用户标识' not in [field.label for field in app.text_input]
-    plan = next(field for field in app.text_area if field.label == '您的投资计划')
-    assert plan.placeholder == '例如：2 年后买房，最多接受 8% 亏损，期间可能随时需要使用这笔钱。'
-    assert '投资 3 年' not in plan.placeholder
-    assert '期望年化收益' not in plan.placeholder
-
+    assert not app.text_area and not app.number_input
+    assert len(app.radio) == 1 and app.radio[0].value is None
+    assert next(button for button in app.button if button.label == '下一题').disabled
 
 
 def test_analysis_details_remains_reachable_without_sidebar_history_entry():
@@ -981,13 +979,13 @@ with patch.object(ui, 'api_request', side_effect=fake_api):
     assert app.session_state['renamed_payload'] == {'title': '新的名称'}
 
 
-@pytest.mark.parametrize("score", [0, 5, 10])
-def test_risk_grid_submits_scaled_scores_and_requires_confirmation(score):
+def test_risk_wizard_retains_answers_and_saves_only_after_result_confirmation():
     script = SETUP + """
+from backend.app.risk_questionnaire import evaluate_answers
 def fake_api(base, method, path, payload=None, **kwargs):
     if path == '/profile/assess':
         st.session_state.assessment_payload = payload
-        return {'profile': dict(st.session_state.profile, confirmed=False),
+        return {'profile': dict(evaluate_answers(payload['risk_answers']), confirmed=False),
                 'missing_fields': [], 'evidence': []}
     if path == '/profile/confirm':
         return dict(payload['profile'], confirmed=True, version=2)
@@ -996,54 +994,77 @@ with patch.object(ui, 'api_request', side_effect=fake_api):
 """
     app = AppTest.from_string(script).run(timeout=15)
     assert not app.exception
-    assert not app.slider
-    assert len(app.radio) == 5
-    assert all(item.options == [str(n) for n in range(11)] for item in app.radio)
-    assert any(item.label == '风险态度' for item in app.expander)
-    next(field for field in app.number_input if field.label == '计划投资时间（个月）').set_value(24)
-    next(field for field in app.number_input if field.label == '最多可接受亏损（%）').set_value(8.0)
-    next(field for field in app.selectbox if field.label == '资金使用需求').set_value('高')
-    next(field for field in app.text_input if field.label == '资金用途或投资目标').set_value('两年后购房')
-    app.radio[1].set_value(score)
-    next(button for button in app.button if button.label == '立即评估').click().run(timeout=15)
-    assert not app.exception
-    assert app.session_state['assessment_payload']['questionnaire']['loss_tolerance'] == score * 10
-    assert app.session_state['assessment_payload']['questionnaire']['financial_capacity'] == 50
-    assert app.session_state['assessment_payload']['horizon_months'] == 24
-    assert app.session_state['assessment_payload']['max_drawdown'] == 0.08
-    assert app.session_state['assessment_payload']['liquidity_need'] == '高'
-    assert app.session_state['assessment_payload']['target'] == '两年后购房'
+    assert len(app.radio) == 1 and app.radio[0].value is None
+    assert not app.text_area and not app.number_input and not app.slider
+    assert next(b for b in app.button if b.label == '上一题').disabled
+    assert next(b for b in app.button if b.label == '下一题').disabled
+    app.radio[0].set_value('A').run(timeout=15)
+    next(b for b in app.button if b.label == '下一题').click().run(timeout=15)
+    app.radio[0].set_value('C').run(timeout=15)
+    next(b for b in app.button if b.label == '上一题').click().run(timeout=15)
+    assert app.radio[0].value == 'A'
+    answers = 'ACABDC CACCB BCCBC CDB'.replace(' ', '')
+    for index, answer in enumerate(answers):
+        assert app.session_state['risk_assessment_index'] == index
+        app.radio[0].set_value(answer).run(timeout=15)
+        if index < 18:
+            next(b for b in app.button if b.label == '下一题').click().run(timeout=15)
+    next(b for b in app.button if b.label == '提交').click().run(timeout=15)
+    assert not app.exception and not app.radio
+    payload = app.session_state['assessment_payload']
+    assert len(payload['risk_answers']) == 19
+    assert 'questionnaire' not in payload and 'horizon_months' not in payload
     assert app.session_state['profile']['confirmed'] is False
-    next(button for button in app.button if button.label == '确认并保存').click().run(timeout=15)
-    assert not app.exception
-    assert app.session_state['profile']['confirmed'] is True
+    assert app.session_state['profile']['investor_category'] == 'C4'
+    next(b for b in app.button if b.label == '确认并保存').click().run(timeout=15)
+    assert not app.exception and app.session_state['profile']['confirmed']
+    assert next(b for b in app.button if b.label == '重新测评').disabled
+    assert 'profile_draft' not in app.session_state
 
 
-def test_risk_adjustment_restores_plan_scores_and_retains_risk_limits():
+def test_risk_adjustment_restores_answers_and_retains_risk_limits():
     script = SETUP + """
-st.session_state.profile.update(single_security_limit=0.1, industry_limit=0.25,
-                                constraints=['不使用杠杆'], confirmed=True)
-st.session_state.questionnaire = {'loss_tolerance': 80}
+from backend.app.risk_questionnaire import evaluate_answers, QUESTIONS
+answers = dict(zip((q.id for q in QUESTIONS), 'ACABDC CACCB BCCBC CDB'.replace(' ', '')))
+if 'risk_fixture_initialized' not in st.session_state:
+    st.session_state.profile.update(evaluate_answers(answers), single_security_limit=0.1,
+        industry_limit=0.25, constraints=['不使用杠杆'], confirmed=True, assessed_on='2026-01-01')
+    st.session_state.risk_fixture_initialized = True
 def fake_api(base, method, path, payload=None, **kwargs):
     if path == '/profile/assess':
-        return {'profile': dict(st.session_state.profile, single_security_limit=0.2,
+        return {'profile': dict(evaluate_answers(payload['risk_answers']), single_security_limit=0.2,
                                industry_limit=0.3, constraints=[], confirmed=False),
                 'missing_fields': [], 'evidence': []}
 with patch.object(ui, 'api_request', side_effect=fake_api):
     ui.page_profile('http://localhost', view='风险调整')
 """
     app = AppTest.from_string(script).run(timeout=15)
-    assert not app.exception
-    assert app.title[0].value == '风险调整'
-    assert app.radio[1].value == 8
-    assert '24 个月' in app.text_area[0].value
-    assert '10% 亏损' in app.text_area[0].value
-    next(button for button in app.button if button.label == '立即调整').click().run(timeout=15)
+    assert not app.exception and app.radio[0].value == 'A'
+    for _ in range(18):
+        next(b for b in app.button if b.label == '下一题').click().run(timeout=15)
+    assert app.radio[0].value == 'B'
+    next(b for b in app.button if b.label == '提交').click().run(timeout=15)
     assert not app.exception
     assert app.session_state['profile']['single_security_limit'] == 0.1
     assert app.session_state['profile']['industry_limit'] == 0.25
     assert app.session_state['profile']['constraints'] == ['不使用杠杆']
     assert app.session_state['profile']['confirmed'] is False
+
+
+def test_risk_wizard_does_not_submit_missing_answers_or_leak_answers_on_logout():
+    script = SETUP + """
+with patch.object(ui, 'api_request') as mocked:
+    ui.page_profile('http://localhost')
+st.button('模拟退出', on_click=ui.reset_user_session)
+"""
+    app = AppTest.from_string(script).run(timeout=15)
+    app.radio[0].set_value('B').run(timeout=15)
+    app.session_state['risk_assessment_index'] = 18
+    app.run(timeout=15)
+    assert next(b for b in app.button if b.label == '提交').disabled
+    next(b for b in app.button if b.label == '模拟退出').click().run(timeout=15)
+    assert not app.exception
+    assert app.session_state['risk_assessment_answers'] == {}
 
 
 def test_home_explains_workflow_and_opens_research_page():

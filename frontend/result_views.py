@@ -2,8 +2,6 @@
 from __future__ import annotations
 from functools import partial
 from typing import Any
-import altair as alt
-import pandas as pd
 import streamlit as st
 from frontend.answer_report import answer_images, build_answer_pdf, chart_groups, cited_facts
 from frontend.presentation import (plain_language, render_conclusion_panel, render_logic_chain, render_source_trace, source_trace_rows, TOPIC_LABELS)
@@ -20,6 +18,8 @@ def render_answer_charts(advice, *, key="answer"):
     if not groups:
         st.caption("同口径的数值资料不足，暂不绘制趋势或对比图。")
         return
+    import altair as alt
+    import pandas as pd
     for index, group in enumerate(groups[:2]):
         frame = pd.DataFrame(group["rows"]).rename(columns={"name": "标的", "value": "数值", "date": "期间"})
         st.markdown("**" + group["title"] + "**")
@@ -119,7 +119,7 @@ def answer_export_payload(advice: dict[str, Any], images: list, question: str = 
         ("分析结论", [advice.get("conclusion") or "资料不足，暂未形成结论。"]),
         ("风险结论", [advice.get("risk_conclusion") or "请结合资料完整性及个人承受能力进一步核实。", *notices, compliance.get("reason"), compliance.get("risk_notice")]),
         ("需要注意", [*advice.get("risks", []), *[item.get("message") for item in advice.get("cross_validation", {}).get("issues", [])], *compliance.get("required_disclosures", [])]),
-        ("接下来可以做", advice.get("next_steps", [])),
+        ("后续研究建议", advice.get("next_steps", [])),
         ("与您的投资偏好是否匹配", [advice.get("user_fit")]),
     ]
     for result in advice.get("agent_results", []):

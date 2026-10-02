@@ -8,8 +8,6 @@ from datetime import datetime
 from time import monotonic
 from typing import Any, Callable
 
-import altair as alt
-import pandas as pd
 import streamlit as st
 from frontend.financial_view import fact_unit
 from streamlit.runtime.scriptrunner import get_script_run_ctx
@@ -244,6 +242,7 @@ def known_entities(api_base: str, direction: str) -> dict[str, str]:
 
 
 def render_table(rows: list[dict], direction: str) -> None:
+    import pandas as pd
     records = []
     for row in rows:
         record = {"名称": row["name"]}
@@ -259,6 +258,8 @@ def render_table(rows: list[dict], direction: str) -> None:
 
 
 def render_comparison(rows: list[dict], direction: str) -> None:
+    import altair as alt
+    import pandas as pd
     field = "fund_size" if direction == "fund" else "conversion_premium_rate" if direction == "convertible" else "change"
     points = []
     periods = set()
@@ -293,6 +294,8 @@ def render_comparison(rows: list[dict], direction: str) -> None:
 
 
 def render_history(facts: list[dict]) -> None:
+    import altair as alt
+    import pandas as pd
     values, conflicts = {}, set()
     metric = None
     for fact in facts:
@@ -482,6 +485,7 @@ def _render_research_board(api_base: str, page_direction: str, fetch: Callable) 
                     records = [{"指标": str(fact.get("source_field")) if re.search(r"[\u4e00-\u9fff]", str(fact.get("source_field") or "")) else LABELS.get(fact["field"], "其他指标"), "数值": format_fact(fact), "统计期": data_period(fact)}
                                for fact in macro if fact.get("field") in {"cpi", "ppi", "pmi", "social_financing", "interest_rate", "gdp"}][:12]
                     if records:
+                        import pandas as pd
                         st.dataframe(pd.DataFrame(records), hide_index=True, width="stretch", height="content")
                     else:
                         st.caption("供应商本次未提供可展示的宏观数值。")

@@ -104,12 +104,16 @@ async def run(output: Path):
         FactRecord(fact_id="SMOKE-" + field, entity="合成测试市场", field=field, value=value,
                    snapshot_time=datetime.now(timezone.utc), source_id="SYNTHETIC_SMOKE_ONLY", quality=0.95)
         for field, value in {"growth_score": 55, "inflation_score": 50, "liquidity_score": 60,
-                             "policy_score": 55, "risk_appetite_score": 50}.items()
+                             "policy_score": 55, "risk_appetite_score": 50,
+                             "prosperity_score": 55, "valuation_score": 50,
+                             "capital_flow_score": 55, "crowding_score": 45}.items()
     ]
     calls_before = len(llm.calls)
+    analysis_started = perf_counter()
     result = await coordinator.run(request(
         "请只根据提供的合成宏观评分分析这个测试市场的环境，解释各维度作用，"
         "不要将其描述为真实行情，不要推荐具体产品或作收益承诺。", facts=facts))
+    analysis_seconds = round(perf_counter() - analysis_started, 3)
     record("analysis_pipeline",
            result.intent == "market_analysis" and len(result.agent_results) == 2
            and all(item.details.get("engine") == "third_party_llm" for item in result.agent_results)
@@ -118,7 +122,8 @@ async def run(output: Path):
            {"intent": result.intent, "compliance": result.compliance.model_dump(mode="json"),
             "evidence": result.evidence,
             "agent_results": [item.model_dump(mode="json") for item in result.agent_results],
-            "logical_calls": len(llm.calls) - calls_before})
+            "logical_calls": len(llm.calls) - calls_before,
+            "full_analysis_seconds": analysis_seconds, "within_3_seconds": analysis_seconds <= 3})
     report["calls"] = llm.calls
     report["passed"] = all(item["passed"] for item in report["checks"])
     output.parent.mkdir(parents=True, exist_ok=True)

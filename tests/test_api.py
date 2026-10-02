@@ -57,17 +57,18 @@ def test_data_fetch_explains_missing_provider_configuration(monkeypatch) -> None
     assert response.json()["facts"] == []
 
 
-def test_profile_assessment_and_confirmation_are_explicit_two_steps() -> None:
+def test_profile_assessment_and_confirmation_are_explicit_two_steps(risk_questionnaire_payload) -> None:
     """画像评估不能绕过用户确认，确认后版本必须向前推进。"""
     assessment = client.post(
         "/api/v1/profile/assess",
-        json={"user_id": "u-profile-api", "narrative": "我 2 年后买房，最多接受 8% 回撤"},
+        json={"user_id": "u-profile-api", **risk_questionnaire_payload},
     )
 
     assert assessment.status_code == 200
     draft = assessment.json()["profile"]
     assert draft["confirmed"] is False
-    assert draft["horizon_months"] == 24
+    assert draft["horizon_months"] is None
+    assert draft["investment_horizon_label"] == "1到5年"
     confirmed = client.post("/api/v1/profile/confirm", json={"profile": draft})
     assert confirmed.status_code == 200
     assert confirmed.json()["confirmed"] is True

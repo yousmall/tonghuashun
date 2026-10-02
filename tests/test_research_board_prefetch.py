@@ -45,11 +45,13 @@ def test_login_starts_all_default_boards_without_waiting_and_pages_reuse_them(st
     def transport(request):
         requests.append(request)
         assert gate.wait(5), "Login must return before data loading completes"
+        if request.method == "GET":
+            return httpx.Response(200, json={"profile": {"confirmed": False}} if request.url.path.endswith("/profile") else [])
         import json
         data = json.loads(request.content)
         return httpx.Response(200, json=result(data["direction"], data["target"]))
 
-    with httpx.Client(transport=httpx.MockTransport(transport)) as client, ThreadPoolExecutor(max_workers=5) as executor:
+    with httpx.Client(transport=httpx.MockTransport(transport)) as client, ThreadPoolExecutor(max_workers=8) as executor:
         monkeypatch.setattr(ui, "backend_http_client", lambda base: client)
         monkeypatch.setattr(board, "board_prefetch_executor", lambda: executor)
         try:
@@ -65,10 +67,12 @@ def test_login_starts_all_default_boards_without_waiting_and_pages_reuse_them(st
         for base, direction, target in list(pending):
             data = board.load_board(base, direction, target, lambda *args: pytest.fail("Duplicate page fetch"))
             assert data["status"] == "ok"
-        assert len(requests) == 5
+        for future in state["account_prefetch"].values():
+            future.result(timeout=5)
+        assert len(requests) == 8
         assert all(request.headers["Authorization"] == "Bearer customer-token" for request in requests)
         import json
-        assert {(json.loads(request.content)["direction"], json.loads(request.content)["target"]) for request in requests} == {
+        assert {(json.loads(request.content)["direction"], json.loads(request.content)["target"]) for request in requests if request.method == "POST"} == {
             ("market", None), ("industry", None), ("stock", "600519"), ("fund", None), ("convertible", None)}
         assert state["research_board_prefetch"] == {}
         assert not state.get("facts") and not state["conversation"]
@@ -134,6 +138,8 @@ def test_login_form_prefetches_before_user_opens_investment_questions(monkeypatc
     requests = []
 
     def transport(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"profile": {"confirmed": False}} if request.url.path.endswith("/profile") else [])
         data = json.loads(request.content)
         requests.append(data)
         return httpx.Response(200, json=result(data["direction"], data["target"]))

@@ -77,13 +77,13 @@ hr, [data-testid="stDivider"] hr { border-color: var(--wence-line-soft); }
 
 /* 侧栏品牌区 */
 .side-brand {
-    display: flex; align-items: center; gap: .68rem;
-    padding: .15rem .35rem .7rem;
+    display: flex; align-items: center;
+    container-type: inline-size;
+    padding: .15rem 0 .7rem;
     margin-bottom: .35rem;
     border-bottom: 1px solid var(--wence-line-soft);
 }
-.side-brand .brand-image { display: block; width: 124px; height: 124px; object-fit: contain; mix-blend-mode: multiply; }
-.side-brand .tag { margin-left: auto; font-size: .78rem; color: var(--wence-faint); letter-spacing: .04em; }
+.side-brand .brand-lockup { --logo-size: 100cqw; }
 
 /* 侧栏分组标题 */
 .side-label {
@@ -118,58 +118,6 @@ hr, [data-testid="stDivider"] hr { border-color: var(--wence-line-soft); }
     min-height: 2.25rem; font-size: .92rem;
 }
 
-/* 风险评分：0 是清空入口，1—10 是十个格子，数字显示在格子上方。
- * 保留原生 radio 输入及键盘操作，只替换它的视觉样式。 */
-.st-key-risk-score-grid [data-testid="stRadioGroup"] {
-    display: grid;
-    grid-template-columns: 2rem repeat(10, minmax(0, 1fr));
-    gap: .3rem;
-    width: 100%;
-}
-.st-key-risk-score-grid [data-testid="stRadioOption"] {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    margin: 0;
-    gap: .3rem;
-    padding: .15rem 0;
-    min-width: 0;
-    cursor: pointer;
-}
-.st-key-risk-score-grid [data-testid="stRadioOption"] > div > div > div:first-child { display: none; }
-.st-key-risk-score-grid [data-testid="stRadioOption"]::after {
-    content: "";
-    display: block;
-    width: 100%;
-    height: 1.6rem;
-    background: #fff;
-    border: 1px solid var(--wence-brand-line);
-    border-radius: 3px;
-}
-.st-key-risk-score-grid [data-testid="stRadioOption"]:first-child::after {
-    content: "○";
-    display: grid;
-    place-items: center;
-    background: transparent;
-    border-color: transparent;
-    color: var(--wence-muted);
-}
-.st-key-risk-score-grid [data-testid="stRadioOption"]:not(:first-child):has(input:checked)::after,
-.st-key-risk-score-grid [data-testid="stRadioOption"]:not(:first-child):has(~ [data-testid="stRadioOption"] input:checked)::after {
-    background: var(--wence-brand);
-    border-color: var(--wence-brand);
-}
-.st-key-risk-score-grid [data-testid="stRadioOption"]:has(input:checked) {
-    color: var(--wence-brand-strong);
-    font-weight: 700;
-}
-.st-key-risk-score-grid [data-testid="stRadioOption"]:first-child:has(input:checked)::after { content: "●"; }
-.st-key-risk-score-grid [data-testid="stRadioOption"]:hover::after,
-.st-key-risk-score-grid [data-testid="stRadioOption"]:has(input:focus-visible)::after {
-    outline: 2px solid var(--wence-brand);
-    outline-offset: 2px;
-}
-
 /* 最近咨询标题可收起；紧凑样式与侧栏分组保持一致。 */
 [data-testid="stSidebar"] .st-key-recent-chats [data-testid="stExpander"],
 [data-testid="stSidebar"] [data-testid="stExpander"].st-key-recent-chats {
@@ -192,10 +140,12 @@ hr, [data-testid="stDivider"] hr { border-color: var(--wence-line-soft); }
     margin: .1rem 0 .6rem;
 }
 .st-key-recent-chat-list [data-testid="stVerticalBlock"] { gap: .15rem; }
-[data-testid="stSidebar"] .st-key-recent-chat-list .stButton > button {
+[data-testid="stSidebar"] .st-key-recent-chat-list [data-testid="stButton"] button {
     min-height: 2.35rem;
     justify-content: flex-start;
     text-align: left;
+    width: 100%;
+    overflow: hidden;
     padding: .38rem .65rem;
     border: 1px solid transparent;
     border-radius: 9px;
@@ -204,32 +154,49 @@ hr, [data-testid="stDivider"] hr { border-color: var(--wence-line-soft); }
     font-weight: 500;
     color: var(--wence-ink-2);
 }
-[data-testid="stSidebar"] .st-key-recent-chat-list .stButton > button p {
+[data-testid="stSidebar"] .st-key-recent-chat-list [data-testid="stButton"] button p {
     display: block;
     max-width: 100%;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    text-align: left;
+    margin: 0;
     font-size: .91rem;
 }
-[data-testid="stSidebar"] .st-key-recent-chat-list .stButton > button > div,
-[data-testid="stSidebar"] .st-key-recent-chat-list .stButton > button [data-testid="stMarkdownContainer"] {
+[data-testid="stSidebar"] .st-key-recent-chat-list [data-testid="stButton"] button > div {
+    min-width: 0;
+    overflow: hidden;
+    justify-content: flex-start;
+    flex: 1;
+}
+[data-testid="stSidebar"] .st-key-recent-chat-list button [data-has-shortcut] {
+    display: flex;
+    justify-content: flex-start;
+    width: 100%;
     min-width: 0;
     overflow: hidden;
 }
+[data-testid="stSidebar"] .st-key-recent-chat-list [data-testid="stMarkdownContainer"] {
+    min-width: 0;
+    flex: 1;
+    overflow: hidden;
+    text-align: left;
+}
+[data-testid="stSidebar"] .st-key-recent-chat-list [data-testid="stIconMaterial"] { flex-shrink: 0; }
 .st-key-confirmed-profile-stamp { display: flex; justify-content: flex-end; }
 .st-key-confirmed-profile-stamp [data-testid="stImage"] { opacity: .72; }
-.st-key-recent-chat-list .stButton > button[kind="tertiary"]:hover {
+.st-key-recent-chat-list [data-testid="stButton"] button[kind="tertiary"]:hover {
     background: #eceef2;
     color: var(--wence-ink);
 }
-.st-key-recent-chat-list .stButton > button[kind="primary"] {
+.st-key-recent-chat-list [data-testid="stButton"] button[kind="primary"] {
     background: var(--wence-brand-tint);
     border-color: var(--wence-brand-line);
     color: var(--wence-brand-strong);
     font-weight: 650;
 }
-.st-key-recent-chat-list .stButton > button[kind="primary"]:hover {
+.st-key-recent-chat-list [data-testid="stButton"] button[kind="primary"]:hover {
     background: #f6e3e7;
     border-color: var(--wence-brand-line);
     box-shadow: none;
@@ -337,7 +304,14 @@ button:focus-visible, input:focus-visible, textarea:focus-visible,
 [data-testid="stTabs"] [data-baseweb="tab-border"] { background: transparent; }
 
 /* 聊天输入 */
+/* 与研究面板内的图表卡片对齐：主区两侧 2.4rem，面板内侧再各 1.25rem。 */
+@media (min-width: 901px) {
+    [data-testid="stBottomBlockContainer"] { padding-inline: 2.4rem; }
+}
 [data-testid="stChatInput"] {
+    width: 100%;
+    max-width: min(calc(1180px - 7.3rem), calc(100% - 2.5rem));
+    margin-inline: auto;
     background: #fff;
     border: 1px solid #dde1e7;
     border-radius: 12px;
@@ -350,6 +324,12 @@ button:focus-visible, input:focus-visible, textarea:focus-visible,
 [data-testid="stChatInput"] textarea::placeholder { color: var(--wence-faint); }
 [data-testid="stChatInputSubmitButton"] { color: var(--wence-brand); }
 [data-testid="stChatInputSubmitButton"]:hover { background: var(--wence-brand-tint); }
+@media (max-width: 900px) {
+    [data-testid="stChatInput"] { max-width: calc(100% - 2.9rem); }
+}
+@media (max-width: 640px) {
+    [data-testid="stChatInput"] { max-width: calc(100% - 1.5rem); }
+}
 
 /* 提示与徽标 */
 [data-testid="stAlert"] { border-radius: 11px; border: 1px solid var(--wence-line); }
@@ -393,9 +373,24 @@ button:focus-visible, input:focus-visible, textarea:focus-visible,
 .topbar .chip .dot { width: 6px; height: 6px; border-radius: 50%; background: #18794e; }
 .topbar .chip.live .dot { background: var(--wence-brand); }
 
-/* 品牌行（登录页） */
-.brand { display: flex; align-items: center; gap: .7rem; margin-bottom: 1.3rem; }
-.brand .brand-image { display: block; width: 138px; height: 138px; object-fit: contain; mix-blend-mode: multiply; }
+/* 品牌行（登录页）：四个汉字约占四个字宽，图标按同一标题字号显示为正方形。 */
+.brand { display: flex; align-items: center; gap: .7rem; margin-bottom: 1.3rem; font-size: clamp(2.1rem, 4.2vw, 3.3rem); }
+.brand .brand-lockup { --logo-size: 3.92em; }
+.brand-lockup { --logo-size: 138px; position: relative; flex: none; width: var(--logo-size); height: var(--logo-size); }
+.brand-lockup .brand-symbol, .brand-lockup .brand-wordmark {
+    position: absolute; left: 0; display: block; width: 100%; overflow: hidden;
+    background-image: var(--brand-image); background-repeat: no-repeat; mix-blend-mode: multiply;
+}
+.brand-lockup .brand-symbol {
+    top: 0; height: 75%;
+    background-size: 145% auto;
+    background-position: calc(var(--logo-size) * -.26) calc(var(--logo-size) * -.215);
+}
+.brand-lockup .brand-wordmark {
+    top: 75%; height: 25%;
+    background-size: 166% auto;
+    background-position: calc(var(--logo-size) * -.328) calc(var(--logo-size) * -1.15);
+}
 .brand-note { margin-left: auto; color: var(--wence-muted); font-size: .8rem; }
 
 /* 首页标题区 */
@@ -693,4 +688,51 @@ button:focus-visible, input:focus-visible, textarea:focus-visible,
 @media (max-width: 640px) {
     :is(.st-key-research-board-market, .st-key-research-board-industry,
         .st-key-research-board-stock, .st-key-research-board-fund, .st-key-research-board-convertible) { padding: .8rem; }
+}
+/* 投资偏好：所有问题和翻页操作放在同一边框内。 */
+.st-key-risk-assessment-box {
+    max-width: 860px; margin: 0 auto 24px; background: #fff;
+    border: 1px solid #d9dfe4 !important; border-radius: 14px; overflow: hidden;
+    padding: 24px 30px !important;
+}
+.st-key-risk-assessment-box, .st-key-risk-assessment-box p, .st-key-risk-assessment-box span,
+.st-key-risk-assessment-box dt, .st-key-risk-assessment-box dd {
+    font-family:"Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif !important;
+}
+.risk-box-heading { text-align:center; font-size:24px; font-weight:700; color:#16212a; margin-bottom:16px; }
+.risk-question-counter { text-align:center; color:#737b83; font-size:18px; margin:8px 0 24px; }
+.st-key-risk-question-content { min-height:420px; }
+.st-key-risk-question-content h3 { font-size:20px !important; line-height:1.8; margin-bottom:20px; }
+.st-key-risk-assessment-box [data-testid="stProgressBarTrack"] > div { background:#ed1c0a; }
+.st-key-risk-question-content [role="radiogroup"] { gap:10px; }
+.st-key-risk-question-content [role="radiogroup"] label { padding:13px 14px; border-radius:4px; width:100%; align-items:flex-start; }
+.st-key-risk-question-content [role="radiogroup"] label:has(input:checked) { background:#edf0f2; }
+.st-key-risk-question-content [role="radiogroup"] label p { font-size:17px; line-height:1.7; color:#616a70; }
+.st-key-risk-question-content [data-testid="stRadioOption"][data-selected="true"] > div > div > div:first-child {
+    border-color:#ed1c0a !important; background:#ed1c0a !important;
+}
+.st-key-risk-assessment-box button[kind="primary"] { background:#ed1c0a; border-color:#ed1c0a; color:#fff; min-height:48px; }
+.st-key-risk-assessment-box button[kind="primary"]:disabled { opacity:.45; }
+.st-key-risk_previous button { color:#e52317; min-height:48px; border:1px solid #d9dfe4; }
+.risk-result-card { background:#f4f8fb; border-radius:12px; padding:30px 24px 10px; color:#182128; }
+.risk-result-caption { color:#7a838b; font-size:18px; }
+.risk-result-card h2 { font-size:52px !important; font-weight:700; padding:8px 0 0 !important; margin:4px 0 8px !important; line-height:1.2; }
+.risk-result-category { color:#747e85; font-size:16px; margin-bottom:20px; }
+.risk-result-steps { display:flex; align-items:center; gap:8px; margin:20px 0 24px; }
+.risk-step { border:1px solid #bfc7ce; border-radius:50%; width:34px; height:34px; display:inline-flex; align-items:center; justify-content:center; color:#9ca5ad; }
+.risk-step.active { background:#fa743b; color:#fff; border-color:#fa743b; box-shadow:0 0 0 7px #fee3d9; }
+.risk-step-line { width:12px; height:3px; background:#c4cbd0; }
+.risk-result-validity { color:#7a838b; margin-bottom:32px; }
+.risk-result-card dl > div { display:flex; flex-wrap:wrap; margin-bottom:16px; gap:6px; line-height:1.8; }
+.risk-result-card dt { color:#79838b; }
+.risk-result-card dd { margin:0; }
+.st-key-risk_matching_rules button { color:#fa743b !important; text-align:left; border:0; background:transparent !important; }
+@media (max-width:640px) {
+    .st-key-risk-assessment-box { padding:16px 14px !important; }
+    .st-key-risk-question-content { min-height:360px; }
+    .st-key-risk-question-content h3 { font-size:18px !important; }
+    .st-key-risk-question-content [role="radiogroup"] label { padding:10px 5px; }
+    .st-key-risk-question-content [role="radiogroup"] label p { font-size:16px; }
+    .risk-result-card { padding:22px 16px 8px; }
+    .risk-result-card h2 { font-size:42px !important; }
 }

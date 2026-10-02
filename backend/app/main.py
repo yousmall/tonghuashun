@@ -20,10 +20,11 @@ from contextlib import asynccontextmanager
 from contextlib import suppress
 from datetime import date, datetime, timedelta, timezone
 from time import perf_counter
+from threading import Event
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
 from fastapi import Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from dotenv import load_dotenv
 
 from backend.app.agents.coordinator import (
@@ -33,12 +34,14 @@ from backend.app.agents.coordinator import (
 )
 from backend.app.agents.llm_agents import LLMConfig, OpenAICompatibleLLM, make_investment_agents
 from backend.app.semantic import SemanticService
+from backend.app.research_routing import DIRECTION_FOR_INTENT
 from backend.app.data_provider import IwencaiSkillHubProvider
 from backend.app.auth import TokenError, create_access_token, decode_access_token, hash_password, verify_password
 from backend.app.database import (
     Database,
     DatabaseUnavailable,
     ProfileVersionConflict,
+    ProfileDailyLimit,
     UsernameExists,
     WatchlistCapacityExceeded,
     WatchlistItemExists,
@@ -75,21 +78,25 @@ from backend.app.services import (
 )
 from backend.app.models.schemas import DataOverviewRequest, DataOverviewResponse, ComparisonRequest, ComparisonResponse, SnapshotOptions
 from backend.app.services.comparison import fetch_snapshots
+from backend.app.risk_questionnaire import assessment_is_current
 from backend.app.services.overview_cache import OverviewCache
 overview_cache = OverviewCache()
 from backend.app.services.admin import consultation_metadata
 from backend.app.services.call_tracking import calling_user_id
+from backend.app.services.monitoring import RequestMetricsMiddleware
 from backend.app.session_pool import (
     SessionCapacityExceeded,
     SessionLeaseExpired,
     SessionThreadPool,
 )
+from backend.app.wechat_login import WechatLogin
 
 
 # 从本地 .env 加载可选外部服务配置；生产环境中已有的环境变量优先。
 load_dotenv()
 database = Database.from_env()
 session_thread_pool = SessionThreadPool.from_env()
+wechat_login = WechatLogin.from_env()
 
 
 async def reap_idle_sessions() -> None:
@@ -105,11 +112,22 @@ async def reap_idle_sessions() -> None:
 async def lifespan(_: FastAPI):
     """准备数据表并启动空闲会话清理任务。"""
 
-    database.initialize()
+    await asyncio.to_thread(database.initialize, backfill=False)
+    stop_backfill = Event()
+
+    async def backfill_history():
+        try:
+            await asyncio.to_thread(database.backfill_consultations, stop_backfill)
+        except Exception:
+            logging.getLogger(__name__).warning("历史咨询统计补齐失败，可在下次启动时重试")
+
+    history_backfill = asyncio.create_task(backfill_history())
     reaper = asyncio.create_task(reap_idle_sessions())
     try:
         yield
     finally:
+        stop_backfill.set()
+        await history_backfill
         reaper.cancel()
         with suppress(asyncio.CancelledError):
             await reaper
@@ -280,18 +298,7 @@ def auth_response_for(user: dict[str, object]) -> AuthResponse:
         raise
 
 
-@app.middleware("http")
-async def observe_requests(request: Request, call_next):
-    """记录单进程请求量、失败率和延迟分位数，不保存请求正文或敏感信息。"""
-
-    started = perf_counter()
-    status_code = 500
-    try:
-        response = await call_next(request)
-        status_code = response.status_code
-        return response
-    finally:
-        service_metrics.record(status_code, (perf_counter() - started) * 1_000)
+app.add_middleware(RequestMetricsMiddleware, metrics=service_metrics)
 
 
 @app.get("/api/v1/health", tags=["system"])
@@ -343,6 +350,60 @@ def login(credentials: Credentials) -> AuthResponse:
         raise HTTPException(status_code=401, detail="账号或密码错误")
     user.pop("password_hash", None)
     return auth_response_for(user)
+
+
+@app.post("/api/v1/auth/wechat/start", tags=["auth"])
+def start_wechat_login() -> dict[str, str]:
+    """为当前浏览器签发只在服务端保存的扫码状态和独立轮询凭据。"""
+    try:
+        database.require_ready()
+        return wechat_login.start()
+    except (ValueError, DatabaseUnavailable) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/auth/wechat/callback", response_class=HTMLResponse, tags=["auth"])
+def wechat_login_callback(state: str = Query(max_length=128), code: str = Query(default="", max_length=512)) -> HTMLResponse:
+    """微信回调只完成身份绑定；登录令牌由原浏览器凭轮询密钥领取。"""
+    if not wechat_login.begin_callback(state):
+        raise HTTPException(status_code=400, detail="扫码请求已过期或无效，请返回登录页重试")
+    if not code:
+        wechat_login.finish_callback(state, error="微信授权已取消，请重新扫码")
+        message = "微信授权已取消，请返回登录页重试。"
+    else:
+        try:
+            openid = wechat_login.exchange_code(code)
+            user = database.get_or_create_wechat_user(openid)
+            wechat_login.finish_callback(state, user_id=int(user["id"]))
+            message = "微信验证成功，请返回登录页。"
+        except Exception:
+            # httpx 异常可能包含带 AppSecret 的请求 URL，日志只记录固定文案。
+            logging.getLogger(__name__).warning("微信登录回调失败")
+            wechat_login.finish_callback(state, error="微信登录未完成，请重新扫码")
+            message = "微信登录未完成，请返回登录页重试。"
+    return HTMLResponse(f"<html><meta charset='utf-8'><body><p>{message}</p></body></html>",
+                        headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/v1/auth/wechat/poll", tags=["auth"])
+def poll_wechat_login(poll_token: str = Body(embed=True, min_length=32, max_length=128)) -> dict[str, object]:
+    """一次性领取普通账号会话；二维码中的 state 不能用于领取令牌。"""
+    status, user_id, error = wechat_login.poll(poll_token)
+    if status == "expired":
+        raise HTTPException(status_code=410, detail="二维码已过期，请重新扫码")
+    if status == "failed":
+        return {"status": "failed", "detail": error}
+    if status == "ready" and user_id is not None:
+        try:
+            user = database.get_user(user_id)
+            if user is None or user.get("role") != "user":
+                raise HTTPException(status_code=403, detail="该账号不能使用微信登录")
+            return {"status": "ready", "auth": auth_response_for(user).model_dump(mode="json")}
+        except DatabaseUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"status": "pending"}
 
 
 @app.get("/api/v1/auth/me", response_model=UserSummary, tags=["auth"])
@@ -641,7 +702,12 @@ async def assess_user_profile(request: ProfileAssessmentRequest, user: dict[str,
     前端应展示提取证据和缺失字段，请用户在下一步核对并确认。
     """
 
-    return await assess_profile(request, coordinator.semantic)
+    if user is not None:
+        request = request.model_copy(update={"user_id": str(user["id"])})
+    try:
+        return await assess_profile(request, coordinator.semantic)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.post("/api/v1/profile/confirm", response_model=UserProfile, tags=["profile"])
@@ -655,12 +721,17 @@ async def confirm_user_profile(
     不必重新填写问卷；版本号用于留下审计边界。
     """
 
+    if not request.profile.questionnaire_version:
+        raise HTTPException(status_code=422, detail="请完成全部19道题后再确认风险测评。")
     if user is not None:
         # 画像归属以鉴权上下文为准，不接受前端声明的 user_id。
         request = request.model_copy(
             update={"profile": request.profile.model_copy(update={"user_id": str(user["id"])})}
         )
-    confirmed = confirm_profile(request.profile)
+    try:
+        confirmed = confirm_profile(request.profile)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     if user is not None:
         future = session_thread_pool.submit(
             str(user["_session_id"]),
@@ -672,7 +743,7 @@ async def confirm_user_profile(
         )
         try:
             await asyncio.wrap_future(future)
-        except ProfileVersionConflict as exc:
+        except (ProfileVersionConflict, ProfileDailyLimit) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
     return confirmed
 
@@ -710,8 +781,22 @@ async def analyze_portfolio(
     仍为 200，但 ``compliance.status`` 为 ``BLOCK`` 且不含投资建议。
     """
 
+    started = perf_counter()
+    stage_started = started
+    stage = None
+    timings: dict[str, float] = {}
+    outcome = "ERROR"
+
+    def report(next_stage: str) -> None:
+        nonlocal stage, stage_started
+        now = perf_counter()
+        if stage is not None:
+            timings[stage] = round(timings.get(stage, 0) + (now - stage_started) * 1_000, 2)
+        stage, stage_started = next_stage, now
+        _report_progress(next_stage)
+
     try:
-        _report_progress("核对投资偏好")
+        report("核对投资偏好")
         if user:
             stored = await asyncio.wrap_future(session_thread_pool.submit(
                 str(user["_session_id"]), database.get_profile, int(user["id"]),
@@ -724,11 +809,15 @@ async def analyze_portfolio(
                 **stored["payload"], "version": stored["version"], "user_id": str(user["id"]),
             })
             request = request.model_copy(update={"profile": profile})
-        _report_progress("理解问题")
+        if request.profile.questionnaire_version and not assessment_is_current(request.profile):
+            raise HTTPException(status_code=409, detail="风险测评未确认或已过期，请重新完成风险测评后再分析。")
+        report("理解问题")
         understanding = await coordinator.understand_request(request)
         # 请求风险和意图在一次模型调用中完成，风险请求不访问外部数据服务。
-        fetch_intent = Intent.UNKNOWN if understanding.risk_rules else understanding.intent
-        _report_progress("查找资料")
+        wrong_direction = bool(request.research_direction and
+                               DIRECTION_FOR_INTENT.get(understanding.intent) != request.research_direction)
+        fetch_intent = Intent.UNKNOWN if understanding.risk_rules or wrong_direction else understanding.intent
+        report("查找资料")
         prepared_request, acquisition = await research_pipeline.prepare(
             request,
             fetch_intent,
@@ -738,7 +827,7 @@ async def analyze_portfolio(
         model_slice: dict[str, object] = {}
         advice = await coordinator.run(
             prepared_request, understanding=understanding, metrics_sink=model_slice,
-            progress_sink=_report_progress,
+            progress_sink=report,
         )
         # 指标属于本次请求；提前拦截时保持为零，不读取共享协调器状态。
         acquisition = acquisition.model_copy(
@@ -760,7 +849,7 @@ async def analyze_portfolio(
             }
         )
         if user:
-            _report_progress("保存对话")
+            report("保存对话")
             # 历史记录只保留展示所需的轻量摘要：完整证据包可达数 MB，会撑大
             # messages 行宽并让列表/详情查询触发数据库排序内存告警。
             completed_payload = completed_advice.model_dump(mode="json")
@@ -777,8 +866,10 @@ async def analyze_portfolio(
                 summarise_advice(completed_payload, used_fact_ids_of(completed_payload)),
             )
             await asyncio.wrap_future(future)
-        _report_progress("已完成")
-        return completed_advice
+        report("已完成")
+        timings["total"] = round((perf_counter() - started) * 1_000, 2)
+        outcome = completed_advice.compliance.status.value
+        return completed_advice.model_copy(update={"timings_ms": timings})
     except DatabaseUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except HTTPException:
@@ -787,6 +878,8 @@ async def analyze_portfolio(
         # 不暴露异常细节（可能包含数据源地址或内部实现），同时保留服务端日志入口。
         # 当前本地版未配置日志器；正式环境应记录 trace_id、异常类型与脱敏上下文。
         raise HTTPException(status_code=500, detail="组合诊断服务暂时不可用，请稍后重试。") from exc
+    finally:
+        service_metrics.record_analysis((perf_counter() - started) * 1_000, outcome)
 
 
 @app.post("/api/v1/portfolio/analyze/stream", tags=["advice"])
@@ -819,6 +912,8 @@ async def stream_portfolio_analysis(
         finally:
             if not task.done():
                 task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
 
     return StreamingResponse(
         events(), media_type="application/x-ndjson",

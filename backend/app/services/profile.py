@@ -8,6 +8,9 @@
 from __future__ import annotations
 
 from backend.app.semantic import SemanticService
+from backend.app.risk_questionnaire import (
+    QUESTIONNAIRE_VERSION, QUESTIONS, SCORING_NOTICE, answer_issues, evaluate_answers,
+)
 
 from backend.app.models import (
     ProfileAssessment,
@@ -38,6 +41,24 @@ async def assess_profile(request: ProfileAssessmentRequest, semantic: SemanticSe
     问卷必须五项齐全才计算加权风险分；部分答题时保留已有线索并明确列出缺失项，
     以免用不完整信息给出看似精确的适当性结论。
     """
+    if request.questionnaire_version is not None or request.risk_answers:
+        if request.questionnaire_version != QUESTIONNAIRE_VERSION:
+            raise ValueError("问卷版本已更新，请刷新后重新测评。")
+        missing = [q.id for q in QUESTIONS if q.id not in request.risk_answers]
+        issues = answer_issues(request.risk_answers)
+        if missing or issues:
+            return ProfileAssessment(
+                profile=UserProfile(user_id=request.user_id, questionnaire_version=QUESTIONNAIRE_VERSION,
+                                    risk_answers=request.risk_answers),
+                missing_fields=missing + (["answer_consistency"] if issues else []),
+                evidence=issues or ["请完成全部19道题后再提交。"],
+            )
+        values = evaluate_answers(request.risk_answers)
+        # 新题目不收集精确收益率、回撤百分比和投资月数；不从定性选项猜测。
+        profile = UserProfile(user_id=request.user_id, confirmed=False, **values)
+        return ProfileAssessment(profile=profile, evidence=[SCORING_NOTICE, "已按19题答案计算风险等级并记录投资品种和期限。"])
+
+    # 旧 API 保留兼容；新界面只提交逐题答案。
     narrative_patch, evidence = await (semantic or SemanticService()).extract_profile(request.narrative or "")
     missing = [name for name in RISK_WEIGHTS if name not in request.questionnaire]
     score = None
@@ -87,4 +108,13 @@ def confirm_profile(profile: UserProfile) -> UserProfile:
     API 层不持久化用户档案，因此调用方需要提交上一版本；真实部署时应在事务中
     校验版本号并写入数据库，防止两个终端互相覆盖。
     """
+    if profile.questionnaire_version is not None or profile.risk_answers:
+        if profile.questionnaire_version != QUESTIONNAIRE_VERSION:
+            raise ValueError("问卷版本已更新，请重新测评。")
+        # 客户端不能修改分数、等级、有效期或把未答完的草稿直接确认。
+        values = evaluate_answers(profile.risk_answers)
+        values.update(horizon_months=None, max_drawdown=None, liquidity_need=None,
+                      investment_experience_years=None, expected_annual_return=None,
+                      investment_history=[], holding_history=[], behavioral_notes=[])
+        profile = profile.model_copy(update=values)
     return profile.model_copy(update={"confirmed": True, "version": profile.version + 1})

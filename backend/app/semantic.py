@@ -10,6 +10,7 @@ from backend.app.models import (
     ResearchCapability,
     TaskStatus,
 )
+from backend.app.research_routing import ROUTE_CARDS, route_guidance, user_question
 
 
 class JSONClient(Protocol):
@@ -143,7 +144,8 @@ class SemanticService:
                 RequestUnderstanding,
                 "一次完成意图分类与请求风险识别。优先识别用户本轮实际目的；概念讲解归 education，"
                 "投资组合诊断归 portfolio_review，单只证券研究归 security_research，"
-                "基金筛选/比较归 fund_screening，可转债研究归 convertible_bond_analysis，"
+                "基金/ETF筛选或比较归 fund_screening；A股股票条件筛选、股票池筛选及个股比较归 security_research；"
+                "可转债研究归 convertible_bond_analysis，"
                 "行业研究归 industry_analysis，宏观市场研判归 market_analysis。"
                 "区分研究与科普：要求依据给定事实或评分判断市场/标的状态属于研究，"
                 "即使包含解释、测试或模拟字样；只有单纯询问概念和原理才归 education。"
@@ -161,12 +163,22 @@ class SemanticService:
                 "最短连续原文，不要改写也不要带引号；可完整分析时返回 null。否定、引用或举例中"
                 "并未要求执行的内容不要标记。若请求包含无法处理且未映射为风险规则的部分，即使"
                 "同时包含投资问题，也必须把 intent 设为 unknown；reason 用中文解释原因。"
+                "五个研究入口的定义由 route_catalog 给出；retrieved_route_guidance 是从固定入口知识卡"
+                "检索的相关说明。依据用户问题而不是页名前缀分类，页名前缀只表示当前页面。"
+                "模型只返回 intent，不自行创造新入口；不属于投资研究或无法归入五个入口时用 unknown。"
                 "reason 会直接展示给没有金融背景的用户：用一到两句中文说明缺少什么信息或"
                 "为什么无法归类，不要出现 security_research、portfolio_review 等内部类别名。"
                 + RISK_INSTRUCTIONS,
-                {"query": request.query,
+                {"query": user_question(request.query) if request.research_direction else request.query,
                  "conversation": [turn.model_dump(mode="json") for turn in request.context_messages[-10:]],
-                 "profile": request.profile.model_dump(mode="json", exclude={"user_id"})},
+                 "profile": request.profile.model_dump(mode="json", exclude={"user_id"}),
+                 **({"route_catalog": [
+                     {"intent": intent.value, "direction": label, "scope": scope}
+                     for intent, label, scope, _ in ROUTE_CARDS
+                 ], "retrieved_route_guidance": route_guidance(
+                     request.query,
+                     context=[turn.content for turn in request.context_messages if turn.role == "user"],
+                 )} if request.research_direction else {})},
                 require_confidence=False,
             )
         except (RuntimeError, ValueError, TypeError):

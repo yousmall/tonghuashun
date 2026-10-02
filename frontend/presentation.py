@@ -66,7 +66,7 @@ QUICK_ASK_PROMPTS = {
     "市场解读": "请解读当前市场环境、主要机会与风险",
     "行业分析": "请分析我关注行业的景气度与主要风险",
     "个股研究": "请分析这只股票的经营情况、估值与风险：",
-    "基金筛选": "请帮我比较和筛选基金 / ETF：",
+    "基金筛选": "请比较并筛选基金 / ETF：",
     "可转债分析": "请分析这只可转债的价格、对应股票与风险：",
 }
 # 把用户问题转成完整研究请求时使用的前缀，与后端意图识别保持一致。
@@ -90,7 +90,7 @@ def display_value(key: str, value: Any) -> str:
     if value is None or value == "":
         return "待补充"
     if key == "risk_level":
-        return {"R1": "保守型", "R2": "稳健型", "R3": "平衡型", "R4": "成长型", "R5": "进取型"}.get(str(value), "待评估")
+        return {"R1": "保守型", "R2": "谨慎型", "R3": "稳健型", "R4": "积极型", "R5": "激进型"}.get(str(value), "待评估")
     if key in {
         "max_drawdown", "single_security_limit", "industry_limit", "expected_annual_return", "weight", "fee_rate"
     }:
@@ -323,6 +323,19 @@ def source_trace_rows(advice: dict[str, Any]) -> list[dict[str, Any]]:
             labels = supported_by.setdefault(str(fact_id), [])
             if topic not in labels:
                 labels.append(topic)
+    facts_by_id = {str(fact.get("fact_id")): fact for fact in facts}
+    pending = list(used_ids)
+    while pending:
+        fact_id = pending.pop()
+        for parent in facts_by_id.get(fact_id, {}).get("derived_from") or []:
+            parent = str(parent)
+            labels = supported_by.setdefault(parent, [])
+            for topic in supported_by.get(fact_id, []):
+                if topic not in labels:
+                    labels.append(topic)
+            if parent not in used_ids:
+                used_ids.add(parent)
+                pending.append(parent)
     rows = []
     for fact in facts:
         fact_id = str(fact.get("fact_id", ""))
@@ -391,7 +404,7 @@ def _render_conclusion_content(advice: dict[str, Any]) -> None:
             st.caption(compliance_note)
     issues = [item.get("message", "") for item in advice.get("cross_validation", {}).get("issues", [])]
     render_points("需要注意", [*advice.get("risks", []), *issues], visible=99)
-    render_points("接下来可以做", advice.get("next_steps", []))
+    render_points("后续研究建议", advice.get("next_steps", []))
     if advice.get("user_fit"):
         with st.expander("与您的投资偏好是否匹配", icon=":material/person_check:"):
             st.write(plain_language(advice["user_fit"]))
@@ -401,12 +414,38 @@ def _render_conclusion_content(advice: dict[str, Any]) -> None:
         st.caption(plain_language(disclosure))
 
 
+def collaboration_rows(advice: dict[str, Any]) -> list[dict[str, str]]:
+    """按服务端的真实依赖展示并行分析和后置核验；旧记录不猜测依赖。"""
+    nodes = (advice.get("task_plan") or {}).get("nodes") or []
+    labels = {**TOPIC_LABELS, "fact_verifier": "事实核验", "compliance": "风险检查"}
+    names = {node.get("task_id"): labels.get(node.get("agent_id"), "相关分析") for node in nodes if node.get("task_id")}
+    rows = []
+    for node in nodes:
+        dependencies = node.get("depends_on")
+        known = node.get("task_id") and isinstance(dependencies, list)
+        rows.append({
+            "分析步骤": labels.get(node.get("agent_id"), "相关分析"),
+            "执行方式": ("等待前置步骤" if dependencies else "与其他分项并行") if known else "早期记录未保存依赖",
+            "前置步骤": "、".join(names.get(dep, "相关步骤") for dep in dependencies) if known else "未记录",
+            "完成状态": PROGRESS_LABELS.get(_status_code(node.get("status")), "待确认"),
+        })
+    return rows
+
+
 def render_logic_chain(advice: dict[str, Any]) -> None:
     """逐级展示“事实 -> 分项观点 -> 核验 -> 合规”的既有执行结果。"""
 
     st.markdown("**投资逻辑链**")
     st.caption("依次展开每个分析维度，可查看观点、适用条件及其实际引用的数据。")
     render_chain_overview(advice)
+    rows = collaboration_rows(advice)
+    if rows:
+        st.markdown("**分析协作过程**")
+        st.dataframe(rows, width="stretch", hide_index=True)
+        st.caption("分项分析并行完成后，再依次核验资料和检查风险；各项真实执行状态保留在表中。")
+    timings = advice.get("timings_ms") or {}
+    if isinstance(timings.get("total"), (int, float)):
+        st.caption(f"本轮分析处理用时 {timings['total'] / 1000:.2f} 秒；包含资料、研判、核验及本轮对话保存，不含前置登录检查和网络传输。")
     results = advice.get("agent_results", [])
     if not results:
         clarification = advice.get("task_plan", {}).get("clarification_question")
@@ -502,8 +541,12 @@ def render_source_trace(advice: dict[str, Any], *, collapsed: bool = True) -> No
 
 
 def render_profile_summary(profile: dict[str, Any]) -> None:
-    labels = {"risk_level": "投资风格", "horizon_months": "计划投资多久", "max_drawdown": "最多接受亏损",
-              "liquidity_need": "随时用钱的需要", "target": "投资目标", "expected_annual_return": "期望每年收益"}
+    if profile.get("questionnaire_version"):
+        from frontend.risk_assessment import result_html
+        st.html(result_html(profile))
+        return
+    labels = {"risk_level": "投资风格", "horizon_months": "投资期限", "max_drawdown": "最大可接受亏损",
+              "liquidity_need": "资金流动性需求", "target": "投资目标", "expected_annual_return": "预期年化收益率"}
     st.caption(f"当前投资偏好版本：第 {int(profile.get('version') or 1)} 版")
     cards = "".join(
         f"<div class='profile-card'><div class='profile-card-label'>{label}</div>"
@@ -544,25 +587,25 @@ def plain_language(value: Any) -> str:
         "授权事实不足，暂不形成强结论。": "现有资料不足，暂时无法作出可靠判断。",
         "补齐各专业智能体列出的缺失字段": "补充所分析的股票、基金名称及相关资料，再重新分析",
         "补充有来源、含时间戳的事实后重新核验": "补充注明来源和日期的最新资料，再重新分析",
-        "在执行任何调整前复核风险标记和证伪条件": "调整持仓前，先确认风险以及哪些变化会让结论不再适用",
+        "在执行任何调整前复核风险标记和证伪条件": "调整持仓前，应复核风险提示及结论失效条件",
         "关注证据时点与证伪条件，定期复核": "关注最新信息；情况变化时重新分析",
-        "已确认画像": "投资偏好", "画像适配": "是否适合您", "画像": "投资偏好",
-        "最大回撤": "最多可接受的阶段性亏损", "流动性需求": "随时用钱的需要",
+        "已确认画像": "投资偏好", "画像适配": "风险适配程度", "画像": "投资偏好",
+        "最大回撤": "最大阶段性亏损", "流动性需求": "资金流动性需求",
         "基本面与技术面": "公司经营情况与短期价格走势", "证伪条件": "结论不再适用的情况",
         "授权事实": "已有资料", "事实不足": "资料不足", "证据不足": "资料不足",
         "安全降级": "仅作有限参考", "快照时点": "数据日期", "快照": "数据",
         "事实核验": "数据核对", "合规闸门": "风险检查", "适当性审核": "风险匹配检查",
     }
     replacements.update({
-        "专业智能体评分分散度较高，协调器保留分歧并要求人工复核。": "不同分析的看法差异较大，仍需进一步确认。",
+        "专业智能体评分分散度较高，协调器保留分歧并要求人工复核。": "各项分析结论存在较大分歧，需进一步复核。",
         "语义复核不可用或不确定，需要人工复核。": "部分判断尚未确认，请进一步核实后再作决定。",
-        "组合已完成规则型集中度诊断；调整应分批执行并在新快照下复核。": "已检查持仓是否过于集中。如需调整，请分步进行，并根据最新持仓重新分析。",
-        "单标的集中度超限": "某只股票或基金的占比超过了您设定的上限",
+        "组合已完成规则型集中度诊断；调整应分批执行并在新快照下复核。": "组合集中度评估已完成。如需调整，应分批执行，并依据最新持仓复核风险。",
+        "单标的集中度超限": "单一标的持仓权重超过设定上限",
         "单标的上限": "单只股票或基金的比例上限",
         "可重算综合评分已生成；正反催化剂需随快照复核。": "已完成初步分析，利好和不利因素仍需结合最新资料确认。",
         "的可用研究维度已按授权快照汇总。": "的已有研究资料已整理，仍需关注最新变化。",
         "基于五个已授权宏观维度": "根据现有的经济、资金和政策资料",
-        "证据不足，仅可展示教育性说明。": "资料不足，以下内容只帮助理解相关知识。",
+        "证据不足，仅可展示教育性说明。": "研究证据不足，以下内容仅供知识参考，不构成投资判断依据。",
     })
     for original, friendly in sorted(replacements.items(), key=lambda item: -len(item[0])):
         text = text.replace(original, friendly)

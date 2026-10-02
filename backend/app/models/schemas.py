@@ -16,6 +16,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from backend.app.risk_questionnaire import validate_answers
+
 
 class Intent(StrEnum):
     """主协调智能体可识别的请求类型。
@@ -111,6 +113,27 @@ class UserProfile(BaseModel):
     risk_level: str | None = None
     # 0-100 的问卷分数。risk_level 是可读分层，risk_score 保留可解释的原始分。
     risk_score: float | None = Field(default=None, ge=0, le=100)
+    questionnaire_version: str | None = None
+    risk_answers: dict[str, str] = Field(default_factory=dict)
+    questionnaire_details: dict[str, str] = Field(default_factory=dict)
+    investor_category: Literal["C1", "C2", "C3", "C4", "C5"] | None = None
+    risk_description: str | None = None
+    suitable_product_levels: list[str] = Field(default_factory=list)
+    preferred_product_types: list[str] = Field(default_factory=list)
+    investment_horizon_label: str | None = None
+    horizon_min_months: int | None = Field(default=None, ge=0)
+    horizon_max_months: int | None = Field(default=None, ge=0)
+    loss_tolerance_label: str | None = None
+    experience_label: str | None = None
+    assessed_on: date | None = None
+    valid_until: date | None = None
+    scoring_method: str | None = None
+    scoring_notice: str | None = None
+
+    @field_validator("risk_answers")
+    @classmethod
+    def answers_are_valid(cls, answers: dict[str, str]) -> dict[str, str]:
+        return validate_answers(answers)
     # 投资期限（月）。小于 1 的值无意义，因此由 Pydantic 在入口处拒绝。
     horizon_months: int | None = Field(default=None, ge=1)
     # 最大可接受回撤，以小数存储，例如 8% 填 0.08。
@@ -334,6 +357,8 @@ class OrchestrationRequest(BaseModel):
 
     # 原始用户问题，禁止为空字符串，避免无意义调用专业智能体。
     query: str = Field(min_length=1)
+    # 五个研究页显式传入当前入口；未传时保留通用 API 的原有行为。
+    research_direction: Literal["市场解读", "行业分析", "个股研究", "基金筛选", "可转债分析"] | None = None
     # 当前已加载的用户画像版本。
     profile: UserProfile
     # 数据层在本次请求中已授权的事实集合。
@@ -372,6 +397,13 @@ class ProfileAssessmentRequest(BaseModel):
     user_id: str = Field(default="", max_length=128)
     # 问卷维度使用 0-100；未知维度省略，服务会列入 missing_fields。
     questionnaire: dict[str, float] = Field(default_factory=dict)
+    questionnaire_version: str | None = None
+    risk_answers: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("risk_answers")
+    @classmethod
+    def answers_are_valid(cls, answers: dict[str, str]) -> dict[str, str]:
+        return validate_answers(answers)
     narrative: str | None = Field(default=None, max_length=2_000)
     horizon_months: int | None = Field(default=None, ge=1)
     max_drawdown: float | None = Field(default=None, ge=0, le=1)
@@ -581,6 +613,8 @@ class AdvicePackage(BaseModel):
 
     # 关联同一次请求的所有过程记录。
     trace_id: str
+    # 各真实阶段与完整分析的耗时（毫秒）；不把流式首包当作最终回答。
+    timings_ms: dict[str, float] = Field(default_factory=dict)
     # 用于决定展示模板和后续追问策略的意图。
     intent: Intent
     # 本次使用的已确认画像版本，供界面及历史记录核对。

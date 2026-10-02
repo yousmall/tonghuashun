@@ -171,7 +171,8 @@ class FundAgent(BaseAgent):
     """基金/ETF 准入优先于排序的规则智能体。"""
 
     agent_id = "fund"
-    _fields = {"fund_risk_level", "fee_rate", "tracking_error", "fund_score", "liquidity_score"}
+    _fields = {"fund_risk_level", "fee_rate", "tracking_error", "fund_score", "liquidity_score",
+               "fund_type", "product_type", "minimum_holding_months", "product_horizon_months"}
 
     async def run(self, request: OrchestrationRequest) -> AgentResult:
         selected = _matching_facts(request.facts, self._fields)
@@ -182,6 +183,7 @@ class FundAgent(BaseAgent):
             by_entity[fact.entity].append(fact)
         eligible: list[tuple[str, list[FactRecord], float]] = []
         rejected: list[str] = []
+        suitability_missing: list[str] = []
         user_risk = int(request.profile.risk_level[1:]) if request.profile.risk_level and request.profile.risk_level.startswith("R") and request.profile.risk_level[1:].isdigit() else None
         for entity, facts in by_entity.items():
             values = {fact.field.lower(): fact.value for fact in facts}
@@ -189,6 +191,30 @@ class FundAgent(BaseAgent):
             if user_risk is not None and isinstance(product_risk, (int, float)) and product_risk > user_risk:
                 rejected.append(entity)
                 continue
+            if request.profile.questionnaire_version:
+                if not isinstance(product_risk, (int, float)) or not 1 <= product_risk <= 5:
+                    suitability_missing.append(f"{entity}缺少有效产品风险等级")
+                    continue
+                product_type = str(values.get("fund_type") or values.get("product_type") or "")
+                group = next((group for words, group in (
+                    (("股票", "偏股", "权益"), "权益类"),
+                    (("混合",), "混合类"), (("债券", "货币", "固收", "固定收益"), "固定收益类"),
+                    (("期货", "期权", "衍生"), "融资及衍生品类"),
+                ) if any(word in product_type for word in words)), None)
+                if group is None:
+                    suitability_missing.append(f"{entity}缺少可核验的投资品种分类")
+                    continue
+                if group not in request.profile.preferred_product_types:
+                    rejected.append(entity)
+                    continue
+                holding = values.get("minimum_holding_months", values.get("product_horizon_months"))
+                if request.profile.horizon_max_months is not None:
+                    if not isinstance(holding, (int, float)) or holding < 0:
+                        suitability_missing.append(f"{entity}缺少可核验的投资期限")
+                        continue
+                    if holding > request.profile.horizon_max_months:
+                        rejected.append(entity)
+                        continue
             quality = [value for _, value in numeric_fact_values(facts) if value is not None]
             # fund_score 是首选；不存在时只用已有数值做透明的降级排序。
             score = float(values["fund_score"]) if isinstance(values.get("fund_score"), (int, float)) else (sum(quality) / len(quality) if quality else 0)
@@ -197,12 +223,12 @@ class FundAgent(BaseAgent):
             return AgentResult(
                 agent_id=self.agent_id,
                 status=TaskStatus.DEGRADED,
-                opinion="没有满足当前风险准入条件的基金/ETF 候选。",
+                opinion="候选的适当性资料不完整，请补充风险等级、投资品种或期限后复核。" if suitability_missing else "没有满足当前风险准入条件的基金/ETF 候选。",
                 confidence=0,
                 confidence_reasons=["候选均未通过风险等级准入"],
-                risk_flags=["无匹配产品"],
+                risk_flags=["适当性资料不足"] if suitability_missing else ["无匹配产品"],
                 invalidation_conditions=["补充更低风险候选或更新画像"],
-                details={"rejected_candidates": rejected},
+                details={"rejected_candidates": rejected, "suitability_missing": suitability_missing},
             )
         entity, facts, score = max(eligible, key=lambda item: item[2])
         fact_ids, citations = evidence_metadata(facts)
@@ -214,7 +240,7 @@ class FundAgent(BaseAgent):
             confidence=round(sum(f.quality for f in facts) / len(facts), 2),
             facts_used=fact_ids,
             citations=citations,
-            risk_flags=["候选比较受快照覆盖范围限制"],
+            risk_flags=["候选比较受快照覆盖范围限制"] + suitability_missing,
             invalidation_conditions=["费率、跟踪质量、流动性或用户约束变化"],
             details={"primary_candidate": entity, "rejected_candidates": rejected, "eligible_count": len(eligible)},
         )
@@ -242,7 +268,11 @@ class PortfolioAgent(BaseAgent):
             risk_flags.append("单标的集中度超限")
         if total_weight > 1.05:
             risk_flags.append("持仓权重和超过 100%，请检查口径")
-        target_range = "以较高流动性和较低波动资产为主" if request.profile.liquidity_need == "高" or (request.profile.max_drawdown is not None and request.profile.max_drawdown <= 0.08) else "按已确认风险等级设定资产区间"
+        target_range = "以较高流动性和较低波动资产为主" if (
+            request.profile.liquidity_need == "高"
+            or (request.profile.max_drawdown is not None and request.profile.max_drawdown <= 0.08)
+            or (request.profile.horizon_max_months is not None and request.profile.horizon_max_months <= 12)
+        ) else "按已确认风险等级设定资产区间"
         return AgentResult(
             agent_id=self.agent_id,
             status=TaskStatus.COMPLETED,

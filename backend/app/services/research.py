@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 from collections import defaultdict
 from dataclasses import dataclass
@@ -79,10 +80,15 @@ class AutomatedResearchPipeline:
         *,
         now: Callable[[], datetime] | None = None,
         max_portfolio_entities: int = 4,
+        call_timeout_seconds: float | None = None,
     ) -> None:
         self.provider = provider
         self.now = now or (lambda: datetime.now(timezone.utc))
         self.max_portfolio_entities = max_portfolio_entities
+        self.call_timeout_seconds = float(call_timeout_seconds if call_timeout_seconds is not None
+                                          else os.getenv("WENCE_DATA_CALL_TIMEOUT_SECONDS", "30"))
+        if not 0 < self.call_timeout_seconds <= 60:
+            raise ValueError("数据能力总超时须大于 0 且不超过 60 秒")
 
     async def prepare(
         self,
@@ -193,7 +199,7 @@ class AutomatedResearchPipeline:
 
     async def _execute(self, call: DataCall) -> list[FactRecord]:
         method = getattr(self.provider, call.method)
-        facts = await method(*call.args)
+        facts = await asyncio.wait_for(method(*call.args), timeout=self.call_timeout_seconds)
         # 打上来源调用键：下一轮针对同一目标再提问时，据此判断能否直接沿用。
         return [fact.model_copy(update={"produced_by": call.key}) for fact in facts
                 if fact.field not in NON_SUBSTANTIVE_FIELDS]

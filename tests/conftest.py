@@ -49,3 +49,12 @@ def offline_application(monkeypatch, semantic):
         make_rule_agents(), verify_facts, basic_compliance_check, semantic=semantic))
     monkeypatch.setattr(main, "research_pipeline", AutomatedResearchPipeline(None))
 
+
+
+@pytest.fixture
+def risk_questionnaire_payload():
+    from backend.app.risk_questionnaire import QUESTIONNAIRE_VERSION, QUESTIONS
+    return {
+        "questionnaire_version": QUESTIONNAIRE_VERSION,
+        "risk_answers": dict(zip((q.id for q in QUESTIONS), "ACABDC CACCB BCCBC CDB".replace(" ", ""), strict=True)),
+    }

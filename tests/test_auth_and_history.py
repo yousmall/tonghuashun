@@ -45,7 +45,7 @@ def test_history_list_uses_one_query_for_last_messages() -> None:
     assert {item["last_message"] for item in histories} == {f"回答 {index}" for index in range(6)}
 
 
-def test_register_login_persist_history_and_isolate_users(monkeypatch, request, semantic) -> None:
+def test_register_login_persist_history_and_isolate_users(monkeypatch, request, semantic, risk_questionnaire_payload) -> None:
     database = Database("sqlite+pysqlite:///:memory:", "test-secret-that-is-longer-than-thirty-two-characters")
     database.initialize()
     monkeypatch.setattr(main_module, "database", database)
@@ -85,7 +85,7 @@ def test_register_login_persist_history_and_isolate_users(monkeypatch, request, 
         assert missing_profile.status_code == 409
         profile = client.post(
             "/api/v1/profile/confirm", headers=headers,
-            json={"profile": {"risk_level": "R3", "confirmed": False, "version": 1}},
+            json={"profile": {"risk_level": "R3", "confirmed": False, "version": 1, **risk_questionnaire_payload}},
         )
         assert profile.status_code == 200
         stale_profile = client.post(
@@ -126,7 +126,7 @@ def test_register_login_persist_history_and_isolate_users(monkeypatch, request, 
         assert detail.status_code == 200
         assert [message["role"] for message in detail.json()["messages"]] == ["user", "assistant"]
         assert detail.json()["messages"][1]["payload"]["trace_id"] == analyzed.json()["trace_id"]
-        assert detail.json()["messages"][0]["payload"]["profile"]["risk_level"] == "R3"
+        assert detail.json()["messages"][0]["payload"]["profile"]["risk_level"] == profile.json()["risk_level"]
         assert detail.json()["messages"][0]["payload"]["profile"]["version"] == 2
 
         added = client.post(

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import secrets
 import uuid
 from datetime import datetime, timezone
+from threading import Event
 from typing import Any
 from urllib.parse import quote_plus
 
@@ -13,6 +16,9 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from backend.app.auth import hash_password
+from backend.app.risk_questionnaire import local_today
+
 
 class DatabaseUnavailable(RuntimeError):
     """数据库未配置或暂时无法使用。"""
@@ -20,6 +26,10 @@ class DatabaseUnavailable(RuntimeError):
 
 class ProfileVersionConflict(ValueError):
     """保存画像时客户端版本已经落后。"""
+
+
+class ProfileDailyLimit(ValueError):
+    """同一账号的新风险测评每天只保存一次。"""
 
 
 class UsernameExists(ValueError):
@@ -52,6 +62,14 @@ class AdminRoleRow(Base):
     """独立权限表，旧用户表无需修改；公开注册永远不会写入这里。"""
     __tablename__ = "admin_roles"
     user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+
+
+class WechatIdentityRow(Base):
+    """微信身份只绑定普通用户；不与用户名相同的管理员账号自动合并。"""
+
+    __tablename__ = "wechat_identities"
+    openid: Mapped[str] = mapped_column(String(128), primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False)
 
 
 class IwencaiCallRow(Base):
@@ -188,7 +206,7 @@ class Database:
             and len(self.auth_secret) >= 32
         )
 
-    def initialize(self) -> None:
+    def initialize(self, *, backfill: bool = True) -> None:
         if not self.engine:
             return
         try:
@@ -198,15 +216,21 @@ class Database:
                 for index in table.indexes:
                     if index.name in {"ix_conversations_user_updated", "ix_messages_user_conversation_id"}:
                         index.create(self.engine, checkfirst=True)
-            self._backfill_consultations()
+            if backfill:
+                self._backfill_consultations()
             self.initialization_error = None
         except SQLAlchemyError as exc:
             self.initialization_error = type(exc).__name__
 
-    def _backfill_consultations(self) -> None:
+    def backfill_consultations(self, stop_event: Event | None = None) -> None:
+        """表结构就绪后可在后台补齐统计，不阻塞应用接收请求。"""
+        if self.engine is not None and self.initialization_error is None:
+            self._backfill_consultations(stop_event)
+
+    def _backfill_consultations(self, stop_event: Event | None = None) -> None:
         """幂等补齐历史消息的轻量统计；缺少元数据时保留为未分类。"""
         assert self.session_factory is not None
-        while True:
+        while stop_event is None or not stop_event.is_set():
             with self.session_factory.begin() as session:
                 rows = session.execute(select(
                     MessageRow.id, MessageRow.user_id, MessageRow.created_at,
@@ -264,6 +288,37 @@ class Database:
             row = session.get(UserRow, user_id)
             return self._user_with_role(session, row) if row else None
 
+    def get_or_create_wechat_user(self, openid: str) -> dict[str, Any]:
+        """按微信 openid 原子绑定独立账号；并发回调收敛到同一身份。"""
+        self.require_ready()
+        assert self.session_factory is not None
+        if not openid or len(openid) > 128:
+            raise ValueError("微信身份无效")
+        username = "wx_" + hashlib.sha256(openid.encode("utf-8")).hexdigest()[:40]
+        try:
+            with self.session_factory.begin() as session:
+                identity = session.get(WechatIdentityRow, openid)
+                if identity is None:
+                    row = UserRow(username=username, password_hash=hash_password(secrets.token_urlsafe(48)))
+                    session.add(row)
+                    session.flush()
+                    session.add(WechatIdentityRow(openid=openid, user_id=row.id))
+                else:
+                    row = session.get(UserRow, identity.user_id)
+                    if row is None:
+                        raise ValueError("微信绑定账号不存在")
+                result = self._user_with_role(session, row)
+            return result
+        except IntegrityError:
+            with self.session_factory() as session:
+                identity = session.get(WechatIdentityRow, openid)
+                if identity is None:
+                    raise
+                row = session.get(UserRow, identity.user_id)
+                if row is None:
+                    raise ValueError("微信绑定账号不存在")
+                return self._user_with_role(session, row)
+
     def save_profile(
         self, user_id: int, payload: dict[str, Any], version: int,
         expected_version: int | None = None,
@@ -279,6 +334,10 @@ class Database:
             current_version = int(row.version) if row is not None else 1
             if expected_version is not None and expected_version != current_version:
                 raise ProfileVersionConflict("投资偏好已在其他页面更新，请重新打开投资偏好后再确认。")
+            if (row is not None and payload.get("questionnaire_version")
+                    and row.payload.get("questionnaire_version")
+                    and str(row.payload.get("assessed_on")) == str(local_today())):
+                raise ProfileDailyLimit("今日已保存风险测评，每日只能保存一次，请明日重新测评。")
             if row is None:
                 session.add(ProfileRow(user_id=user_id, payload=payload, version=version))
             else:

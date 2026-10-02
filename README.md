@@ -42,6 +42,9 @@ python -m uvicorn backend.app.main:app --reload --port 8000
 
 - `POST /api/v1/auth/register`：注册账号并返回登录令牌。
 - `POST /api/v1/auth/login`：登录并返回登录令牌。
+- `POST /api/v1/auth/wechat/start`：创建微信扫码授权请求。
+- `GET /api/v1/auth/wechat/callback`：微信开放平台授权回调；回调完成后登录页自动领取原有会话令牌。
+- `POST /api/v1/auth/wechat/poll`：原浏览器使用一次性轮询凭据领取登录结果。
 - `GET /api/v1/auth/me`：读取当前登录用户。
 - `GET /api/v1/auth/session/status`：只检查租约状态，不刷新空闲计时。
 - `POST /api/v1/auth/logout`：退出登录并立即释放会话槽。
@@ -57,6 +60,8 @@ python -m uvicorn backend.app.main:app --reload --port 8000
 ## 管理员后台
 
 管理员使用同一登录页，登录后只显示「注册用户」「咨询统计」「问财调用」。普通注册不能选择或获取管理员权限；管理 API 根据数据库权限校验，普通账号返回 403，未登录返回 401。
+
+微信扫码登录需先在[微信开放平台](https://open.weixin.qq.com/)申请并审核「网站应用」及微信登录能力，在 `.env` 中设置 `WENCE_WECHAT_APP_ID`、`WENCE_WECHAT_APP_SECRET` 和 `WENCE_WECHAT_CALLBACK_URL`。回调地址须为公开可访问的 HTTPS 地址 `https://你的域名/api/v1/auth/wechat/callback`，并使用开放平台登记的授权回调域名。二维码与扫码状态保存在单个后端进程内，部署时须使用一个 Uvicorn worker；状态 5 分钟过期。微信账号首次扫码创建独立普通账号，后续扫码恢复该账号的历史记录，管理员身份不会经微信扫码授予。
 
 配置好 MySQL 后，用项目 Python 创建一个新的管理员账号：
 
@@ -147,6 +152,13 @@ $env:DEEPSEEK_MODEL="模型名称"
 
 ## 运行测试
 
+图片中15项技术要求的逐项实现、演示路线和实测边界见 [技术要求验收与演示说明](docs/technical-requirements.md)。
+运行 `python scripts/verify_requirements.py` 可生成不调用外部服务、不访问正式用户库的100账号隔离验收；
+运行 `python -m streamlit run frontend/requirements_demo.py --server.port 8502` 可展示合成场景、协作过程与风险边界。
+完整咨询延迟见 `/api/v1/metrics` 的 `analysis`；`timings_ms` 返回当前分析的阶段耗时。
+事实核验/合规故障会进入复核并撤下未经完整审核的观点；研究数据能力总预算通过 `WENCE_DATA_CALL_TIMEOUT_SECONDS` 配置（默认30秒）。
+完整流式响应计时包括正文发送过程，不能将进度首包或健康接口延迟作为投研回答达标证据。
+
 ```powershell
 python -m pytest -q
 ```
@@ -202,6 +214,9 @@ python -m streamlit run frontend/streamlit_app.py
 
 - 首次使用保留完整操作引导；投资偏好确认后，首页提供继续研究、自选、持仓风险入口与市场概览，使用说明可展开。
 - 登录启动五个方向的预取。研究数据在后台加载，行情、财务、资讯分别更新，底部输入不等待概览；加载完成后停止快速轮询。概览仅用于浏览，不自动进入投资分析证据。
+- 账号的投资偏好、最近咨询与自选列表并行预取，首屏不等待资料读取；资料完成后自动更新。偏好恢复前不开放修改，自选列表恢复前不开放添加，避免旧读取覆盖新操作；退出登录清理任务与结果。
+- 图表依赖按页面需求导入；登录成功后复用已验证的会话状态，并每 30 秒复验租约。读取失败短暂缓存 30 秒，避免控件重跑重复等待。
+- 后端启动先完成表结构准备，历史咨询统计分批在后台补齐；补齐期间管理员的历史聚合统计可能尚未完整，新增咨询仍实时记录。
 - `/api/v1/data/overview`、`/data/compare`、`/data/watchlist-quotes` 均要求客户登录。自选行情仅读取当前账户最近加入的 20 项；横向对比限定 2–4 个同类型标的，服务端逐项核对证券身份。
 - 公共供应商事实使用进程内缓存与同一请求合并：最多 64 个键、32 个待完成任务、8 个并行任务；行情缓存 60 秒，基金/新闻/历史 300 秒，财务/公司资料 900 秒，宏观 1800 秒，失败 30 秒。取数包括排队最长 28 秒，强制刷新每键间隔至少 10 秒。多进程部署时各进程独立缓存。
 - 对比矩阵优先采用共有的最新期间，并显示单位、日期、缺失与冲突。季度数据保持财报期间，不混同交易日；日期或单位不齐时不强行排序，也不把缺失值补成零。

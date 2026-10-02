@@ -60,7 +60,7 @@ def summarise_advice(advice: dict[str, Any], used_fact_ids: set[str] | None = No
         summary["task_plan"] = {
             "clarification_question": plan.get("clarification_question"),
             "nodes": [
-                {"agent_id": node.get("agent_id"), "status": node.get("status")}
+                {key: node.get(key) for key in ("task_id", "agent_id", "status", "depends_on")}
                 for node in (plan.get("nodes") or [])
             ],
         }
@@ -74,6 +74,16 @@ def used_fact_ids_of(advice: dict[str, Any]) -> set[str]:
     for result in advice.get("agent_results") or []:
         if isinstance(result, dict):
             used.update(str(item) for item in (result.get("facts_used") or []))
+    # 保存派生结论的原始输入，避免历史里只剩一个不可回溯的评分。
+    facts = {str(fact.get("fact_id")): fact for fact in advice.get("facts") or [] if isinstance(fact, dict)}
+    pending = list(used)
+    while pending:
+        fact = facts.get(pending.pop(), {})
+        for parent in fact.get("derived_from") or []:
+            parent = str(parent)
+            if parent not in used:
+                used.add(parent)
+                pending.append(parent)
     return used
 
 

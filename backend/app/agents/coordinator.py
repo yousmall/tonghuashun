@@ -19,9 +19,11 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from backend.app.semantic import RequestUnderstanding, SemanticService
+from backend.app.semantic import RequestUnderstanding, SemanticService, UNAVAILABLE_REASON
+from backend.app.research_routing import DIRECTION_FOR_INTENT
 from backend.app import fact_taxonomy as _TAXONOMY
 from backend.app.services.model_input import slice_facts_for_model
+from backend.app.risk_questionnaire import assessment_is_current
 
 from backend.app.models import (
     AdvicePackage,
@@ -136,12 +138,12 @@ class CoordinatorAgent:
                 intent=intent,
                 clarification_question="请说明您希望进行市场解读、标的研究、基金筛选还是组合诊断。",
             )
-        if not request.profile.confirmed:
+        if not assessment_is_current(request.profile):
             # 画像未确认时，不能以模型抽取的草稿替用户决定风险与仓位。
             return TaskPlan(
                 trace_id=trace_id,
                 intent=intent,
-                clarification_question="请先确认风险等级、投资期限、最大可接受回撤和流动性需求，再生成个性化建议。",
+                clarification_question="请先完成并确认有效的风险测评，再生成个性化建议。",
             )
 
         # 根据意图只选择必要专业能力，避免无关调用增加时延、成本和信息噪声。
@@ -215,8 +217,22 @@ class CoordinatorAgent:
                 "confidence": 0,
                 "risk_conclusion": build_risk_conclusion(compliance, output.cross_validation, []),
             })
+        if request.research_direction and understanding.intent is not Intent.UNKNOWN:
+            expected_direction = DIRECTION_FOR_INTENT.get(understanding.intent)
+            if expected_direction != request.research_direction:
+                plan.nodes = []
+                message = (
+                    f"这条问题属于“{expected_direction}”，请切换到“{expected_direction}”入口重新输入。"
+                    if expected_direction else "这条问题不属于当前五个研究入口可处理的内容。"
+                )
+                plan.clarification_question = message
+                return self._review_package(plan, message)
         if understanding.intent is Intent.UNKNOWN:
-            plan.clarification_question = unsupported_input_message(request, understanding)
+            # 模型故障不代表用户问题无关，不能显示“无法处理该内容”的拒绝话术。
+            plan.clarification_question = (
+                UNAVAILABLE_REASON if understanding.reason == UNAVAILABLE_REASON
+                else unsupported_input_message(request, understanding)
+            )
 
         if plan.clarification_question:
             # 追问不是异常，是刻意的安全业务结果，使用 REVIEW 状态返回给界面。
@@ -241,13 +257,33 @@ class CoordinatorAgent:
         verification_node.status = TaskStatus.RUNNING
         if progress_sink is not None:
             progress_sink("事实核验")
-        results = await self.verifier(results, request.facts)
+        try:
+            results = await asyncio.wait_for(
+                self.verifier(results, request.facts), timeout=verification_node.timeout_seconds,
+            )
+        except Exception as exc:
+            verification_node.status = TaskStatus.DEGRADED if isinstance(exc, TimeoutError) else TaskStatus.FAILED
+            return self._gate_failure(plan, results, "FACT_VERIFICATION_UNAVAILABLE", "资料核验暂不可用，请刷新资料后重试。")
         verification_node.status = TaskStatus.COMPLETED
         # 合规器使用核验后的结果作最终判定，保证无来源结论无法被放行。
         compliance_node = next(node for node in plan.nodes if node.agent_id == "compliance")
         compliance_node.status = TaskStatus.RUNNING
         if progress_sink is not None:
             progress_sink("风险检查")
+        try:
+            async with asyncio.timeout(compliance_node.timeout_seconds):
+                cross_validation, compliance = await self._review_results(request, results)
+        except Exception as exc:
+            compliance_node.status = TaskStatus.DEGRADED if isinstance(exc, TimeoutError) else TaskStatus.FAILED
+            return self._gate_failure(plan, results, "COMPLIANCE_UNAVAILABLE", "风险检查暂不可用，请稍后重试或转人工复核。")
+        compliance_node.status = TaskStatus.COMPLETED
+
+        return self._aggregate(request, plan, results, cross_validation, compliance)
+
+    async def _review_results(
+        self, request: OrchestrationRequest, results: list[AgentResult],
+    ) -> tuple[CrossValidationResult, ComplianceResult]:
+        """数值与语义复核共同受合规节点的总时间预算约束。"""
         cross_validation = cross_validate_results(results, request.facts)
         compliance = await self.compliance_checker(request, results)
         # 所有专业意见合并为一次语义审核，补充数值一致性检查无法发现的实质矛盾。
@@ -284,7 +320,38 @@ class CoordinatorAgent:
                     ),
                 }
             )
-        compliance_node.status = TaskStatus.COMPLETED
+        return cross_validation, compliance
+
+    def _gate_failure(
+        self, plan: TaskPlan, results: list[AgentResult], code: str, reason: str,
+    ) -> AdvicePackage:
+        """闸门故障时撤下未经完整审核的观点，不冒充已核验的结果。"""
+        safe_results = [AgentResult(
+            agent_id=result.agent_id, status=TaskStatus.UNKNOWN,
+            opinion="核验或风险检查未完成，暂不展示该维度的投资判断。",
+            confidence=0, confidence_reasons=[reason], risk_flags=["信息不完整"],
+        ) for result in results]
+        for node in plan.nodes:
+            if node.status is TaskStatus.PENDING:
+                node.status = TaskStatus.SKIPPED
+        return AdvicePackage(
+            trace_id=plan.trace_id, intent=plan.intent, conclusion=reason, confidence=0,
+            risks=[reason], next_steps=["重新核验后再作判断"], task_plan=plan,
+            agent_results=safe_results, risk_conclusion="检查未完成，暂不能形成可靠的风险判断。",
+            compliance=ComplianceResult(
+                status=ComplianceStatus.REVIEW, matched_rules=[code], reason=reason,
+                risk_notice=RISK_NOTICE, required_disclosures=[RISK_NOTICE],
+            ),
+            cross_validation=CrossValidationResult(issues=[CrossValidationIssue(
+                code=code, severity="critical", message=reason,
+            )]),
+        )
+
+    def _aggregate(
+        self, request: OrchestrationRequest, plan: TaskPlan, results: list[AgentResult],
+        cross_validation: CrossValidationResult, compliance: ComplianceResult,
+    ) -> AdvicePackage:
+        trace_id = plan.trace_id
 
         if compliance.status is ComplianceStatus.BLOCK:
             # BLOCK 是硬拦截：不执行综合摘要，也不把专业观点组合成建议。
@@ -447,6 +514,16 @@ class CoordinatorAgent:
         """用已确认字段生成适配说明，不把风险等级解释成收益预期。"""
         profile = request.profile
         parts = [f"已确认画像 {profile.risk_level or '未量化'}"]
+        if profile.investor_category:
+            parts[0] = f"已确认画像 {profile.investor_category}（{profile.risk_description}）"
+        if profile.investment_horizon_label:
+            parts.append(f"拟投资期限 {profile.investment_horizon_label}")
+        if profile.preferred_product_types:
+            parts.append(f"拟投资品种 {'、'.join(profile.preferred_product_types)}")
+        if profile.loss_tolerance_label:
+            parts.append(f"损失偏好 {profile.loss_tolerance_label}")
+        if profile.experience_label:
+            parts.append(f"投资经验 {profile.experience_label}")
         if profile.horizon_months is not None:
             parts.append(f"期限 {profile.horizon_months} 个月")
         if profile.max_drawdown is not None:
@@ -475,6 +552,8 @@ class CoordinatorAgent:
         for result in results:
             if result.agent_id == "portfolio" and result.details:
                 profile_ranges = ranges.get(request.profile.risk_level or "", ranges["R3"])
+                if request.profile.preferred_product_types == ["固定收益类"]:
+                    profile_ranges = ((0, 0), (60, 90), (10, 40))
                 return [
                     {
                         "asset_class": name,

@@ -155,7 +155,7 @@ def render_watchlist(api_base, actions):
                     st.toast("已加入自选", icon=":material/check_circle:")
                     items = st.session_state.watchlist
     if not items:
-        render_empty_state("还没有自选标的", "添加后可以查看行情、一键研究或进行横向比较。", ":material/star:")
+        render_empty_state("暂无自选标的", "添加关注标的后，可查看行情、发起研究或开展横向比较。", ":material/star:")
         return
     st.subheader(f"我的自选 · {len(items)}")
     with st.container(horizontal=True):

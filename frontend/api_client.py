@@ -34,7 +34,7 @@ def request_json(client, base, method, path, payload, token):
             detail = None
         return ApiResult(status=exc.response.status_code, detail=detail or "请求未成功，请稍后重试。")
     except (httpx.HTTPError, ValueError):
-        return ApiResult(detail="暂时连接不上分析服务，请稍后再试。")
+        return ApiResult(detail="分析服务暂时不可用，请稍后重试。")
 
 
 def overview_fetch(client, token):
