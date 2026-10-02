@@ -1,6 +1,7 @@
 """登录资料并行预取：后台只返回结果，主线程应用当前账号的状态。"""
 import httpx
 import streamlit as st
+from concurrent.futures import ThreadPoolExecutor
 
 from frontend.api_client import request_json
 from frontend import research_board
@@ -8,6 +9,24 @@ from frontend import research_board
 
 PENDING = object()
 NOT_PREFETCHED = object()
+
+
+@st.cache_resource(show_spinner=False)
+def account_read_executor() -> ThreadPoolExecutor:
+    """账号刷新和租约检查不排在研究概览请求后面。"""
+    return ThreadPoolExecutor(max_workers=4, thread_name_prefix="account-read")
+
+
+def read_account_data(api_base: str, path: str, token: str | None, client: httpx.Client):
+    """消费已完成的读取；缓存缺失时只提交一次后台任务。"""
+    result = take_account_result(api_base, path)
+    if result is NOT_PREFETCHED:
+        pending = st.session_state.setdefault("account_prefetch", {})
+        pending[(api_base, path)] = account_read_executor().submit(
+            request_json, client, api_base, "GET", path, None, token,
+        )
+        return PENDING
+    return result
 
 
 def cancel_account_prefetch() -> None:

@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
+import hashlib
 import os
 from dataclasses import dataclass
 from typing import Any
+from time import perf_counter
 
 import httpx
 from pydantic import ValidationError
@@ -19,6 +22,9 @@ from pydantic import ValidationError
 from backend.app.agents.base import BaseAgent
 from backend.app.agents.rule_agents import make_rule_agents
 from backend.app.models import AgentResult, OrchestrationRequest, TaskStatus
+from backend.app.services.model_telemetry import analysis_telemetry
+from backend.app.services.model_input import slice_facts_for_agent
+from backend.app.services.model_response_cache import ModelResponseCache
 
 
 ROLE_INSTRUCTIONS = {
@@ -45,14 +51,22 @@ class LLMConfig:
     max_output_tokens: int = 2000
     max_input_chars: int = 60000
     thinking_mode: str = "auto"
+    input_price_per_million: float | None = None
+    output_price_per_million: float | None = None
+    cache_ttl_seconds: float = 120
 
     def __post_init__(self) -> None:
         if not (0 < self.timeout_seconds <= 60 and 0 <= self.max_retries <= 1
                 and self.max_concurrency >= 1 and self.max_output_tokens >= 1
                 and self.max_input_chars >= 1000):
             raise ValueError("LLM 配置越界：超时须 <=60 秒，重试最多 1 次，其余限制须为正")
+        if not 0 <= self.cache_ttl_seconds <= 900:
+            raise ValueError("模型精确输入缓存有效期须在 0 至 900 秒之间")
         if self.thinking_mode not in {"auto", "disabled", "enabled", "omit"}:
             raise ValueError("thinking_mode 必须为 auto、disabled、enabled 或 omit")
+        for price in (self.input_price_per_million, self.output_price_per_million):
+            if price is not None and (price < 0 or not math.isfinite(price)):
+                raise ValueError("模型价格须为非负有限数值，单位 USD/百万 token")
 
     @classmethod
     def from_env(cls) -> "LLMConfig | None":
@@ -69,6 +83,11 @@ class LLMConfig:
             max_output_tokens=int(os.getenv("WENCE_LLM_MAX_OUTPUT_TOKENS", "2000")),
             max_input_chars=int(os.getenv("WENCE_LLM_MAX_INPUT_CHARS", "60000")),
             thinking_mode=os.getenv("WENCE_LLM_THINKING_MODE", "auto").strip().lower(),
+            cache_ttl_seconds=float(os.getenv("WENCE_LLM_CACHE_TTL_SECONDS", "120")),
+            input_price_per_million=(float(os.environ["WENCE_LLM_INPUT_USD_PER_MILLION"])
+                                     if os.getenv("WENCE_LLM_INPUT_USD_PER_MILLION") else None),
+            output_price_per_million=(float(os.environ["WENCE_LLM_OUTPUT_USD_PER_MILLION"])
+                                      if os.getenv("WENCE_LLM_OUTPUT_USD_PER_MILLION") else None),
         )
 
 
@@ -82,30 +101,94 @@ class OpenAICompatibleLLM:
         # 一个应用进程共享连接池，避免每个并行专业节点都重复建立 TCP/TLS 连接。
         # 请求级超时仍由 complete_json 的总预算控制，不改变重试和降级路径。
         self._client = httpx.AsyncClient(transport=transport, timeout=config.timeout_seconds)
+        self._responses = ModelResponseCache(config.cache_ttl_seconds)
 
     async def aclose(self) -> None:
         """在应用退出时释放共享连接池。"""
 
+        await self._responses.aclose()
         await self._client.aclose()
 
     async def complete_json(self, *, system: str, payload: dict[str, Any]) -> dict[str, Any]:
         """队列等待、重试及网络共同受单次总超时限制，不截断事实或语义输入。"""
         # 紧凑 JSON 不删减任何字段，只移除无语义空白，减少传输与模型输入 token。
         content = json.dumps(payload, ensure_ascii=False, default=str, separators=(",", ":"))
-        if len(system) + len(content) > self.config.max_input_chars:
-            raise RuntimeError("模型输入超过预算")
-        try:
+        collector = analysis_telemetry.get()
+        sent_facts = payload.get("authorized_facts") or []
+        started = perf_counter()
+        record: dict[str, Any] = {"purpose": (payload.get("required_output") or {}).get("agent_id")
+                                  or (payload.get("required_schema") or {}).get("title", "semantic"),
+                                  "model": self.config.model, "input_chars": len(system) + len(content),
+                                  "input_fact_count": len(sent_facts),
+                                  "queue_ms": 0, "network_ms": 0, "attempts": 0,
+                                  "prompt_tokens": None, "completion_tokens": None,
+                                  "estimated_cost_usd": None, "status": "failed"}
+        if collector is not None:
+            collector.setdefault("model_fact_ids", set()).update(fact["fact_id"] for fact in sent_facts)
+        async def perform():
             async with asyncio.timeout(self.config.timeout_seconds):
                 async with self._semaphore:
-                    return await self._complete(system, content)
+                    record["queue_ms"] = round((perf_counter() - started) * 1000, 2)
+                    return await self._complete(system, content, record,
+                        fast=bool(collector and collector.get("mode") == "fast"))
+        try:
+            if len(system) + len(content) > self.config.max_input_chars:
+                raise RuntimeError("模型输入超过预算")
+            scope = collector.get("cache_scope") if collector else None
+            if scope is not None and self.config.cache_ttl_seconds:
+                key = hashlib.sha256(json.dumps([scope, collector.get("mode"), system, content],
+                                               ensure_ascii=False).encode()).hexdigest()
+                result, hit = await self._responses.get(key, perform,
+                    cacheable=lambda result: self._cacheable(result, payload))
+                record["cache_hit"] = hit
+                if hit:
+                    record["estimated_cost_usd"] = 0
+            else:
+                result = await perform()
+                record["cache_hit"] = False
+            record["status"] = "completed"
+            return result
         except TimeoutError as exc:
+            record["status"] = "timeout"
             raise RuntimeError("模型调用超过总时间预算") from exc
+        except asyncio.CancelledError:
+            record["status"] = "cancelled"
+            raise
+        finally:
+            record["total_ms"] = round((perf_counter() - started) * 1000, 2)
+            if not record["attempts"]:
+                record["queue_ms"] = record["total_ms"]
+            if collector is not None:
+                collector["calls"].append(record)
 
-    async def _complete(self, system: str, content: str) -> dict[str, Any]:
+    @staticmethod
+    def _cacheable(result, payload):
+        try:
+            schema = payload.get("required_schema")
+            if schema:
+                from backend.app.semantic import RequestUnderstanding, OutputReview, ProfileExtraction
+                model = {"RequestUnderstanding": RequestUnderstanding, "OutputReview": OutputReview,
+                         "ProfileExtraction": ProfileExtraction}.get(schema.get("title"))
+                if model is None:
+                    return False
+                model.model_validate(result)
+            agent_id = (payload.get("required_output") or {}).get("agent_id")
+            if agent_id:
+                candidate = AgentResult.model_validate({"status": "completed", "confidence": 0,
+                    "opinion": (payload.get("rule_baseline") or {}).get("opinion", ""),
+                    **result, "agent_id": agent_id})
+                allowed = {fact["fact_id"] for fact in payload.get("authorized_facts", [])}
+                if not set(candidate.facts_used) <= allowed:
+                    return False
+            return True
+        except (ValidationError, ValueError, TypeError):
+            return False
+
+    async def _complete(self, system: str, content: str, record: dict[str, Any], *, fast: bool = False) -> dict[str, Any]:
         request_body = {
             "model": self.config.model,
             "temperature": 0.1,
-            "max_tokens": self.config.max_output_tokens,
+            "max_tokens": min(1000, self.config.max_output_tokens) if fast else self.config.max_output_tokens,
             "response_format": {"type": "json_object"},
             "messages": [
                 {"role": "system", "content": system},
@@ -123,12 +206,28 @@ class OpenAICompatibleLLM:
         last_error: Exception | None = None
         for attempt in range(self.config.max_retries + 1):
             try:
-                response = await self._client.post(
-                    f"{self.config.base_url}/chat/completions",
-                    headers=headers, json=request_body,
-                )
+                record["attempts"] += 1
+                network_started = perf_counter()
+                try:
+                    response = await self._client.post(
+                        f"{self.config.base_url}/chat/completions",
+                        headers=headers, json=request_body,
+                    )
+                finally:
+                    record["network_ms"] = round(record["network_ms"] + (perf_counter() - network_started) * 1000, 2)
                 response.raise_for_status()
-                choice = response.json()["choices"][0]
+                body = response.json()
+                usage = body.get("usage") or {}
+                for key in ("prompt_tokens", "completion_tokens"):
+                    count = usage.get(key)
+                    if type(count) is int and count >= 0:
+                        record[key] = (record[key] or 0) + count
+                if (record["prompt_tokens"] is not None and record["completion_tokens"] is not None
+                        and self.config.input_price_per_million is not None
+                        and self.config.output_price_per_million is not None):
+                    record["estimated_cost_usd"] = round((record["prompt_tokens"] * self.config.input_price_per_million
+                        + record["completion_tokens"] * self.config.output_price_per_million) / 1_000_000, 8)
+                choice = body["choices"][0]
                 if choice.get("finish_reason") == "length":
                     raise RuntimeError("模型输出已达到 token 上限，未接受截断结果")
                 raw = choice["message"]["content"]
@@ -160,14 +259,17 @@ class HybridInvestmentAgent(BaseAgent):
 
     async def run(self, request: OrchestrationRequest) -> AgentResult:
         baseline: AgentResult = await self.rule_handler(request)
+        baseline.rule_score = baseline.score
         if not request.facts:
             return baseline
         facts_by_id = {fact.fact_id: fact for fact in request.facts}
+        model_facts = slice_facts_for_agent(request.facts, self.agent_id, baseline.facts_used,
+                                          mode=request.research_mode)
         payload = {
             "query": request.query,
             "conversation": [turn.model_dump(mode="json") for turn in request.context_messages[-10:]],
             "profile": request.profile.model_dump(mode="json", exclude={"user_id"}),
-            "authorized_facts": [fact.model_dump(mode="json") for fact in request.facts],
+            "authorized_facts": [fact.model_dump(mode="json") for fact in model_facts],
             "rule_baseline": baseline.model_dump(mode="json"),
             "required_output": {
                 "agent_id": self.agent_id,
@@ -191,6 +293,8 @@ class HybridInvestmentAgent(BaseAgent):
             "术语随附短解释，不展示内部名称、字段编码、评分或运行过程。风险、分歧和资料限制必须保留；"
             "列表去重且各不超过3项，每项一句中文。"
         )
+        if request.research_mode == "fast":
+            system += "本次为快速研究：opinion控制在80字内；风险与缺口必须保留，其余列表最多2项。"
         try:
             raw = await self.llm.complete_json(system=system, payload=payload)
             if not isinstance(raw, dict):
@@ -201,7 +305,7 @@ class HybridInvestmentAgent(BaseAgent):
             raw.setdefault("opinion", baseline.opinion)
             raw.setdefault("facts_used", [])
             candidate = AgentResult.model_validate(raw)
-            self.ensure_fact_only(candidate.facts_used, request.facts)
+            self.ensure_fact_only(candidate.facts_used, model_facts)
             # citations 由受信事实层重建，不接受模型自行填写的数据来源。
             candidate.citations = sorted({facts_by_id[fact_id].source_id for fact_id in candidate.facts_used})
             if not candidate.facts_used:
@@ -220,10 +324,17 @@ class HybridInvestmentAgent(BaseAgent):
             # 模型允许返回 null 分数（"无可比评分"）。但规则基线已经算出了同一批
             # 事实的确定性分数，模型不得把它抹掉：否则该节点会静默退出共识计算
             # 与"评分分散"核验，等于让模型自己决定要不要被交叉检查。
-            if candidate.score is None and baseline.score is not None:
-                candidate.score = baseline.score
+            candidate.model_score = candidate.score
+            candidate.rule_score = baseline.score
+            candidate.score = baseline.score
+            if candidate.model_score is None and baseline.score is not None:
                 candidate.confidence_reasons = list(dict.fromkeys(
                     [*candidate.confidence_reasons, "模型未给出评分，沿用规则基线分数"]))
+            if candidate.model_score != baseline.score:
+                candidate.score_difference_reason = (
+                    "模型判断与可复算规则分不同；共识计算仅采用规则分。"
+                    if baseline.score is not None else "缺少可复算规则分，模型评分不参与共识计算。"
+                )
             candidate.details = {
                 **baseline.details, "llm_assessment": candidate.details,
                 "engine": "third_party_llm", "model": self.llm.config.model,

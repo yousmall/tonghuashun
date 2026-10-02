@@ -29,6 +29,7 @@ class FakeIwencaiProvider:
             entity=entity,
             field=field,
             value=value,
+            unit="ratio" if field in {"change", "roe", "revenue_growth"} else None,
             snapshot_time=datetime.now(timezone.utc),
             source_id=self.source_id,
             quality=0.9,
@@ -107,7 +108,7 @@ def test_pipeline_routes_live_data_and_preserves_derivation_lineage() -> None:
         "macro", "industry", "quote", "financial", "event", "institutional_research",
     }
     assert audit.fetched_fact_count == 18
-    derived = [fact for fact in prepared.facts if fact.source_id == "DERIVED_RULE_V1"]
+    derived = [fact for fact in prepared.facts if fact.source_id == "DERIVED_RULE_V2"]
     assert {fact.field for fact in derived} == {
         "fundamental_score",
         "valuation_score",
@@ -219,10 +220,15 @@ def test_analyze_endpoint_returns_fetched_and_derived_facts(monkeypatch) -> None
     assert response.status_code == 200
     body = response.json()
     assert body["data_acquisition"]["mode"] == "live"
-    assert body["data_acquisition"]["fetched_fact_count"] == 18
+    # Repair known event/governance gaps before the first analysis; the complete
+    # verifier/compliance chain still checks the final evidence.
+    assert body["data_acquisition"]["fetched_fact_count"] == 19
+    assert body["data_acquisition"]["recovery_rounds"] == 1
+    assert not body["data_acquisition"]["recovery_reanalyzed"]
+    assert body["data_acquisition"]["recovery_phase"] == "before_analysis"
     assert body["risk_conclusion"]
     assert any(fact["source_id"] == "IWENCAI_TEST" for fact in body["facts"])
-    assert any(fact["source_id"] == "DERIVED_RULE_V1" for fact in body["facts"])
+    assert any(fact["source_id"] == "DERIVED_RULE_V2" for fact in body["facts"])
     assert set(body["evidence"]).issubset({fact["fact_id"] for fact in body["facts"]})
     # 来源调用键必须走通 API：浏览器要靠它把"这份资料是哪次取回的"带回下一轮，
     # 序列化时丢掉这个字段会让复用永远失效，而且不会报错。
@@ -374,9 +380,10 @@ def test_without_extracted_target_a_reworded_question_refetches() -> None:
         pipeline.prepare(follow_up(first.facts), Intent.SECURITY_RESEARCH)
     )
 
-    assert provider.calls == [
-        "macro", "industry", "quote", "financial", "event", "institutional_research",
-    ]
+    # The identical public macro query is reusable independently of the
+    # unresolved security target. Target-dependent calls still refetch.
+    assert provider.calls == ["industry", "quote", "financial", "event", "institutional_research"]
+    assert audit.cached_capabilities == ["macro"]
     assert audit.reused_capabilities == []
 
 
@@ -452,7 +459,7 @@ def test_changing_the_portfolio_invalidates_the_reuse_scope() -> None:
         )
     )
 
-    assert "macro" in provider.calls and "industry" in provider.calls
+    assert set(audit.cached_capabilities) == {"macro", "industry"}
     assert "macro" not in audit.reused_capabilities
     # 没变的那只持仓仍可沿用，不必跟着一起重取。
     assert "quote:1:示例科技" in audit.reused_capabilities

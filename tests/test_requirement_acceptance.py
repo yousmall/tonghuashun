@@ -135,6 +135,19 @@ async def test_analysis_counts_full_runtime_and_review_separately(monkeypatch):
     assert metrics.snapshot()["analysis"]["within_3_seconds_count"] == 2
 
 
+def test_fast_overload_rejections_do_not_count_as_completed_advice():
+    metrics = ServiceMetrics()
+    for outcome in ("OVERLOADED", "ERROR"):
+        metrics.record_analysis(20, outcome)
+    for outcome in ("PASS", "REVIEW", "BLOCK"):
+        metrics.record_analysis(500, outcome)
+    metrics.record_analysis(4000, "PASS")
+    snapshot = metrics.snapshot()["analysis"]
+    assert snapshot["count"] == 6
+    assert snapshot["outcomes"]["OVERLOADED"] == 1
+    assert snapshot["within_3_seconds_count"] == 3
+
+
 def test_derived_input_lineage_and_dag_survive_history():
     root = request().facts[0].model_dump(mode="json")
     derived = {**root, "fact_id": "DERIVED-1", "field": "portfolio_score", "source_id": "DERIVED_RULE", "derived_from": [root["fact_id"]]}

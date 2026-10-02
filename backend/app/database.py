@@ -17,7 +17,6 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, rela
 from sqlalchemy.pool import StaticPool
 
 from backend.app.auth import hash_password
-from backend.app.risk_questionnaire import local_today
 
 
 class DatabaseUnavailable(RuntimeError):
@@ -26,10 +25,6 @@ class DatabaseUnavailable(RuntimeError):
 
 class ProfileVersionConflict(ValueError):
     """保存画像时客户端版本已经落后。"""
-
-
-class ProfileDailyLimit(ValueError):
-    """同一账号的新风险测评每天只保存一次。"""
 
 
 class UsernameExists(ValueError):
@@ -133,6 +128,14 @@ class MessageRow(Base):
     payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
     conversation: Mapped[ConversationRow] = relationship(back_populates="messages")
+
+
+class ResearchEvidenceRow(Base):
+    """Full evidence is fetched by message key, never carried through a filesort."""
+    __tablename__ = "research_evidence"
+    message_id: Mapped[int] = mapped_column(Integer, ForeignKey("messages.id", ondelete="CASCADE"), primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    facts: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False)
 
 
 class ConsultationRow(Base):
@@ -333,11 +336,7 @@ class Database:
             )
             current_version = int(row.version) if row is not None else 1
             if expected_version is not None and expected_version != current_version:
-                raise ProfileVersionConflict("投资偏好已在其他页面更新，请重新打开投资偏好后再确认。")
-            if (row is not None and payload.get("questionnaire_version")
-                    and row.payload.get("questionnaire_version")
-                    and str(row.payload.get("assessed_on")) == str(local_today())):
-                raise ProfileDailyLimit("今日已保存风险测评，每日只能保存一次，请明日重新测评。")
+                raise ProfileVersionConflict("风险评估已在其他页面更新，请重新打开风险评估后再确认。")
             if row is None:
                 session.add(ProfileRow(user_id=user_id, payload=payload, version=version))
             else:
@@ -423,6 +422,7 @@ class Database:
         request_payload: dict[str, Any],
         answer: str,
         response_payload: dict[str, Any],
+        evidence_facts: list[dict[str, Any]] | None = None,
     ) -> str:
         """在同一事务中保存一次用户提问和助手回答。"""
         self.require_ready()
@@ -441,9 +441,20 @@ class Database:
             conversation.updated_at = datetime.now(timezone.utc)
             user_message = MessageRow(conversation_id=resolved_id, user_id=user_id,
                                       role="user", content=query, payload=request_payload)
-            session.add_all([user_message, MessageRow(conversation_id=resolved_id, user_id=user_id,
-                                                     role="assistant", content=answer, payload=response_payload)])
+            assistant_payload = dict(response_payload)
+            assistant_message = MessageRow(conversation_id=resolved_id, user_id=user_id,
+                                           role="assistant", content=answer, payload=assistant_payload)
+            # Supplied request facts are replayed from the independent evidence
+            # store; avoid duplicating large JSON in the sorted messages table.
+            if evidence_facts is not None:
+                user_message.payload = {**request_payload, "facts": []}
+                assistant_payload.update({"evidence_count": len(evidence_facts),
+                                          "evidence_storage": "research_evidence"})
+            session.add_all([user_message, assistant_message])
             session.flush()
+            if evidence_facts is not None:
+                session.add(ResearchEvidenceRow(message_id=assistant_message.id,
+                                                user_id=user_id, facts=evidence_facts))
             metadata = request_payload.get("_analytics") or {}
             session.add(ConsultationRow(message_id=user_message.id, user_id=user_id,
                                         domain=metadata.get("domain") or "unknown",
@@ -522,6 +533,23 @@ class Database:
             newest = session.scalars(query.order_by(MessageRow.id.desc()).limit(limit + 1)).all()
             has_more = len(newest) > limit
             messages = list(reversed(newest[:limit]))
+            evidence_rows = session.scalars(select(ResearchEvidenceRow).where(
+                ResearchEvidenceRow.user_id == user_id,
+                ResearchEvidenceRow.message_id.in_([message.id for message in messages]),
+            )).all() if messages else []
+            evidence_by_message = {row.message_id: row.facts for row in evidence_rows}
+
+            def restored_payload(message: MessageRow) -> dict[str, Any] | None:
+                if message.id not in evidence_by_message:
+                    return message.payload
+                facts = evidence_by_message[message.id]
+                payload = message.payload or {}
+                by_id = {fact.get("fact_id"): fact for fact in facts}
+                cross = payload.get("cross_validation") or {}
+                issues = [{**issue, "evidence_details": [by_id[fact_id] for fact_id in issue.get("fact_ids") or [] if fact_id in by_id]}
+                          for issue in cross.get("issues") or []]
+                return {**payload, "facts": facts, "cross_validation": {**cross, "issues": issues},
+                        "facts_truncated": False, "evidence_restored": True}
             return {
                 "id": conversation.id, "title": conversation.title,
                 "created_at": self._utc(conversation.created_at),
@@ -531,7 +559,7 @@ class Database:
                 "messages": [
                     {
                         "id": message.id, "role": message.role, "content": message.content,
-                        "payload": message.payload, "created_at": self._utc(message.created_at),
+                        "payload": restored_payload(message), "created_at": self._utc(message.created_at),
                     }
                     for message in messages
                 ],

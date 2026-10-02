@@ -10,6 +10,9 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Iterable
 from typing import Any
+from datetime import datetime, timezone
+import math
+from backend.app.fact_taxonomy import SCORE_FIELDS, fact_is_current
 
 from backend.app.agents.base import BaseAgent, clamp_score, evidence_metadata, numeric_fact_values
 from backend.app.models import AgentResult, FactRecord, OrchestrationRequest, TaskStatus
@@ -22,7 +25,20 @@ def _field_matches(fact: FactRecord, names: set[str]) -> bool:
 
 def _matching_facts(facts: Iterable[FactRecord], names: set[str]) -> list[FactRecord]:
     """只返回本 Agent 声明需要的事实；不匹配的数据绝不会被悄悄引用。"""
-    return [fact for fact in facts if _field_matches(fact, names)]
+    selected = {}
+    now = datetime.now(timezone.utc)
+    for fact in facts:
+        if not _field_matches(fact, names):
+            continue
+        if fact.field.lower() in SCORE_FIELDS and (not fact_is_current(fact, now)
+                or type(fact.value) not in {int, float} or not math.isfinite(fact.value)
+                or not 0 <= fact.value <= 100):
+            continue
+        key = (fact.entity, fact.field.lower())
+        previous = selected.get(key)
+        if previous is None or (fact.snapshot_time, fact.quality) > (previous.snapshot_time, previous.quality):
+            selected[key] = fact
+    return list(selected.values())
 
 
 def _degraded(agent_id: str, missing: list[str], *, details: dict[str, Any] | None = None) -> AgentResult:
@@ -56,7 +72,11 @@ class MacroAgent(BaseAgent):
     }
 
     async def run(self, request: OrchestrationRequest) -> AgentResult:
-        by_field = {fact.field.lower(): fact for fact in request.facts}
+        by_entity: dict[str, dict[str, FactRecord]] = defaultdict(dict)
+        for fact in _matching_facts(request.facts, set(self._weights)):
+            if fact.field.lower() in self._weights:
+                by_entity[fact.entity][fact.field.lower()] = fact
+        by_field = max(by_entity.values(), key=lambda fields: len(fields), default={})
         missing = [field for field in self._weights if field not in by_field]
         if missing:
             return _degraded(self.agent_id, missing)
@@ -144,6 +164,7 @@ class StockAgent(BaseAgent):
         if not numeric:
             return _degraded(self.agent_id, ["至少一个数值评分字段"])
         by_field = {fact.field.lower(): value for fact, value in numeric}
+        missing = sorted(self._fields - set(by_field))
         score = clamp_score(sum(by_field.values()) / len(by_field))
         fundamental = by_field.get("fundamental_score")
         technical = by_field.get("technical_score")
@@ -151,19 +172,20 @@ class StockAgent(BaseAgent):
         fact_ids, citations = evidence_metadata(chosen)
         return AgentResult(
             agent_id=self.agent_id,
-            status=TaskStatus.COMPLETED if len(chosen) >= 2 else TaskStatus.DEGRADED,
+            status=TaskStatus.DEGRADED if missing else TaskStatus.COMPLETED,
             opinion=(
                 f"{entity}的基本面与技术面存在时间维度分歧，应分别展示长期与短期判断。"
                 if conflict else f"{entity}的可用研究维度已按授权快照汇总。"
             ),
             score=score,
             confidence=round(sum(f.quality for f in chosen) / len(chosen) * min(1, len(chosen) / 3), 2),
-            confidence_reasons=[] if len(chosen) >= 2 else ["研究维度不足"],
+            confidence_reasons=["研究维度不足"] if missing else [],
             facts_used=fact_ids,
             citations=citations,
             risk_flags=["基本面与技术面分歧"] if conflict else [],
             invalidation_conditions=["财报期或价格快照更新", "治理或事件事实发生变化"],
-            details={"security": entity, "dimension_scores": by_field, "has_time_horizon_conflict": conflict},
+            details={"security": entity, "dimension_scores": by_field, "missing_fields": missing,
+                     "has_time_horizon_conflict": conflict},
         )
 
 

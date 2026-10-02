@@ -60,6 +60,10 @@ INTENT_FIELD_PRIORITY: dict[Intent, tuple[str, ...]] = {
         "target_price", "rating", "earnings_forecast", "event",
         "industry", "news", "announcement", "research_report",
         "prosperity_score", "valuation_score", "policy_score",
+        "company_name", "main_business", "revenue_composition", "major_customer",
+        "major_supplier", "major_contract", "controlling_shareholder", "actual_controller",
+        "shareholder_count", "total_shares", "float_shares", "listing_date",
+        "gross_margin", "net_margin", "operating_margin",
     ),
     Intent.FUND_SCREENING: (
         "fee_rate", "tracking_error", "fund_score", "fund_risk_level", "liquidity_score",
@@ -89,6 +93,7 @@ def slice_facts_for_model(
     *,
     limit: int = MAX_MODEL_FACTS,
     now: datetime | None = None,
+    multi_record_limit: int = MULTI_RECORD_LIMIT,
 ) -> tuple[list[FactRecord], dict[str, Any]]:
     """返回（送入模型的事实子集, 切片说明）。子集仍是 FactRecord，可直接参与核验。"""
 
@@ -103,7 +108,7 @@ def slice_facts_for_model(
     selected: list[FactRecord] = []
     for (_, field), records in grouped.items():
         if field in MULTI_RECORD_FIELDS:
-            records = sorted(records, key=lambda item: item.snapshot_time, reverse=True)[:MULTI_RECORD_LIMIT]
+            records = sorted(records, key=lambda item: item.snapshot_time, reverse=True)[:multi_record_limit]
         else:
             records = [max(records, key=lambda item: (item.snapshot_time, item.quality, item.quality))]
         selected.extend(records)
@@ -122,7 +127,7 @@ def slice_facts_for_model(
         else:
             tier = len(priority_index) + 4
         freshness = (fact.snapshot_time - current).total_seconds()
-        return (tier, 0 if fact.quality >= 0.6 else 1, freshness, -fact.quality)
+        return (tier, 0 if fact.quality >= 0.6 else 1, -freshness, -fact.quality)
 
     selected.sort(key=rank)
     kept = selected[:limit]
@@ -134,3 +139,25 @@ def slice_facts_for_model(
         "truncated": dropped > 0,
     }
     return kept, summary
+
+
+def slice_facts_for_agent(facts: list[FactRecord], agent_id: str, baseline_ids: list[str], *, mode: str = "deep") -> list[FactRecord]:
+    """Role-specific input, always retaining the baseline and its full lineage."""
+    role_intent = {"market": Intent.MARKET_ANALYSIS, "industry": Intent.INDUSTRY_ANALYSIS,
+                   "security": Intent.SECURITY_RESEARCH, "fund": Intent.FUND_SCREENING,
+                   "portfolio": Intent.PORTFOLIO_REVIEW}[agent_id]
+    by_id = {fact.fact_id: fact for fact in facts}
+    required = set(baseline_ids)
+    pending = list(required)
+    while pending:
+        fact = by_id.get(pending.pop())
+        for parent in fact.derived_from if fact else ():
+            if parent not in required:
+                required.add(parent)
+                pending.append(parent)
+    relevant = set(INTENT_FIELD_PRIORITY[role_intent])
+    extra = [fact for fact in facts if fact.field.casefold() in relevant and fact.fact_id not in required]
+    budget = 40 if mode == "fast" else 80
+    selected, _ = slice_facts_for_model(extra, role_intent, limit=max(0, budget - len(required)),
+                                      multi_record_limit=2 if mode == "fast" else MULTI_RECORD_LIMIT)
+    return [fact for fact in facts if fact.fact_id in required] + selected

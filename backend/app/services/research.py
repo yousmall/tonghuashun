@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import json
+import math
+from time import perf_counter
 import re
 from collections import defaultdict
 from dataclasses import dataclass
@@ -19,6 +22,12 @@ from backend.app.models import (
     ResearchCapability,
 )
 from backend.app.fact_taxonomy import fact_is_current, fact_max_age_seconds
+from backend.app.fact_units import PERCENT_FIELDS
+from backend.app.services.evidence_coverage import missing_fields_by_agent
+from backend.app.services.research_cache import ResearchFactCache
+from backend.app.services.provider_errors import failure_summary
+from backend.app.services.scoring_dimensions import additional_dimensions
+from backend.app.services.derived_score_cache import DerivedScoreCache
 
 
 @dataclass(frozen=True)
@@ -81,14 +90,20 @@ class AutomatedResearchPipeline:
         now: Callable[[], datetime] | None = None,
         max_portfolio_entities: int = 4,
         call_timeout_seconds: float | None = None,
+        cache: ResearchFactCache | None = None,
     ) -> None:
         self.provider = provider
         self.now = now or (lambda: datetime.now(timezone.utc))
         self.max_portfolio_entities = max_portfolio_entities
+        self.cache = cache or ResearchFactCache()
+        self.score_cache = DerivedScoreCache()
         self.call_timeout_seconds = float(call_timeout_seconds if call_timeout_seconds is not None
                                           else os.getenv("WENCE_DATA_CALL_TIMEOUT_SECONDS", "30"))
         if not 0 < self.call_timeout_seconds <= 60:
             raise ValueError("数据能力总超时须大于 0 且不超过 60 秒")
+
+    def _derive(self, facts):
+        return self.score_cache.derive(facts, self.now(), derive_scoring_facts)
 
     async def prepare(
         self,
@@ -97,11 +112,13 @@ class AutomatedResearchPipeline:
         *,
         target: str | None = None,
         data_requirements: list[ResearchCapability] | None = None,
+        planned_calls: list[DataCall] | None = None,
+        force_refresh: bool = False,
     ) -> tuple[OrchestrationRequest, DataAcquisitionResult]:
         """返回补齐事实后的请求以及不泄露底层异常的取数审计摘要。
 
-        ``target`` 是语义层抽取的研究对象，仅用于判断"同一份资料本轮是否已经取过"。
-        真正发给数据源的仍是用户原话：问财接受自然语言查询，改写它反而会改变结果。
+        ``target`` is used only in fixed capability templates. Screening and
+        topical news retain the user's conditions; macro calls use macro scope.
         """
 
         supplied = [fact.model_copy(deep=True) for fact in request.facts]
@@ -109,12 +126,13 @@ class AutomatedResearchPipeline:
         base_facts = _merge_by_fact_id([*supplied, *portfolio_facts])
 
         if not request.auto_fetch:
-            derived = derive_scoring_facts(base_facts, now=self.now())
+            derived = self._derive(base_facts)
             prepared = request.model_copy(update={"facts": _merge_by_fact_id([*base_facts, *derived])})
             return prepared, DataAcquisitionResult(
                 mode="provided",
                 supplied_fact_count=len(supplied),
                 derived_fact_count=len(portfolio_facts) + len(derived),
+                missing_fields_by_agent=missing_fields_by_agent(prepared.facts, intent, now=self.now()),
                 message="自动取数已由调用方关闭，仅使用显式事实和持仓快照。",
             )
 
@@ -127,10 +145,11 @@ class AutomatedResearchPipeline:
                 message="当前请求尚未通过画像/意图闸门，未调用外部数据源。",
             )
 
-        calls = self._calls_for(request, intent, target, data_requirements)
+        target = self._validated_target(request, target)
+        calls = planned_calls if planned_calls is not None else self._calls_for(request, intent, target, data_requirements)
         requested = [call.label for call in calls]
         if self.provider is None:
-            derived = derive_scoring_facts(base_facts, now=self.now())
+            derived = self._derive(base_facts)
             prepared = request.model_copy(update={"facts": _merge_by_fact_id([*base_facts, *derived])})
             return prepared, DataAcquisitionResult(
                 mode="unavailable",
@@ -138,23 +157,41 @@ class AutomatedResearchPipeline:
                 supplied_fact_count=len(supplied),
                 derived_fact_count=len(portfolio_facts) + len(derived),
                 message="未配置问财只读密钥，已仅使用调用方事实和持仓快照。",
+                missing_fields_by_agent=missing_fields_by_agent(prepared.facts, intent, now=self.now()),
             )
 
         # 追问时最容易浪费的一段：同一目标的资料通常几分钟前才取过。这里先判断
         # 哪些能力可以直接沿用，只对真正缺资料的能力发起外部调用。
-        reusable, pending = self._split_reusable(calls, base_facts, self.now())
+        reusable, pending = ([], calls) if force_refresh else self._split_reusable(calls, base_facts, self.now())
         reused = [call.label for call in reusable]
+        call_timings: dict[str, float] = {}
+        cached_calls: list[str] = []
+        async def fetch(call: DataCall) -> list[FactRecord]:
+            started = perf_counter()
+            try:
+                # Only adapter-returned public facts enter this cache; profiles,
+                # supplied facts, holdings and model answers are never cached.
+                key = self._cache_key(call)
+                facts, cached = await self.cache.get(key, lambda: self._execute(call), self.now,
+                                                     force_refresh=force_refresh)
+                if cached:
+                    cached_calls.append(call.label)
+                return [fact.model_copy(update={"produced_by": call.key}) for fact in facts]
+            finally:
+                call_timings[call.label] = round((perf_counter() - started) * 1000, 2)
         results = await asyncio.gather(
-            *(self._execute(call) for call in pending),
+            *(fetch(call) for call in pending),
             return_exceptions=True,
         )
         fetched: list[FactRecord] = []
         successful: list[str] = []
         empty: list[str] = []
         failed: list[str] = []
+        errors = {}
         for call, result in zip(pending, results, strict=True):
             if isinstance(result, BaseException):
                 failed.append(call.label)
+                errors[call.label] = failure_summary(result)
             elif result:
                 successful.append(call.label)
                 fetched.extend(result)
@@ -162,7 +199,7 @@ class AutomatedResearchPipeline:
                 empty.append(call.label)
 
         source_facts = _merge_by_fact_id([*base_facts, *fetched])
-        derived = derive_scoring_facts(source_facts, now=self.now())
+        derived = self._derive(source_facts)
         all_facts = _merge_by_fact_id([*source_facts, *derived])
         if fetched:
             mode = "mixed" if base_facts else "live"
@@ -191,11 +228,20 @@ class AutomatedResearchPipeline:
             reused_capabilities=reused,
             empty_capabilities=empty,
             failed_capabilities=failed,
+            capability_errors=errors,
             supplied_fact_count=len(supplied),
-            fetched_fact_count=len(fetched),
+            fetched_fact_count=len(_merge_by_fact_id(fetched)),
             derived_fact_count=len(portfolio_facts) + len(derived),
             message=message,
+            missing_fields_by_agent=missing_fields_by_agent(all_facts, intent, now=self.now()),
+            capability_timings_ms=call_timings,
+            cached_capabilities=cached_calls,
         )
+
+    def _cache_key(self, call: DataCall) -> str:
+        method = getattr(self.provider, "cache_method_aliases", {}).get(call.method, call.method)
+        return json.dumps([getattr(self.provider, "cache_namespace", type(self.provider).__name__),
+                           method, call.args], ensure_ascii=False, sort_keys=True)
 
     async def _execute(self, call: DataCall) -> list[FactRecord]:
         method = getattr(self.provider, call.method)
@@ -290,6 +336,7 @@ class AutomatedResearchPipeline:
                 ("news", "get_news"),
             ),
             Intent.INDUSTRY_ANALYSIS: (
+                ("macro", "get_macro_data"),
                 ("industry", "get_industry_rank"),
                 ("news", "get_news"),
             ),
@@ -305,10 +352,12 @@ class AutomatedResearchPipeline:
                 ("institutional_research", "get_institutional_research"),
             ),
             Intent.CONVERTIBLE_BOND_ANALYSIS: (
+                ("macro", "get_macro_data"),
+                ("industry", "get_industry_rank"),
                 ("convertible", "get_convertible_bond"),
                 ("news", "get_news"),
             ),
-            Intent.FUND_SCREENING: (),
+            Intent.FUND_SCREENING: (("macro", "get_macro_data"),),
             Intent.PORTFOLIO_REVIEW: (
                 ("macro", "get_macro_data"),
                 ("industry", "get_industry_rank"),
@@ -317,9 +366,9 @@ class AutomatedResearchPipeline:
             Intent.UNKNOWN: (),
         }
         calls = [
-            # args 仍然是用户原话（问财接受自然语言查询）；key 才用抽取出的研究对象，
-            # 这样"换一种问法问同一只票"能被识别为同一次取数。
-            DataCall(label=name, method=method, args=(query_text,), key=f"{method}@{research_target}")
+            DataCall(label=name, method=method,
+                     args=(self._query_scope(method, request, intent, target),),
+                     key=f"{method}@{research_target}")
             for name, method in routes[intent]
         ]
         if intent is Intent.FUND_SCREENING:
@@ -365,10 +414,33 @@ class AutomatedResearchPipeline:
                     capability,
                     request,
                     research_target=research_target,
+                    intent=intent, target=target,
                 )
             )
             planned_methods.add(method)
         return calls
+
+    @staticmethod
+    def _validated_target(request: OrchestrationRequest, target: str | None) -> str | None:
+        codes = set(re.findall(r"(?<!\d)\d{6}(?!\d)", request.query))
+        if len(codes) == 1:
+            return next(iter(codes))  # explicit current symbol takes precedence
+        if not target or codes:
+            return None
+        user_text = " ".join([request.query, *(turn.content for turn in request.context_messages[-10:] if turn.role == "user"),
+                              *(fact.entity for fact in request.facts),
+                              *(fact.entity_code or "" for fact in request.facts)])
+        return target if target.casefold() in user_text.casefold() else None
+
+    @staticmethod
+    def _query_scope(method: str, request: OrchestrationRequest, intent: Intent, target: str | None) -> str:
+        if method == "get_macro_data":
+            return request.query if intent is Intent.MARKET_ANALYSIS else "中国最新宏观经济"
+        if method == "get_industry_rank" and target and intent in {Intent.SECURITY_RESEARCH, Intent.CONVERTIBLE_BOND_ANALYSIS}:
+            return f"{target.strip()[:60]}所属行业"
+        if method in {"get_news", "screen_stocks", "screen_sectors"}:
+            return request.query
+        return target.strip()[:60] if target else request.query
 
     @staticmethod
     def _capability_call(
@@ -376,6 +448,8 @@ class AutomatedResearchPipeline:
         request: OrchestrationRequest,
         *,
         research_target: str,
+        intent: Intent,
+        target: str | None,
     ) -> DataCall:
         """把模型选择的白名单能力转换成后端控制的只读调用。"""
 
@@ -387,7 +461,7 @@ class AutomatedResearchPipeline:
             }
             args: tuple[Any, ...] = (filters,)
         else:
-            args = (request.query,)
+            args = (AutomatedResearchPipeline._query_scope(method, request, intent, target),)
         return DataCall(
             label=capability.value,
             method=method,
@@ -438,13 +512,17 @@ def derive_scoring_facts(facts: list[FactRecord], *, now: datetime) -> list[Fact
         by_field: dict[str, list[FactRecord]] = defaultdict(list)
         for fact in entity_facts:
             by_field[fact.field.casefold()].append(fact)
-        existing = set(by_field)
+        # Expired scores and scores derived from previous inputs must not
+        # suppress recomputation when the source facts have been refreshed.
+        existing = {field for field, records in by_field.items()
+                    if any(fact_is_current(fact, now) and not fact.source_id.startswith("DERIVED_RULE_")
+                           for fact in records)}
 
         fundamental_inputs: list[tuple[FactRecord, float]] = []
         for field, multiplier in (("roe", 1.5), ("revenue_growth", 1.0)):
             source = _latest_numeric(by_field.get(field, []), now)
             if source:
-                fundamental_inputs.append((source[0], _clamp(50 + _as_percent(source[1]) * multiplier)))
+                fundamental_inputs.append((source[0], _clamp(50 + source[1] * multiplier)))
         _append_score(derived, existing, entity, "fundamental_score", fundamental_inputs, now)
 
         valuation_inputs: list[tuple[FactRecord, float]] = []
@@ -463,7 +541,7 @@ def derive_scoring_facts(facts: list[FactRecord], *, now: datetime) -> list[Fact
                 existing,
                 entity,
                 "technical_score",
-                [(change[0], _clamp(50 + _as_percent(change[1]) * 3))],
+                [(change[0], _clamp(50 + change[1] * 3))],
                 now,
             )
 
@@ -481,7 +559,7 @@ def derive_scoring_facts(facts: list[FactRecord], *, now: datetime) -> list[Fact
         for field in ("cpi", "ppi"):
             source = _latest_numeric(by_field.get(field, []), now)
             if source:
-                value = _as_percent(source[1])
+                value = source[1]
                 inflation_inputs.append((source[0], _clamp(100 - abs(value - 2) * 12)))
         _append_score(derived, existing, entity, "inflation_score", inflation_inputs, now)
 
@@ -492,18 +570,24 @@ def derive_scoring_facts(facts: list[FactRecord], *, now: datetime) -> list[Fact
                 existing,
                 entity,
                 "liquidity_score",
-                [(rate[0], _clamp(75 - _as_percent(rate[1]) * 6))],
+                [(rate[0], _clamp(75 - rate[1] * 6))],
                 now,
             )
 
         fund_inputs: list[tuple[FactRecord, float]] = []
         fee = _latest_numeric(by_field.get("fee_rate", []), now)
         if fee:
-            fund_inputs.append((fee[0], _clamp(100 - _as_percent(fee[1]) * 20)))
+            fund_inputs.append((fee[0], _clamp(100 - fee[1] * 20)))
         tracking = _latest_numeric(by_field.get("tracking_error", []), now)
         if tracking:
-            fund_inputs.append((tracking[0], _clamp(100 - _as_percent(tracking[1]) * 20)))
+            fund_inputs.append((tracking[0], _clamp(100 - tracking[1] * 20)))
         _append_score(derived, existing, entity, "fund_score", fund_inputs, now)
+        def emit(field, score, parents, rule):
+            before = len(derived)
+            _append_score(derived, existing, entity, field, [(parent, score) for parent in parents], now)
+            if len(derived) > before:
+                derived[-1].derivation_rule = rule
+        additional_dimensions(by_field, now=now, numeric=_latest_numeric, emit=emit)
     return derived
 
 
@@ -519,7 +603,7 @@ def _append_score(
         return
     parents = sorted({fact.fact_id for fact, _ in inputs})
     value = round(sum(score for _, score in inputs) / len(inputs), 2)
-    stable_id = uuid5(NAMESPACE_URL, f"derived:v1:{entity}:{field}:{'|'.join(parents)}")
+    stable_id = uuid5(NAMESPACE_URL, f"derived:v2:{entity}:{field}:{'|'.join(parents)}")
     output.append(
         FactRecord(
             fact_id=f"DERIVED-{stable_id.hex[:16].upper()}",
@@ -527,7 +611,7 @@ def _append_score(
             field=field,
             value=value,
             snapshot_time=now,
-            source_id="DERIVED_RULE_V1",
+            source_id="DERIVED_RULE_V2",
             quality=round(min(fact.quality for fact, _ in inputs) * 0.9, 2),
             period=_common_period([fact for fact, _ in inputs]),
             derived_from=parents,
@@ -538,7 +622,7 @@ def _append_score(
 
 def _latest_numeric(facts: list[FactRecord], now: datetime) -> tuple[FactRecord, float] | None:
     candidates = [
-        (fact, _number(fact.value))
+        (fact, fact.normalized_value if fact.field.casefold() in PERCENT_FIELDS else _number(fact.value))
         for fact in facts
         if (
             now - timedelta(seconds=fact_max_age_seconds(fact))
@@ -558,19 +642,16 @@ def _number(value: Any) -> float | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return float(value)
+        return float(value) if math.isfinite(value) else None
     if isinstance(value, str):
-        match = re.search(r"[-+]?\d[\d,]*(?:\.\d+)?", value)
+        match = re.fullmatch(r"[-+]?\d[\d,]*(?:\.\d+)?", value.strip())
         if match:
             try:
-                return float(match.group(0).replace(",", ""))
+                number = float(match.group(0).replace(",", ""))
+                return number if math.isfinite(number) else None
             except ValueError:
                 return None
     return None
-
-
-def _as_percent(value: float) -> float:
-    return value * 100 if -1 < value < 1 else value
 
 
 def _clamp(value: float) -> float:

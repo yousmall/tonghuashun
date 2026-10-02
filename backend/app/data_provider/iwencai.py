@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import math
 import os
 import re
@@ -19,11 +20,24 @@ from uuid import uuid4
 from time import perf_counter
 
 from backend.app.services.call_tracking import calling_user_id
+from backend.app.services.provider_errors import ProviderCallError
 
 import httpx
 
 from backend.app.fact_taxonomy import METADATA_FIELD_NAMES
 from backend.app.models import FactRecord
+from backend.app.fact_units import PERCENT_FIELDS
+
+SKILL_KEY_ENV = {
+    "hithink-market-query": "IWENCAI_MARKET_API_KEY",
+    "hithink-finance-query": "IWENCAI_FINANCE_API_KEY",
+    "hithink-macro-query": "IWENCAI_MACRO_API_KEY",
+    "hithink-fund-query": "IWENCAI_FUND_API_KEY",
+    "hithink-astock-selector": "IWENCAI_SELECTOR_API_KEY",
+    "announcement-search": "IWENCAI_ANNOUNCEMENT_API_KEY",
+    "news-search": "IWENCAI_NEWS_API_KEY",
+    "report-search": "IWENCAI_REPORT_API_KEY",
+}
 
 
 # 实体名由 _entity_from_record 从这些字段提取并写入 FactRecord.entity，
@@ -37,6 +51,24 @@ SKIPPED_RECORD_FIELDS: frozenset[str] = frozenset(
 # 别名表：值为内部规范化字段名。匹配时按别名长度倒序（见 _alias_index），
 # 因此长别名优先命中，避免 "市盈率" 把 "静态市盈率" 一并吞掉这类子串误合并。
 FIELD_ALIASES = {
+    "近一年最大回撤": "max_drawdown_1y",
+    "近20日平均成交额": "avg_turnover_20d",
+    "近20个交易日平均成交额": "avg_turnover_20d",
+    "是否st": "is_st",
+    "交易状态": "trading_status",
+    "所属行业": "industry",
+    "行业名称": "industry",
+    "m2同比增长率": "m2_growth",
+    "广义货币同比增长率": "m2_growth",
+    "市场上涨家数占比": "market_advancing_ratio",
+    "行业营业收入同比增长率": "industry_revenue_growth",
+    "行业换手率历史百分位": "industry_turnover_percentile",
+    "毛利率": "gross_margin",
+    "净利率": "net_margin",
+    "营业利润率": "operating_margin",
+    "cpi同比": "cpi",
+    "ppi同比": "ppi",
+    "制造业pmi": "pmi",
     "最新价": "close_price",
     "收盘价": "close_price",
     "收盘价_前复权": "close_price",
@@ -265,6 +297,8 @@ SEARCH_CHANNEL_INDEX: dict[str, tuple[tuple[str, str], ...]] = {
 class IwencaiSkillHubProvider:
     """把问财自然语言查询结果转换为带来源和时点的 FactRecord。"""
 
+    cache_method_aliases = {"get_event_data": "get_announcements"}
+
     source_id = "IWENCAI_SKILLHUB"
 
     def __init__(
@@ -276,10 +310,16 @@ class IwencaiSkillHubProvider:
         max_retries: int = 2,
         max_concurrency: int = 8,
         transport: httpx.AsyncBaseTransport | None = None,
+        skill_api_keys: Mapping[str, str] | None = None,
     ) -> None:
         if not api_key.strip():
             raise ValueError("IWENCAI_API_KEY 不能为空")
         self._api_key = api_key.strip()
+        self._skill_api_keys = {skill: key.strip() for skill, key in (skill_api_keys or {}).items()
+                                if skill in SKILL_KEY_ENV and key.strip()}
+        # Partition public caches by entitlement without persisting credentials.
+        self.cache_namespace = hashlib.sha256(json.dumps([base_url, self._api_key,
+            self._skill_api_keys], sort_keys=True).encode()).hexdigest()
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
         self.max_retries = max_retries
@@ -305,6 +345,7 @@ class IwencaiSkillHubProvider:
         return cls(
             api_key,
             base_url=os.getenv("IWENCAI_BASE_URL", "https://openapi.iwencai.com"),
+            skill_api_keys={skill: os.getenv(env_name, "") for skill, env_name in SKILL_KEY_ENV.items()},
         )
 
     async def query(
@@ -373,7 +414,7 @@ class IwencaiSkillHubProvider:
         async with self._semaphore:
             for attempt in range(self.max_retries + 1):
                 headers = {
-                    "Authorization": f"Bearer {self._api_key}",
+                    "Authorization": f"Bearer {self._skill_api_keys.get(skill_id, self._api_key)}",
                     "Content-Type": "application/json",
                     "X-Claw-Call-Type": "normal" if attempt == 0 else "retry",
                     "X-Claw-Skill-Id": skill_id,
@@ -402,10 +443,21 @@ class IwencaiSkillHubProvider:
                     last_error = exc
                     if attempt < self.max_retries:
                         await asyncio.sleep(0.15 * (2**attempt))
-        self._failure_count += 1
-        if self._failure_count >= 3:
-            self._circuit_open_until = datetime.now(timezone.utc) + timedelta(seconds=30)
-        raise RuntimeError(self._query_error_message(last_error)) from last_error
+        # Permission/parameter rejection for one query is not proof that the
+        # whole provider is unavailable. Only transient service/network faults
+        # participate in the provider-wide breaker; 4xx queries still fail.
+        provider_fault = not isinstance(last_error, httpx.HTTPStatusError) or (
+            last_error.response.status_code in {408, 425, 429}
+            or last_error.response.status_code >= 500
+        )
+        if provider_fault:
+            self._failure_count += 1
+            if self._failure_count >= 3:
+                self._circuit_open_until = datetime.now(timezone.utc) + timedelta(seconds=30)
+        status = last_error.response.status_code if isinstance(last_error, httpx.HTTPStatusError) else None
+        code = {401: "AUTHENTICATION_REJECTED", 403: "CAPABILITY_FORBIDDEN",
+                429: "PROVIDER_RATE_LIMITED"}.get(status, "PROVIDER_UNAVAILABLE")
+        raise ProviderCallError(self._query_error_message(last_error), code=code, status_code=status) from last_error
 
     async def _tracked_attempt(
         self, path: str, payload: dict[str, object], headers: dict[str, str], *,
@@ -482,6 +534,12 @@ class IwencaiSkillHubProvider:
     async def get_quote(self, symbol: str) -> list[FactRecord]:
         return await self.query(f"{symbol} 最新价、涨跌幅、成交量、换手率", entity_hint=symbol)
 
+    async def get_stock_risk_metrics(self, symbol: str) -> list[FactRecord]:
+        return await self.query(
+            f"{symbol} 近一年最大回撤、近20日平均成交额、是否ST、交易状态",
+            entity_hint=symbol,
+        )
+
     async def get_financial_metrics(self, symbol: str) -> list[FactRecord]:
         return await self.query(
             f"{symbol} 最新财报的市盈率、市净率、ROE、营业收入同比增长率",
@@ -509,6 +567,7 @@ class IwencaiSkillHubProvider:
         # 返回字段无法满足 IndustryAgent，故补齐维度。
         return await self.query(
             f"{window} 行业涨跌、估值、资金流向和景气度排名，"
+            "以及行业营业收入同比增长率、主力资金净流入、成交额、行业换手率历史百分位，"
             "以及景气度评分、估值评分、资金流向评分、拥挤度评分和政策评分",
             entity_hint="行业排名",
         )
@@ -535,20 +594,35 @@ class IwencaiSkillHubProvider:
         )
 
     async def get_event_data(self, target: str) -> list[FactRecord]:
-        return await self.query(
-            f"{target} 最新业绩预告、增减持、股权质押、限售解禁、机构调研、监管函和重大事件",
-            entity_hint=target,
-        )
+        # Events are disclosure records, not scalar market-query columns.
+        # Keep their document dates and links through the announcement adapter.
+        return await self.get_announcements(target)
 
     async def get_macro_data(self, query: str) -> list[FactRecord]:
         # 同时索取原始指标与评分维度：research 的派生规则会用 CPI/PPI/PMI 等原始值
         # 算出 growth_score 等分项，只取评分名会失去派生来源。
-        return await self.query(
-            f"{query} 宏观数据 CPI、PPI、PMI、利率、汇率、社会融资、"
+        facts = await self.query(
+            f"{query} 宏观数据 CPI同比、PPI同比、制造业PMI、利率、汇率、社会融资、M2同比增长率、市场上涨家数占比、"
             "经济增长评分、通胀评分、流动性评分、政策评分和风险偏好评分",
             entity_hint="宏观数据",
             skill_id="hithink-macro-query",
         )
+        # Indicator names identify columns, not separate economic regions.
+        # Only this server-controlled China query and exact known indicator
+        # names share a scope. User snapshots, custom/multi-country queries and
+        # differently named regional series retain their original entities.
+        if query == "中国最新宏观经济":
+            indicators = {
+                "制造业PMI": "pmi", "CPI:当月同比": "cpi", "PPI:当月同比": "ppi",
+                "CPI同比": "cpi", "PPI同比": "ppi",
+                "居民消费价格指数": "cpi", "工业生产者出厂价格指数": "ppi",
+                "采购经理指数": "pmi",
+                "M2同比增长率": "m2_growth", "广义货币同比增长率": "m2_growth",
+                "市场上涨家数占比": "market_advancing_ratio",
+            }
+            return [fact.model_copy(update={"entity": "中国宏观经济"})
+                    if indicators.get(fact.entity) == fact.field else fact for fact in facts]
+        return facts
 
     async def get_institutional_research(self, target: str) -> list[FactRecord]:
         return await self.query(f"{target} 最新机构研究、评级、目标价和盈利预测", entity_hint=target)
@@ -625,9 +699,10 @@ class IwencaiSkillHubProvider:
                         entity=entity,
                         field=field,
                         value=value,
+                        unit=_percentage_unit(field, str(raw_field), record),
                         period=period if record_scope else (_field_period(str(raw_field)) or period),
                         entity_code=_entity_code_from_record(record),
-                        source_field=str(raw_field),
+                        source_field=(f"{record['指标名称']} ({raw_field})" if record.get("指标名称") else str(raw_field)),
                         snapshot_time=snapshot_time,
                         source_id=self.source_id,
                         source_url=source_url,
@@ -655,6 +730,30 @@ class IwencaiSkillHubProvider:
         ]
 
 
+def _percentage_unit(field: str, source_field: str, record: Mapping[str, Any]) -> str | None:
+    if field in {"capital_flow", "turnover_value", "avg_turnover_20d"}:
+        declared = str(record.get("指标单位") or record.get("unit") or "").strip()
+        if declared in {"CNY", "元", "万元", "亿元"}:
+            return "CNY" if declared == "元" else declared
+        match = re.search(r"[\[(（](亿元|万元|元)[\])）]", source_field)
+        return {"元": "CNY"}.get(match[1], match[1]) if match else None
+    if field not in PERCENT_FIELDS:
+        return None
+    declared = str(record.get("指标单位") or record.get("unit") or "").strip().casefold()
+    source_field = source_field + " " + str(record.get("指标名称") or "")
+    if declared in {"ratio", "小数比例"}:
+        return "ratio"
+    if declared in {"%", "％", "percent", "百分比"} or "%" in source_field or "％" in source_field:
+        return "percent"
+    if declared:
+        return declared  # e.g. an index with base 100 is not a percentage rate
+    # Query2data rate fields use percentage points. CPI/PPI indices require an
+    # explicit percentage/yoy label; a bare index must never become inflation.
+    if field in {"cpi", "ppi"} and not any(token in source_field.casefold() for token in ("同比", "增长", "yoy")):
+        return None
+    return "percent"
+
+
 class CompositeProvider:
     """并行读取多个 DataProvider，并按实体/字段/报告期选择最新高质量事实。"""
 
@@ -679,6 +778,9 @@ class CompositeProvider:
 
     async def get_quote(self, symbol: str) -> list[FactRecord]:
         return await self._merge("get_quote", symbol)
+
+    async def get_stock_risk_metrics(self, symbol: str) -> list[FactRecord]:
+        return await self._merge("get_stock_risk_metrics", symbol)
 
     async def get_financial_metrics(self, symbol: str) -> list[FactRecord]:
         return await self._merge("get_financial_metrics", symbol)
@@ -772,11 +874,21 @@ def _expand_indicator_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]
         # 日期后缀越大越新，只保留最近若干期，避免一次宏观查询塞进上百条事实。
         value_columns.sort(key=lambda item: _period_suffix(item[0]), reverse=True)
         for raw_key, value in value_columns[:MAX_PERIODS_PER_INDICATOR]:
+            entity = _entity_from_record(record, name)
+            # A declared region must survive indicator expansion. A generic
+            # CPI label from a foreign row cannot become a China-scoped input.
+            region = next((str(record[key]).strip() for key in ("国家", "地区", "country", "region")
+                           if record.get(key) not in (None, "")), "")
+            if region and region not in entity:
+                entity = f"{region}:{entity}"
             row = {
-                "证券简称": name,
+                "证券简称": entity,
                 "指标名称": name,
                 indicator: value,
             }
+            for unit_key in ("指标单位", "unit"):
+                if unit_key in record:
+                    row[unit_key] = record[unit_key]
             suffix = _period_suffix(raw_key)
             observed_period = suffix or _period_from_record(record)
             if observed_period:
@@ -1030,6 +1142,9 @@ def _period_from_record(record: dict[str, Any]) -> str | None:
 def _canonical_field(raw: str, *, channel: str | None = None) -> str:
     normalized = re.sub(r"\[[^]]*]", "", raw).strip()
     key = normalized.casefold().replace(" ", "")
+    for marker, prefix in (("行业中值", "industry_median"), ("行业均值", "industry_mean"), ("行业平均", "industry_mean")):
+        if marker in key:
+            return f"{prefix}_{_canonical_field(key.replace(marker, ''))}"
     if channel is not None:
         # 综合搜索按频道解析：同名的 title/content 在公告、新闻、研报中含义不同。
         for alias, canonical in SEARCH_CHANNEL_INDEX.get(channel, RECORD_FIELD_INDEX):

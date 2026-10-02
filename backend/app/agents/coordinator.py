@@ -17,6 +17,7 @@ import json
 import re
 from datetime import datetime, timezone
 from typing import Any
+from time import perf_counter
 from uuid import uuid4
 
 from backend.app.semantic import RequestUnderstanding, SemanticService, UNAVAILABLE_REASON
@@ -245,7 +246,9 @@ class CoordinatorAgent:
         model_facts, slice_metrics = slice_facts_for_model(request.facts, plan.intent)
         if metrics_sink is not None:
             metrics_sink.update(slice_metrics)
-        model_view = _RequestView(request, model_facts)
+        # Rules see full evidence. Hybrid nodes each prepare a role-specific
+        # model slice, retaining the rule baseline and transitive inputs.
+        model_view = _RequestView(request, request.facts)
         if progress_sink is not None:
             progress_sink("分项研判")
         results = await self._run_parallel(model_view, specialist_nodes)
@@ -417,7 +420,9 @@ class CoordinatorAgent:
             node.status = TaskStatus.RUNNING
             try:
                 # wait_for 强制执行节点自己的超时预算，不允许慢模型拖住整条链路。
-                return await asyncio.wait_for(handler(request), timeout=node.timeout_seconds)
+                result = await asyncio.wait_for(handler(request), timeout=node.timeout_seconds)
+                result.rule_score = result.score
+                return result
             except TimeoutError:
                 # 超时仍是一个可审计的业务状态，其他 asyncio.gather 任务不会被取消。
                 return AgentResult(
@@ -441,7 +446,12 @@ class CoordinatorAgent:
                 )
 
         # gather 保持输入节点顺序，同时真正并发等待所有互不依赖的专业分析。
-        return list(await asyncio.gather(*(execute(node) for node in nodes)))
+        async def execute_timed(node: TaskNode) -> AgentResult:
+            started = perf_counter()
+            result = await execute(node)
+            result.details = {**result.details, "duration_ms": round((perf_counter() - started) * 1000, 2)}
+            return result
+        return list(await asyncio.gather(*(execute_timed(node) for node in nodes)))
 
     @staticmethod
     def _specialists_for(intent: Intent) -> tuple[str, ...]:
@@ -644,6 +654,21 @@ def fact_max_age_seconds(fact: FactRecord) -> int:
     return _TAXONOMY.fact_max_age_seconds(fact)
 
 
+def _conflict_details(records: list[FactRecord]) -> list[dict[str, Any]]:
+    return [{key: fact.model_dump(mode="json")[key]
+             for key in ("fact_id", "entity", "field", "source_field", "source_id", "period",
+                         "snapshot_time", "value", "unit", "normalized_value")}
+            for fact in records]
+
+
+def _comparison_value(fact: FactRecord) -> str:
+    from backend.app.fact_units import PERCENT_FIELDS
+    value = ({"percentage_points": fact.normalized_value}
+             if fact.field.casefold() in PERCENT_FIELDS and fact.normalized_value is not None
+             else {"value": fact.value, "unit": fact.unit})
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
 def cross_validate_results(results: list[AgentResult], facts: list[FactRecord]) -> CrossValidationResult:
     """用已核验引用检查同项记录、派生依据与专业观点的一致性。"""
 
@@ -711,10 +736,10 @@ def cross_validate_results(results: list[AgentResult], facts: list[FactRecord]) 
         for source_records in by_source.values():
             same_time: dict[datetime, set[str]] = {}
             for record in source_records:
-                value = json.dumps(record.value, ensure_ascii=False, sort_keys=True, default=str)
+                value = _comparison_value(record)
                 same_time.setdefault(record.snapshot_time, set()).add(value)
             values = {
-                json.dumps(record.value, ensure_ascii=False, sort_keys=True, default=str)
+                _comparison_value(record)
                 for record in source_records
             }
             if len(values) > 1 and (
@@ -725,11 +750,12 @@ def cross_validate_results(results: list[AgentResult], facts: list[FactRecord]) 
                     severity="warning",
                     message=f"{entity_label(entity)}的{field_label(field)}在同一来源的同项记录中不一致，需核对时间与口径。",
                     fact_ids=[record.fact_id for record in source_records],
+                    evidence_details=_conflict_details(source_records),
                 ))
             latest_by_source.append(max(source_records, key=lambda record: record.snapshot_time))
         if len(latest_by_source) >= 2:
             values = {
-                json.dumps(record.value, ensure_ascii=False, sort_keys=True, default=str)
+                _comparison_value(record)
                 for record in latest_by_source
             }
             if len(values) > 1:
@@ -738,6 +764,7 @@ def cross_validate_results(results: list[AgentResult], facts: list[FactRecord]) 
                     severity="warning",
                     message=f"{entity_label(entity)}的{field_label(field)}在不同来源的同项记录中不一致，需核对时间与口径。",
                     fact_ids=[record.fact_id for record in latest_by_source],
+                    evidence_details=_conflict_details(latest_by_source),
                 ))
 
     labels = {"market": "市场", "industry": "行业", "security": "个股",

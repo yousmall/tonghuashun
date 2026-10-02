@@ -2,8 +2,8 @@
 
 `AdvicePackage` 的完整证据包可能包含上千条事实（单条消息可达 1MB），直接写进
 MySQL 会撑大行宽、拖慢查询，并在 filesort 时触发 `Out of sort memory`。历史记录
-只需要让用户回看当时的结论、风险与依据，因此这里保留展示所需字段，并对证据
-条数设上限。
+保留展示所需字段及有限预览；完整引用和派生血缘另存于 research_evidence，
+读取详情时由账号与消息 ID 关联恢复。
 """
 
 from __future__ import annotations
@@ -12,11 +12,10 @@ from typing import Any
 
 from backend.app.models import FactRecord
 
-# 保留在历史记录里的证据条数上限。界面只展示实际引用的证据，因此按引用集合
-# 截断即可，不影响结论的可追溯性。
+# 消息行只保留预览；完整引用和派生血缘由 database 的独立证据表保存。
 MAX_STORED_EVIDENCE = 60
 
-_FACT_KEYS = ("fact_id", "entity", "entity_code", "field", "value", "snapshot_time", "source_id", "source_url", "source_field", "quality", "period", "derived_from")
+_FACT_KEYS = ("fact_id", "entity", "entity_code", "field", "value", "unit", "normalized_value", "snapshot_time", "source_id", "source_url", "source_field", "quality", "period", "derived_from", "produced_by", "derivation_rule")
 
 
 def summarise_advice(advice: dict[str, Any], used_fact_ids: set[str] | None = None) -> dict[str, Any]:
@@ -27,14 +26,15 @@ def summarise_advice(advice: dict[str, Any], used_fact_ids: set[str] | None = No
         if not isinstance(fact, dict):
             continue
         fact_id = fact.get("fact_id")
-        if used_fact_ids and fact_id not in used_fact_ids:
+        if used_fact_ids is not None and fact_id not in used_fact_ids:
             continue
         kept.append({key: fact[key] for key in _FACT_KEYS if key in fact})
         if len(kept) >= MAX_STORED_EVIDENCE:
             break
 
+    available = {str(fact.get("fact_id")) for fact in advice.get("facts") or [] if isinstance(fact, dict)}
     summary: dict[str, Any] = {
-        "history_version": 2,
+        "history_version": 3,
         "intent": advice.get("intent"),
         "trace_id": advice.get("trace_id"),
         "profile_version": advice.get("profile_version"),
@@ -50,11 +50,18 @@ def summarise_advice(advice: dict[str, Any], used_fact_ids: set[str] | None = No
         "agent_results": _compact_agent_results(advice.get("agent_results")),
         "facts": kept,
         "facts_truncated": len(kept) < len(advice.get("facts") or []),
+        "missing_evidence_ids": sorted(used_fact_ids_of(advice) - available),
+        "research_mode": advice.get("research_mode", "deep"),
+        "model_calls": advice.get("model_calls") or [],
+        "model_cost": advice.get("model_cost") or {},
+        "timings_ms": advice.get("timings_ms") or {},
     }
     if advice.get("user_fit"):
         summary["user_fit"] = advice["user_fit"]
     if advice.get("allocation"):
         summary["allocation"] = advice["allocation"]
+    if advice.get("stock_recommendation"):
+        summary["stock_recommendation"] = advice["stock_recommendation"]
     if advice.get("task_plan"):
         plan = advice["task_plan"] or {}
         summary["task_plan"] = {
@@ -74,6 +81,13 @@ def used_fact_ids_of(advice: dict[str, Any]) -> set[str]:
     for result in advice.get("agent_results") or []:
         if isinstance(result, dict):
             used.update(str(item) for item in (result.get("facts_used") or []))
+    for issue in (advice.get("cross_validation") or {}).get("issues") or []:
+        if isinstance(issue, dict):
+            used.update(str(item) for item in issue.get("fact_ids") or [])
+    recommendation = advice.get("stock_recommendation") or {}
+    for candidate in [*(recommendation.get("candidates") or []), *(recommendation.get("recommendations") or [])]:
+        if isinstance(candidate, dict):
+            used.update(str(item) for item in candidate.get("evidence") or [])
     # 保存派生结论的原始输入，避免历史里只剩一个不可回溯的评分。
     facts = {str(fact.get("fact_id")): fact for fact in advice.get("facts") or [] if isinstance(fact, dict)}
     pending = list(used)
@@ -98,7 +112,13 @@ def _compact_acquisition(acquisition: Any) -> dict[str, Any] | None:
             "successful_capabilities",
             "empty_capabilities",
             "failed_capabilities",
+            "capability_errors", "recovery_errors",
             "fetched_fact_count",
+            "missing_fields_by_agent",
+            "capability_timings_ms",
+            "cached_capabilities",
+            "recovery_rounds", "recovery_capabilities", "recovery_successful_capabilities",
+            "recovery_empty_capabilities", "recovery_failed_capabilities", "recovery_reanalyzed",
         )
         if acquisition.get(key) is not None
     }
@@ -110,7 +130,7 @@ def _compact_cross_validation(cross_validation: Any) -> dict[str, Any] | None:
     return {
         "status": cross_validation.get("status"),
         "issues": [
-            {"code": issue.get("code"), "message": issue.get("message")}
+            {key: issue.get(key) for key in ("code", "message", "fact_ids")}
             for issue in (cross_validation.get("issues") or [])
             if isinstance(issue, dict)
         ][:20],
@@ -130,6 +150,10 @@ def _compact_agent_results(results: Any) -> list[dict[str, Any]]:
                     "status",
                     "opinion",
                     "score",
+                    "rule_score",
+                    "model_score",
+                    "score_policy",
+                    "score_difference_reason",
                     "confidence",
                     "confidence_reasons",
                     "risk_flags",
@@ -141,6 +165,14 @@ def _compact_agent_results(results: Any) -> list[dict[str, Any]]:
             }
         )
     return compact
+
+
+def cited_facts_of(advice: dict[str, Any]) -> list[dict[str, Any]]:
+    """Complete cited evidence, including transitive derived inputs, without a cap."""
+    used = used_fact_ids_of(advice)
+    return [{key: fact[key] for key in _FACT_KEYS if key in fact}
+            for fact in advice.get("facts") or []
+            if isinstance(fact, dict) and str(fact.get("fact_id")) in used]
 
 
 def facts_as_dicts(facts: list[FactRecord]) -> list[dict[str, Any]]:

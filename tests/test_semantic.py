@@ -467,6 +467,9 @@ async def test_degraded_node_is_not_treated_as_dissenting_opinion():
     security_only = [
         fact("fundamental_score", 40, entity="贵州茅台"),
         fact("technical_score", 80, entity="贵州茅台"),
+        fact("valuation_score", 50, entity="贵州茅台"),
+        fact("event_score", 50, entity="贵州茅台"),
+        fact("governance_score", 50, entity="贵州茅台"),
     ]
     result2 = await coordinator.run(
         request(facts=security_only),

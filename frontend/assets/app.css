@@ -92,7 +92,7 @@ hr, [data-testid="stDivider"] hr { border-color: var(--wence-line-soft); }
     color: var(--wence-faint); text-transform: uppercase;
 }
 
-/* 侧栏导航：投资偏好为展开按钮，风险评估与风险调整是独立页面。 */
+/* 侧栏导航：风险评估使用单一主入口。 */
 .st-key-nav [data-testid="stElementContainer"] { width: 100%; }
 .st-key-nav .stButton > button {
     width: 100%; min-height: 2.65rem;
@@ -113,9 +113,15 @@ hr, [data-testid="stDivider"] hr { border-color: var(--wence-line-soft); }
     font-weight: 700;
     box-shadow: inset 3px 0 0 var(--wence-brand);
 }
-.st-key-nav-preference-children { padding-left: 1rem; }
-.st-key-nav-preference-children .stButton > button {
-    min-height: 2.25rem; font-size: .92rem;
+.st-key-nav .stButton > button[kind="primary"]:hover,
+.st-key-nav .stButton > button[kind="primary"]:focus-visible {
+    background: var(--wence-brand-strong);
+    color: #fff;
+    border-color: var(--wence-brand-strong);
+}
+.st-key-nav .stButton > button:focus-visible {
+    outline: 2px solid var(--wence-brand-strong);
+    outline-offset: 3px;
 }
 
 /* 最近咨询标题可收起；紧凑样式与侧栏分组保持一致。 */

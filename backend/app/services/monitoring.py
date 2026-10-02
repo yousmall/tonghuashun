@@ -34,7 +34,7 @@ class ServiceMetrics:
         self.analysis_outcomes[outcome] = self.analysis_outcomes.get(outcome, 0) + 1
         if outcome == "ERROR":
             self.analysis_failure_count += 1
-        elif elapsed_ms <= 3_000:
+        elif outcome in {"PASS", "REVIEW", "BLOCK"} and elapsed_ms <= 3_000:
             self.analysis_within_target_count += 1
 
     def record(self, status_code: int, elapsed_ms: float) -> None:

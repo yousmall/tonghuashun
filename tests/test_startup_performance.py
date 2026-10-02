@@ -93,13 +93,90 @@ def test_logout_discards_late_account_results(monkeypatch):
 def test_session_check_reuses_recent_login_and_still_revalidates(monkeypatch):
     state = State(auth_token="token", session_status_checked_at=monotonic())
     monkeypatch.setattr(st, "session_state", state)
+    calls, gate, started = [], Event(), Event()
+    def request(client, base, method, path, payload, token):
+        calls.append((path, token))
+        started.set()
+        assert gate.wait(3), "Session revalidation must not block the script"
+        return ApiResult(data={"active": True}, status=200)
+    monkeypatch.setattr(ui, "request_json", request)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(ui, "account_read_executor", lambda: executor)
+        ui._check_session_timeout("http://test-only", False)
+        assert calls == []
+        state.session_status_checked_at -= 31
+        try:
+            ui._check_session_timeout("http://test-only", False)
+            assert started.wait(1)
+            ui._check_session_timeout("http://test-only", False)
+            assert len(calls) == 1
+        finally:
+            gate.set()
+        state.session_status_task["future"].result(timeout=2)
+        ui._check_session_timeout("http://test-only", False)
+    assert calls == [("/auth/session/status", "token")]
+    assert not state.service_unavailable and "session_status_task" not in state
+
+
+def test_expired_history_refresh_keeps_cached_rows_and_never_blocks_navigation(monkeypatch):
+    from frontend import account_prefetch
+    state = State(auth_token="original-token", recent_conversations=[{"id": "cached"}],
+                  recent_conversations_loaded_at=0.0)
+    monkeypatch.setattr(st, "session_state", state)
+    gate, started = Event(), Event()
     calls = []
-    monkeypatch.setattr(ui, "api_request", lambda *a: calls.append(a) or {"active": True})
-    ui.enforce_session_timeout.__wrapped__("http://test-only")
-    assert calls == []
-    state.session_status_checked_at -= 31
-    ui.enforce_session_timeout.__wrapped__("http://test-only")
-    assert len(calls) == 1 and calls[0][2] == "/auth/session/status"
+    def request(client, base, method, path, payload, token):
+        calls.append((path, token))
+        started.set()
+        assert gate.wait(3)
+        return ApiResult(data=[{"id": "fresh"}], status=200)
+    monkeypatch.setattr(account_prefetch, "request_json", request)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(account_prefetch, "account_read_executor", lambda: executor)
+        try:
+            assert ui.recent_conversations("http://test-only", nonblocking=True) == [{"id": "cached"}]
+            assert started.wait(1)
+            state.auth_token = "changed-token"
+            assert ui.recent_conversations("http://test-only", nonblocking=True) == [{"id": "cached"}]
+            assert len(calls) == 1
+        finally:
+            gate.set()
+        state.account_prefetch[("http://test-only", "/history?limit=20")].result(timeout=2)
+        assert ui.recent_conversations("http://test-only", nonblocking=True) == [{"id": "fresh"}]
+    assert calls == [("/history?limit=20", "original-token")]
+
+
+def test_session_revalidation_unauthorized_clears_login_and_late_checks_are_discarded(monkeypatch):
+    future = Future()
+    future.set_result(ApiResult(status=401, detail="登录已失效"))
+    state = State(auth_token="token", session_status_task={"future": future, "token": "token", "api_base": "test"})
+    monkeypatch.setattr(st, "session_state", state)
+    monkeypatch.setattr(ui, "current_browser_session_id", lambda: None)
+    class Rerun(Exception):
+        pass
+    monkeypatch.setattr(st, "rerun", lambda: (_ for _ in ()).throw(Rerun()))
+    with pytest.raises(Rerun):
+        ui._check_session_timeout("test", True)
+    assert not state.get("auth_token") and "登录已失效" in state.auth_notice
+    state.auth_token = "new-account"
+    state.session_status_task = {"future": future, "token": "old-account", "api_base": "test"}
+    ui._check_session_timeout("test", False)
+    assert state.auth_token == "new-account" and "session_status_task" not in state
+
+
+def test_brand_logo_uses_media_url_and_registers_original_bytes_on_every_run(monkeypatch):
+    from types import SimpleNamespace
+    calls = []
+    def add(data, mime, coordinates):
+        calls.append((data, mime, coordinates))
+        return "/media/original-logo.png"
+    monkeypatch.setattr(ui, "get_instance", lambda: SimpleNamespace(media_file_mgr=SimpleNamespace(add=add)))
+    monkeypatch.setattr(st, "get_option", lambda name: "research")
+    version = ui.BRAND_LOGO.stat().st_mtime_ns
+    assert ui.brand_logo_uri(version) == "/research/media/original-logo.png"
+    assert ui.brand_logo_uri(version) == "/research/media/original-logo.png"
+    assert len(calls) == 2
+    assert all(data == ui.BRAND_LOGO.read_bytes() and mime == "image/png" for data, mime, _ in calls)
 
 
 def test_successful_history_write_discards_old_prefetch(monkeypatch):

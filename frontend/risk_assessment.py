@@ -8,7 +8,7 @@ import streamlit as st
 
 from backend.app.risk_questionnaire import (
     QUESTIONNAIRE_VERSION, QUESTIONS, RISK_NAMES, SCORING_NOTICE,
-    answer_issues, assessment_is_current, local_today,
+    answer_issues, assessment_is_current,
 )
 
 
@@ -22,11 +22,11 @@ def _move_question(offset: int) -> None:
     st.session_state.risk_assessment_index = max(0, min(18, st.session_state.risk_assessment_index + offset))
 
 
-def _start_assessment(*, restore: bool = False) -> None:
+def _start_assessment() -> None:
     for key in list(st.session_state):
         if key.startswith("risk_answer_"):
             st.session_state.pop(key, None)
-    st.session_state.risk_assessment_answers = dict(st.session_state.profile.get("risk_answers", {})) if restore else {}
+    st.session_state.risk_assessment_answers = dict(st.session_state.profile.get("risk_answers") or {})
     st.session_state.risk_assessment_index = 0
     st.session_state.risk_assessment_editing = True
     st.session_state.pop("profile_draft", None)
@@ -61,20 +61,15 @@ def result_html(profile: dict) -> str:
     </section>"""
 
 
-def render_risk_assessment(api_base: str, *, view: str, api_request: Callable) -> None:
+def render_risk_assessment(api_base: str, *, api_request: Callable) -> None:
     current = st.session_state.profile
     is_new = current.get("questionnaire_version") == QUESTIONNAIRE_VERSION
-    saved_today = is_new and current.get("confirmed") and str(current.get("assessed_on")) == str(local_today())
     st.session_state.setdefault("risk_assessment_index", 0)
     st.session_state.setdefault("risk_assessment_answers", dict(current.get("risk_answers") or {}))
-    st.session_state.setdefault("risk_assessment_editing", not is_new or (view == "风险调整" and not saved_today))
-    if (st.session_state.get("risk_assessment_view") != view and view == "风险调整"
-            and is_new and not saved_today):
-        _start_assessment(restore=True)
-    st.session_state.risk_assessment_view = view
+    st.session_state.setdefault("risk_assessment_editing", not is_new)
 
     with st.container(border=True, key="risk-assessment-box"):
-        st.html('<div class="risk-box-heading">风险测评</div>')
+        st.html('<div class="risk-box-heading">风险评估</div>')
         if st.session_state.risk_assessment_editing:
             index = st.session_state.risk_assessment_index
             question = QUESTIONS[index]
@@ -137,11 +132,8 @@ def render_risk_assessment(api_base: str, *, view: str, api_request: Callable) -
                     st.session_state.profile = confirmed
                     st.session_state.pop("profile_draft", None)
                     st.rerun()
-            st.button("返回修改答案", key="risk_edit_answers", width="stretch", on_click=_start_assessment, kwargs={"restore": True})
+            st.button("返回修改答案", key="risk_edit_answers", width="stretch", on_click=_start_assessment)
         else:
             if not assessment_is_current(current):
                 st.warning("风险测评已过期，请重新测评后再开始个性化分析。")
-            done_today = str(current.get("assessed_on")) == str(local_today()) and current.get("confirmed")
-            st.button("重新测评", key="risk_retake", type="primary", width="stretch", disabled=bool(done_today), on_click=_start_assessment)
-        st.markdown("办理须知（办理时间 0:00–24:00）：\n\n1. 风险测评每日可保存 1 次，有效期为两年。\n2. 若您的信息发生变化，请及时重测，关注风险承受能力与产品、投资品种及期限的匹配情况。")
-        st.caption(current.get("scoring_notice") or SCORING_NOTICE)
+            st.button("重新评估", key="risk_retake", type="primary", width="stretch", on_click=_start_assessment)

@@ -14,12 +14,20 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+from pathlib import Path
 from contextvars import ContextVar
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from contextlib import suppress
 from datetime import date, datetime, timedelta, timezone
 from time import perf_counter
+from backend.app.services.history import cited_facts_of
+from backend.app.services.model_telemetry import analysis_telemetry, summarize_costs
+from backend.app.services.research_recovery import recover_research
+from backend.app.services.stock_recommendation import StockRecommendationService
+from backend.app.services.research_admission import ResearchAdmission
+from backend.app.services.research_cache import ResearchFactCache
 from threading import Event
 
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
@@ -41,7 +49,6 @@ from backend.app.database import (
     Database,
     DatabaseUnavailable,
     ProfileVersionConflict,
-    ProfileDailyLimit,
     UsernameExists,
     WatchlistCapacityExceeded,
     WatchlistItemExists,
@@ -95,7 +102,7 @@ from backend.app.wechat_login import WechatLogin
 # 从本地 .env 加载可选外部服务配置；生产环境中已有的环境变量优先。
 load_dotenv()
 database = Database.from_env()
-session_thread_pool = SessionThreadPool.from_env()
+session_thread_pool = SessionThreadPool.from_env(str(Path(__file__).resolve().parents[2] / ".tmp_flow/login_sessions.sqlite3"))
 wechat_login = WechatLogin.from_env()
 
 
@@ -132,6 +139,7 @@ async def lifespan(_: FastAPI):
         with suppress(asyncio.CancelledError):
             await reaper
         await overview_cache.aclose()
+        await research_pipeline.cache.aclose()
         closers = []
         llm = getattr(coordinator.semantic, "llm", None)
         if llm is not None and hasattr(llm, "aclose"):
@@ -176,8 +184,12 @@ app = FastAPI(
 # 应用级单例。后续接数据库/Redis 时可改为 lifespan 管理。
 coordinator, llm_enabled = build_coordinator()
 data_provider = IwencaiSkillHubProvider.from_env()
-research_pipeline = AutomatedResearchPipeline(data_provider)
+research_pipeline = AutomatedResearchPipeline(data_provider, cache=ResearchFactCache(
+    shared_path=os.getenv("WENCE_RESEARCH_CACHE_PATH", str(Path(__file__).resolve().parents[2] / ".tmp_flow/public_research_cache.sqlite3")) or None,
+    lease_seconds=float(os.getenv("WENCE_DATA_CALL_TIMEOUT_SECONDS", "30")) + 5,
+))
 service_metrics = ServiceMetrics()
+research_admission = ResearchAdmission()
 iwencai_tracking_errors = 0
 
 
@@ -224,7 +236,7 @@ async def optional_authenticated_user(authorization: str | None = Header(default
     try:
         payload = _decode_session_token(authorization.split(" ", 1)[1].strip())
         session_id = str(payload["sid"])
-        leased_user_id = session_thread_pool.acquire(session_id)
+        leased_user_id = await asyncio.to_thread(session_thread_pool.acquire, session_id)
         if leased_user_id != int(payload["sub"]):
             raise TokenError("登录状态无效")
         future = session_thread_pool.submit(session_id, database.get_user, int(payload["sub"]))
@@ -242,7 +254,7 @@ async def optional_authenticated_user(authorization: str | None = Header(default
         if context_token is not None:
             calling_user_id.reset(context_token)
         if session_id is not None:
-            session_thread_pool.finish(session_id)
+            await asyncio.to_thread(session_thread_pool.finish, session_id)
 
 
 def authenticated_user(
@@ -319,6 +331,12 @@ async def readiness() -> dict[str, object]:
         "language_processing": "llm" if llm_enabled else "unavailable",
         "iwencai_skillhub_configured": data_provider is not None,
         "automatic_data_pipeline_enabled": True,
+        "research_cache": {"shared_same_host": research_pipeline.cache.shared is not None,
+                           "error": research_pipeline.cache.shared_error},
+        "research_concurrency_per_process": research_admission.limit,
+        "model_pricing_configured": bool(getattr(getattr(coordinator.semantic, "llm", None), "config", None)
+            and coordinator.semantic.llm.config.input_price_per_million is not None
+            and coordinator.semantic.llm.config.output_price_per_million is not None),
         "mysql_configured": database.configured,
         "mysql_ready": database.configured and database.initialization_error is None,
         "session_thread_pool": session_thread_pool.snapshot(),
@@ -743,7 +761,7 @@ async def confirm_user_profile(
         )
         try:
             await asyncio.wrap_future(future)
-        except (ProfileVersionConflict, ProfileDailyLimit) as exc:
+        except ProfileVersionConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
     return confirmed
 
@@ -786,6 +804,11 @@ async def analyze_portfolio(
     stage = None
     timings: dict[str, float] = {}
     outcome = "ERROR"
+    admission_slot = None
+    telemetry = {"calls": [], "mode": request.research_mode}
+    if user:
+        telemetry["cache_scope"] = str(user["id"])
+    telemetry_token = analysis_telemetry.set(telemetry)
 
     def report(next_stage: str) -> None:
         nonlocal stage, stage_started
@@ -796,6 +819,11 @@ async def analyze_portfolio(
         _report_progress(next_stage)
 
     try:
+        try:
+            admission_slot = await research_admission.acquire()
+        except TimeoutError as exc:
+            outcome = "OVERLOADED"
+            raise HTTPException(status_code=429, detail="当前研究请求较多，请稍后重试。", headers={"Retry-After": "2"}) from exc
         report("核对投资偏好")
         if user:
             stored = await asyncio.wrap_future(session_thread_pool.submit(
@@ -804,7 +832,7 @@ async def analyze_portfolio(
             if not stored or not stored["payload"].get("confirmed"):
                 raise HTTPException(status_code=409, detail="请先确认投资偏好，再开始分析。")
             if request.profile.version != stored["version"]:
-                raise HTTPException(status_code=409, detail="投资偏好已更新，请重新打开投资偏好并确认后再分析。")
+                raise HTTPException(status_code=409, detail="风险评估已更新，请重新打开风险评估并确认后再分析。")
             profile = UserProfile.model_validate({
                 **stored["payload"], "version": stored["version"], "user_id": str(user["id"]),
             })
@@ -818,23 +846,55 @@ async def analyze_portfolio(
                                DIRECTION_FOR_INTENT.get(understanding.intent) != request.research_direction)
         fetch_intent = Intent.UNKNOWN if understanding.risk_rules or wrong_direction else understanding.intent
         report("查找资料")
-        prepared_request, acquisition = await research_pipeline.prepare(
-            request,
-            fetch_intent,
-            target=understanding.target,
-            data_requirements=understanding.data_requirements,
-        )
         model_slice: dict[str, object] = {}
-        advice = await coordinator.run(
-            prepared_request, understanding=understanding, metrics_sink=model_slice,
-            progress_sink=report,
-        )
+        if StockRecommendationService.should_run(request, understanding):
+            prepared_request, acquisition, advice = await StockRecommendationService(
+                research_pipeline, coordinator,
+            ).run(request, understanding, progress_sink=report, metrics_sink=model_slice)
+        else:
+            prepared_request, acquisition = await research_pipeline.prepare(
+                request, fetch_intent, target=understanding.target,
+                data_requirements=understanding.data_requirements,
+            )
+            # Repair observable gaps before the first specialist/model pass.
+            prepared_request, acquisition = await recover_research(
+                research_pipeline, prepared_request, fetch_intent, None, acquisition,
+                target=understanding.target, data_requirements=understanding.data_requirements,
+                progress_sink=report,
+            )
+            advice = await coordinator.run(
+                prepared_request, understanding=understanding, metrics_sink=model_slice,
+                progress_sink=report,
+            )
+            recovered_request, acquisition = await recover_research(
+                research_pipeline, prepared_request, fetch_intent, advice, acquisition,
+                target=understanding.target, data_requirements=understanding.data_requirements,
+                progress_sink=report,
+            )
+            if recovered_request is not prepared_request:
+                prepared_request = recovered_request
+                report("重新分析")
+                advice = await coordinator.run(
+                    prepared_request, understanding=understanding, metrics_sink=model_slice,
+                    progress_sink=report,
+                )
+                acquisition = acquisition.model_copy(update={"recovery_reanalyzed": True})
+        if acquisition.recovery_rounds and (
+            acquisition.missing_fields_by_agent or advice.cross_validation.issues
+        ):
+            advice = advice.model_copy(update={"next_steps": list(dict.fromkeys([
+                "系统已自动补取相关资料；仍未解决的缺项或冲突，请取得可核验资料后复核",
+                *[step for step in advice.next_steps if step not in {
+                    "补充有来源、含时间戳的事实后重新核验", "补齐各专业智能体列出的缺失字段",
+                }],
+            ]))})
         # 指标属于本次请求；提前拦截时保持为零，不读取共享协调器状态。
         acquisition = acquisition.model_copy(
             update={
-                "model_fact_count": int(model_slice.get("selected") or 0),
+                "model_fact_count": len(telemetry.get("model_fact_ids", set())),
                 "model_fact_available": int(model_slice.get("available") or 0),
-                "facts_truncated": bool(model_slice.get("truncated")),
+                "facts_truncated": bool(telemetry.get("model_fact_ids")) and
+                    len(telemetry["model_fact_ids"]) < len(prepared_request.facts),
             }
         )
         if llm_enabled and advice.agent_results and not any(
@@ -846,10 +906,14 @@ async def analyze_portfolio(
                 "facts": prepared_request.facts,
                 "profile_version": request.profile.version,
                 "data_acquisition": acquisition,
+                "model_calls": telemetry["calls"],
+                "model_cost": summarize_costs(telemetry["calls"]),
+                "research_mode": request.research_mode,
             }
         )
         if user:
             report("保存对话")
+            completed_advice.timings_ms = dict(timings)
             # 历史记录只保留展示所需的轻量摘要：完整证据包可达数 MB，会撑大
             # messages 行宽并让列表/详情查询触发数据库排序内存告警。
             completed_payload = completed_advice.model_dump(mode="json")
@@ -864,6 +928,7 @@ async def analyze_portfolio(
                 )},
                 completed_advice.conclusion,
                 summarise_advice(completed_payload, used_fact_ids_of(completed_payload)),
+                cited_facts_of(completed_payload),
             )
             await asyncio.wrap_future(future)
         report("已完成")
@@ -879,6 +944,9 @@ async def analyze_portfolio(
         # 当前本地版未配置日志器；正式环境应记录 trace_id、异常类型与脱敏上下文。
         raise HTTPException(status_code=500, detail="组合诊断服务暂时不可用，请稍后重试。") from exc
     finally:
+        if admission_slot is not None:
+            admission_slot.release()
+        analysis_telemetry.reset(telemetry_token)
         service_metrics.record_analysis((perf_counter() - started) * 1_000, outcome)
 
 

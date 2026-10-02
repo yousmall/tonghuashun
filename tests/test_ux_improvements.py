@@ -22,6 +22,7 @@ from frontend import research_board as board
 
 def fact(code="600001.SH", entity="公司甲", field="roe", value=7, period="2026Q2", fact_id="a", **kwargs):
     return FactRecord(fact_id=fact_id, entity=entity, entity_code=code, field=field, value=value,
+        unit="percent" if field in {"roe", "change"} else None,
         period=period, snapshot_time=datetime.now(timezone.utc), source_id="TEST", quality=.9,
         source_field="净资产收益率[20260630]", **kwargs)
 
@@ -30,7 +31,7 @@ def test_history_preserves_citations_identity_and_derivation_after_roundtrip():
     original = {"evidence": ["a"], "facts": [fact(derived_from=["raw"]).model_dump(mode="json")],
                 "agent_results": [{"agent_id": "stock", "facts_used": ["a"], "opinion": "分析"}]}
     saved = summarise_advice(original)
-    assert saved["history_version"] == 2
+    assert saved["history_version"] == 3
     assert len(_facts_used_by_result(saved, saved["agent_results"][0])) == 1
     assert saved["facts"][0]["entity_code"] == "600001.SH"
     assert saved["facts"][0]["source_field"] == "净资产收益率[20260630]"

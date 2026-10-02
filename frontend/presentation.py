@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from html import escape
 from typing import Any
 import streamlit as st
+from frontend.answer_visibility import verification_notes, visible_risks, visible_next_steps, visible_risk_conclusion, visible_compliance_reason
 
 RISK_LEVELS = ["R1", "R2", "R3", "R4", "R5"]
 PROFILE_LABELS = {
@@ -56,7 +57,7 @@ FIELD_LABELS.update({
     "cpi": "居民消费价格指数", "ppi": "工业生产者价格指数", "pmi": "采购经理指数",
     "social_financing": "社会融资", "interest_rate": "利率", "event_score": "事件影响评分", "governance_score": "公司治理评分",
 })
-NAVIGATION = ["主页", "风险评估", "风险调整", "投资问答", "自选研究", "持仓分析"]
+NAVIGATION = ["主页", "风险评估", "投资问答", "自选研究", "持仓分析"]
 # 投资问答由后端自动判断并获取所需资料；以下类型映射仅供保留的资料管理工具使用。
 DATA_KINDS = {"实时行情": "quote", "财务指标": "financial", "财经新闻": "news", "公告": "announcement",
               "研报": "research_report", "基金 / ETF": "fund", "行业排名": "industry", "可转债": "convertible"}
@@ -171,11 +172,20 @@ def friendly_fact_rows(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
                              for key, item in value.items() if key not in {"trace_id", "fact_id", "source_id", "quality"})
         rows.append({
             "对象": fact.get("entity", "—"), "指标": fact_label(str(fact.get("field", ""))),
-            "内容 / 数值": display_value(str(fact.get("field", "")), value),
+            "内容 / 数值": display_fact_value(fact) if not isinstance(fact.get("value"), dict) else value,
             "数据时间（北京时间）": fact_time(fact.get("snapshot_time")),
             "来源": fact_source(fact), "报告期": fact_period(fact.get("period")),
         })
     return rows
+
+
+def display_fact_value(fact: dict[str, Any]) -> str:
+    from backend.app.fact_units import PERCENT_FIELDS, percentage_points
+    field = str(fact.get("field", ""))
+    if field in PERCENT_FIELDS:
+        points = percentage_points(fact.get("value"), fact.get("unit"))
+        return f"{points:g}%" if points is not None else f"{fact.get('value')}（单位待确认）"
+    return display_value(field, fact.get("value"))
 
 
 def advice_facts(advice: dict[str, Any]) -> list[dict[str, Any]]:
@@ -372,10 +382,19 @@ def render_conclusion_panel(advice: dict[str, Any], *, key: str = "analysis-conc
 
     with st.container(key=key, border=True):
         st.html("<div class='analysis-kicker'>研究结论 · 风险与依据</div>")
-        _render_conclusion_content(advice)
+        _render_conclusion_content(advice, key=key)
 
 
-def _render_conclusion_content(advice: dict[str, Any]) -> None:
+def render_verification_records(advice: dict[str, Any], *, key: str) -> None:
+    notes = verification_notes(advice)
+    if notes:
+        with st.expander("核验记录", key=f"verification_{key}", on_change="rerun") as records:
+            if records.open:
+                for note in notes:
+                    st.write(plain_language(note))
+
+
+def _render_conclusion_content(advice: dict[str, Any], *, key: str = "analysis-conclusion") -> None:
     compliance = advice.get("compliance", {})
     facts = advice_facts(advice)
     used_ids = set(advice.get("evidence", []))
@@ -395,16 +414,17 @@ def _render_conclusion_content(advice: dict[str, Any]) -> None:
     st.markdown("**分析结论**")
     conclusion = plain_language(advice.get("conclusion")) or "现有资料不足，暂时无法作出判断。"
     st.write(conclusion)
-    if advice.get("risk_conclusion"):
+    risk_conclusion = visible_risk_conclusion(advice)
+    if risk_conclusion:
         st.markdown("**风险结论**")
-        st.write(plain_language(advice["risk_conclusion"]))
-    if compliance.get("status") != "PASS" and compliance.get("reason"):
-        compliance_note = plain_language(compliance["reason"])
+        st.write(plain_language(risk_conclusion))
+    if compliance.get("status") != "PASS" and visible_compliance_reason(advice):
+        compliance_note = plain_language(visible_compliance_reason(advice))
         if compliance_note and compliance_note != conclusion:
             st.caption(compliance_note)
-    issues = [item.get("message", "") for item in advice.get("cross_validation", {}).get("issues", [])]
-    render_points("需要注意", [*advice.get("risks", []), *issues], visible=99)
-    render_points("后续研究建议", advice.get("next_steps", []))
+    render_points("需要注意", visible_risks(advice), visible=99)
+    render_points("后续研究建议", visible_next_steps(advice))
+    render_verification_records(advice, key=key)
     if advice.get("user_fit"):
         with st.expander("与您的投资偏好是否匹配", icon=":material/person_check:"):
             st.write(plain_language(advice["user_fit"]))

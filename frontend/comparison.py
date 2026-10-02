@@ -1,7 +1,7 @@
 """确定性的指标矩阵：身份由后端核对，缺失、期间差异和冲突都明确显示。"""
 from datetime import date
 import math
-from frontend.financial_view import period_info, fact_unit, numeric_value
+from frontend.financial_view import period_info, fact_unit, fact_numeric_value
 from frontend.research_board import LABELS
 
 FIELDS = ["close_price", "fund_nav", "change", "nav_change", "pe_ttm", "pb", "roe", "revenue_growth", "net_profit_growth", "fund_size", "fee_rate", "tracking_error", "conversion_premium_rate", "yield_to_maturity", "remaining_size", "industry", "fund_manager", "bond_rating"]
@@ -17,7 +17,7 @@ def comparison_matrix(items):
             for fact in item.get("facts", []):
                 if fact.get("field") != field:
                     continue
-                if field not in {"industry", "fund_manager", "bond_rating"} and numeric_value(fact.get("value")) is None:
+                if field not in {"industry", "fund_manager", "bond_rating"} and fact_numeric_value(fact) is None:
                     continue
                 info = period_info(fact.get("period"))
                 if info and info[1] > date.today():
@@ -25,7 +25,7 @@ def comparison_matrix(items):
                 key = (info[0] if info else "日期未提供", fact_unit(fact))
                 previous = values.get(key)
                 if previous:
-                    first, second = numeric_value(previous.get("value")), numeric_value(fact.get("value"))
+                    first, second = fact_numeric_value(previous), fact_numeric_value(fact)
                     same = math.isclose(first, second, rel_tol=1e-8, abs_tol=5e-5) if first is not None and second is not None else previous.get("value") == fact.get("value")
                     if not same:
                         conflicts.add(key)
@@ -49,7 +49,7 @@ def comparison_matrix(items):
                 row["可比性"] = "存在冲突，需核实"
                 continue
             value = values[key].get("value")
-            number = numeric_value(value)
+            number = fact_numeric_value(values[key])
             formatted = f"{number:,.4f}" if field == "fund_nav" and number is not None else f"{number:,.2f}" if number is not None else str(value)
             row[name] = formatted if chosen else f"{formatted} {key[1]}（{key[0]}）"
         rows.append(row)

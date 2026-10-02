@@ -1,14 +1,14 @@
 """首页：首次使用指引、继续研究与自选概览。"""
-from time import monotonic
 import streamlit as st
 from frontend.presentation import QUICK_ASKS, plain_language, display_value
 from frontend.research_board import load_board, section_facts, entity_rows, format_fact
+from streamlit.runtime.scriptrunner import get_script_run_ctx
 
 
 def render_guide():
     steps = [
-        ("01 · 填写投资偏好", "打开左侧“投资偏好”中的“风险评估”，填写资金用途、投资期限、可接受亏损、资金使用需求和投资经历。"),
-        ("02 · 评估并确认风险", "在“风险评估”中回答风险问题，生成评估后核对结果并确认投资偏好。情况发生变化时，可到“风险调整”修改并重新确认。"),
+        ("01 · 完成风险评估", "打开左侧“风险评估”，填写资金用途、投资期限、可接受亏损、资金使用需求和投资经历。"),
+        ("02 · 核对并确认结果", "完成问卷后核对评估结果并确认保存。可随时点击“重新评估”修改答案，原有选项会保留。"),
         ("03 · 选择研究方向", "进入“投资问答”，选择市场解读、行业分析、个股研究、基金筛选或可转债分析。各研究方向独立保存咨询记录与研究资料。"),
         ("04 · 在底部提出问题", "在页面底部输入名称或代码、关注的时间范围和具体问题，然后发送。系统会按需获取资料、核对观点，并结合您的投资偏好分析。"),
         ("05 · 复核结果并深化研究", "核对研究结论、风险提示、数据来源与时点。证据不足或观点存在分歧时，应复核待确认事项；同一方向的后续咨询可沿用已有研究上下文。"),
@@ -20,12 +20,19 @@ def render_guide():
             st.write(description)
 
 
-@st.fragment(run_every=2)
 def market_glance(api_base, fetch):
     key = (api_base, "market", None)
     entry = st.session_state.get("research_board_cache", {}).get(key)
-    due = entry is not None and monotonic() - entry["loaded_at"] >= 15
-    result = load_board(api_base, "market", None, fetch, refresh=due, nonblocking=True)
+    polling = key in st.session_state.get("research_board_prefetch", {}) or not entry or entry["result"].get("status") == "loading"
+    st.fragment(run_every=1 if polling else 30)(_market_glance)(api_base, fetch, polling)
+
+
+def _market_glance(api_base, fetch, polling):
+    result = load_board(api_base, "market", None, fetch, nonblocking=True)
+    loading = result.get("status") == "loading" or bool(result.get("refreshing"))
+    context = get_script_run_ctx(suppress_warning=True)
+    if bool(loading) != polling and context and getattr(context, "fragment_ids_this_run", None):
+        st.rerun()
     rows = entity_rows(section_facts(result, "overview"))
     if not rows:
         overview = next((item for item in result.get("sections", []) if item.get("key") == "overview"), {})
@@ -48,7 +55,7 @@ def render_home(api_base, *, ready, header, go_to, recent, fetch, resume):
         st.caption("完成投资偏好评估与确认后，选择研究方向并发起咨询。")
         render_guide()
         with st.container(horizontal=True):
-            st.button("填写投资偏好", type="primary", icon=":material/person_edit:", on_click=go_to, args=("投资偏好",))
+            st.button("进行风险评估", type="primary", icon=":material/person_edit:", on_click=go_to, args=("风险评估",))
             st.button("进入投资问答", icon=":material/chat:", on_click=go_to, args=("投资问答",))
     else:
         st.title("继续您的投资研究")

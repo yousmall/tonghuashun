@@ -30,6 +30,7 @@ class DataProvider(Protocol):
     async def get_research_reports(self, target: str) -> list[FactRecord]: ...
     async def get_announcements(self, target: str) -> list[FactRecord]: ...
     async def screen_stocks(self, query: str) -> list[FactRecord]: ...
+    async def get_stock_risk_metrics(self, symbol: str) -> list[FactRecord]: ...
     async def screen_sectors(self, query: str) -> list[FactRecord]: ...
 
 
@@ -52,6 +53,9 @@ class SnapshotProvider:
 
     async def get_quote(self, symbol: str) -> list[FactRecord]:
         return self._find(entity=symbol, fields={"close_price", "change", "volume", "volatility"})
+
+    async def get_stock_risk_metrics(self, symbol: str) -> list[FactRecord]:
+        return self._find(entity=symbol, fields={"max_drawdown_1y", "avg_turnover_20d", "is_st", "trading_status"})
 
     async def get_financial_metrics(self, symbol: str) -> list[FactRecord]:
         return self._find(entity=symbol, fields={"pe_ttm", "pb", "revenue_growth", "roe", "fundamental_score"})

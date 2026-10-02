@@ -69,17 +69,11 @@ def test_navigation_and_profile_call_to_action():
     assert not app.exception
     assert app.session_state['navigation'] == '主页'
     assert not app.radio
-    assert not any(button.label in {'风险评估', '风险调整'} for button in app.button)
+    assert any(button.label == '风险评估' for button in app.button)
+    assert not any(button.label in {'投资偏好', '风险调整'} for button in app.button)
     assert not app.chat_input
     assert any('04 · 在底部提出问题' in item.value for item in app.markdown)
-    next(button for button in app.button if button.label == '投资偏好').click().run(timeout=15)
-    assert not app.exception
-    assert app.session_state['navigation'] == '主页'
-    assert {button.label for button in app.button} >= {'风险评估', '风险调整'}
-    next(button for button in app.button if button.label == '投资偏好').click().run(timeout=15)
-    assert app.session_state['navigation'] == '主页'
-    assert not any(button.label in {'风险评估', '风险调整'} for button in app.button)
-    next(button for button in app.button if button.label == '填写投资偏好').click().run(timeout=15)
+    next(button for button in app.button if button.label == '进行风险评估').click().run(timeout=15)
     assert not app.exception
     assert app.title[0].value == '风险评估'
     assert app.session_state['navigation'] == '风险评估'
@@ -150,7 +144,9 @@ ui.page_questions('http://localhost')
     assert sum(item.value == '价格仍可能下跌。' for item in app.markdown) == 1
     assert not app.metric
     assert len(app.warning) == 1
-    assert "未能取得最新市场数据" in app.warning[0].value
+    assert "仍需核实" in app.warning[0].value
+    assert "未能取得最新市场数据" not in app.warning[0].value
+    assert any(item.label == '核验记录' for item in app.expander)
     assert any('风险丁' in item.value for item in app.markdown)
     assert not any('其余需要注意' in item.label for item in app.expander)
 
@@ -456,7 +452,8 @@ def test_manual_material_preserves_percent_source_and_date():
     next(button for button in app.button if button.label == '保存资料').click().run(timeout=15)
     assert not app.exception
     fact = app.session_state['facts'][0]
-    assert fact['value'] == .005
+    assert fact['value'] == '0.5%'
+    assert fact['unit'] == 'percent'
     assert fact['source_id'] == 'USER_SUPPLIED:基金合同'
     assert fact['snapshot_time'].endswith('+08:00')
     assert '0.5%' in app.dataframe[0].value.to_string()
@@ -807,6 +804,7 @@ with patch.object(ui, 'api_request') as request:
 
 def test_sidebar_recent_chat_restores_history_and_new_chat_starts_fresh():
     script = SETUP + """
+from frontend.api_client import ApiResult
 st.session_state.profile_restored = True
 st.session_state.watchlist_loaded = True
 st.session_state.facts = [{'fact_id': 'prepared', 'field': 'news',
@@ -825,11 +823,17 @@ def fake_api(base, method, path, payload=None, **kwargs):
         ]}
     return None
 with patch.object(ui, 'api_request', side_effect=fake_api), \\
+     patch('frontend.account_prefetch.request_json', side_effect=lambda client, base, method, path, payload, token: ApiResult(data=fake_api(base, method, path, payload))), \\
      patch.object(ui, 'register_browser_session'), \\
      patch.object(ui, 'enforce_session_timeout'):
     ui.main()
 """
     app = AppTest.from_string(script).run(timeout=15)
+    assert not app.exception
+    pending = app.session_state["account_prefetch"] if "account_prefetch" in app.session_state else {}
+    for future in pending.values():
+        future.result(timeout=5)
+    app.run(timeout=15)
     assert not app.exception
     assert any(button.label == '发起咨询' for button in app.button)
     assert any(button.label == '之前的问题' for button in app.button)
@@ -886,7 +890,8 @@ ui.page_questions('http://localhost')
     assert not any(field.label == '在资料里查找' for field in home.text_input)
     assert not any(tab.label in {'查询资料', '补充资料'} for tab in home.tabs)
     assert '查找资料' not in NAVIGATION
-    assert NAVIGATION[:4] == ['主页', '风险评估', '风险调整', '投资问答']
+    assert NAVIGATION[:3] == ['主页', '风险评估', '投资问答']
+    assert '风险调整' not in NAVIGATION and '投资偏好' not in NAVIGATION
 
 
 def test_ask_controls_remain_after_materials_panel_is_removed():
@@ -1018,11 +1023,15 @@ with patch.object(ui, 'api_request', side_effect=fake_api):
     assert app.session_state['profile']['investor_category'] == 'C4'
     next(b for b in app.button if b.label == '确认并保存').click().run(timeout=15)
     assert not app.exception and app.session_state['profile']['confirmed']
-    assert next(b for b in app.button if b.label == '重新测评').disabled
+    assert not next(b for b in app.button if b.label == '重新评估').disabled
     assert 'profile_draft' not in app.session_state
+    assert not any('办理须知' in item.value for item in app.markdown)
+    next(b for b in app.button if b.label == '重新评估').click().run(timeout=15)
+    assert not app.exception and app.radio[0].value == answers[0]
+    assert app.session_state['risk_assessment_answers'] == payload['risk_answers']
 
 
-def test_risk_adjustment_restores_answers_and_retains_risk_limits():
+def test_risk_reassessment_restores_answers_and_retains_risk_limits():
     script = SETUP + """
 from backend.app.risk_questionnaire import evaluate_answers, QUESTIONS
 answers = dict(zip((q.id for q in QUESTIONS), 'ACABDC CACCB BCCBC CDB'.replace(' ', '')))
@@ -1036,10 +1045,17 @@ def fake_api(base, method, path, payload=None, **kwargs):
                                industry_limit=0.3, constraints=[], confirmed=False),
                 'missing_fields': [], 'evidence': []}
 with patch.object(ui, 'api_request', side_effect=fake_api):
-    ui.page_profile('http://localhost', view='风险调整')
+    ui.page_profile('http://localhost')
 """
     app = AppTest.from_string(script).run(timeout=15)
+    assert not app.exception and not app.radio
+    next(b for b in app.button if b.label == '重新评估').click().run(timeout=15)
     assert not app.exception and app.radio[0].value == 'A'
+    app.radio[0].set_value('B').run(timeout=15)
+    next(b for b in app.button if b.label == '下一题').click().run(timeout=15)
+    assert app.radio[0].value == 'C'
+    next(b for b in app.button if b.label == '上一题').click().run(timeout=15)
+    assert app.radio[0].value == 'B'
     for _ in range(18):
         next(b for b in app.button if b.label == '下一题').click().run(timeout=15)
     assert app.radio[0].value == 'B'

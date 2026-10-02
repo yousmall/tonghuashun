@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from threading import Lock
 from time import monotonic
 from typing import Callable, Generic, ParamSpec, TypeVar
+from backend.app.shared_sessions import SharedSessionStore
 
 
 P = ParamSpec("P")
@@ -43,6 +44,7 @@ class SessionThreadPool(Generic[R]):
         idle_timeout_seconds: float = 600,
         *,
         clock: Callable[[], float] = monotonic,
+        shared_path: str | None = None,
     ) -> None:
         if max_workers < 1:
             raise ValueError("max_workers 必须大于 0")
@@ -54,24 +56,32 @@ class SessionThreadPool(Generic[R]):
         self._lock = Lock()
         self._leases: dict[str, SessionLease] = {}
         self._beacon_sessions: dict[str, str] = {}
+        self.shared = SharedSessionStore(shared_path, max_workers, idle_timeout_seconds) if shared_path else None
+        self._reservations: dict[str, list[str]] = {}
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers,
             thread_name_prefix="wence-session",
         )
 
     @classmethod
-    def from_env(cls) -> "SessionThreadPool[object]":
+    def from_env(cls, default_shared_path=None) -> "SessionThreadPool[object]":
         """按环境变量创建线程池，默认支持 100 个并发登录会话。"""
 
         return cls(
             max_workers=int(os.getenv("WENCE_SESSION_MAX_WORKERS", "100")),
             idle_timeout_seconds=float(os.getenv("WENCE_SESSION_IDLE_SECONDS", "600")),
+            shared_path=os.getenv("WENCE_SESSION_STORE_PATH", default_shared_path) or None,
         )
 
     def allocate(self, user_id: int) -> tuple[str, str]:
         """分配会话槽，并返回会话标识和最小权限的浏览器回收凭据。"""
 
         now = self._clock()
+        if self.shared:
+            sid, beacon = secrets.token_urlsafe(24), secrets.token_urlsafe(32)
+            if not self.shared.allocate(sid, user_id, self._digest_beacon(beacon)):
+                raise SessionCapacityExceeded(f"当前在线会话已达到 {self.max_workers} 个，请稍后重试")
+            return sid, beacon
         with self._lock:
             self._reap_expired_locked(now)
             if len(self._leases) >= self.max_workers:
@@ -92,6 +102,14 @@ class SessionThreadPool(Generic[R]):
     def acquire(self, session_id: str) -> int:
         """校验会话、记录请求开始，并返回该租约绑定的用户 ID。"""
 
+        if self.shared:
+            lease = self.shared.acquire(session_id)
+            if lease is None:
+                raise SessionLeaseExpired("登录已失效或闲置超过 10 分钟，请重新登录")
+            user_id, reservation = lease
+            with self._lock:
+                self._reservations.setdefault(session_id, []).append(reservation)
+            return user_id
         now = self._clock()
         with self._lock:
             self._reap_expired_locked(now)
@@ -105,6 +123,15 @@ class SessionThreadPool(Generic[R]):
     def finish(self, session_id: str) -> None:
         """记录请求结束；执行中的请求不会被空闲清理器误回收。"""
 
+        if self.shared:
+            with self._lock:
+                pending = self._reservations.get(session_id, [])
+                reservation = pending.pop() if pending else None
+                if not pending:
+                    self._reservations.pop(session_id, None)
+            if reservation:
+                self.shared.finish(session_id, reservation)
+            return
         now = self._clock()
         with self._lock:
             lease = self._leases.get(session_id)
@@ -116,6 +143,11 @@ class SessionThreadPool(Generic[R]):
     def touch(self, session_id: str) -> int:
         """刷新浏览器活动时间，不占用工作线程。"""
 
+        if self.shared:
+            user = self.shared.user(session_id, touch=True)
+            if user is None:
+                raise SessionLeaseExpired("登录已失效或闲置超过 10 分钟，请重新登录")
+            return user
         now = self._clock()
         with self._lock:
             self._reap_expired_locked(now)
@@ -128,6 +160,9 @@ class SessionThreadPool(Generic[R]):
     def is_active(self, session_id: str, *, user_id: int | None = None) -> bool:
         """只检查租约是否有效，不刷新空闲时间。"""
 
+        if self.shared:
+            user = self.shared.user(session_id)
+            return user is not None and (user_id is None or user == user_id)
         with self._lock:
             self._reap_expired_locked(self._clock())
             lease = self._leases.get(session_id)
@@ -136,6 +171,8 @@ class SessionThreadPool(Generic[R]):
     def release(self, session_id: str, *, user_id: int | None = None) -> bool:
         """退出登录或关闭页面时立即释放会话槽。"""
 
+        if self.shared:
+            return self.shared.release(session_id, user_id)
         with self._lock:
             lease = self._leases.get(session_id)
             if lease is None or (user_id is not None and lease.user_id != user_id):
@@ -146,6 +183,8 @@ class SessionThreadPool(Generic[R]):
     def release_beacon(self, beacon_token: str) -> bool:
         """用最小权限回收凭据释放会话槽。"""
 
+        if self.shared:
+            return self.shared.release(beacon=self._digest_beacon(beacon_token))
         with self._lock:
             session_id = self._beacon_sessions.get(self._digest_beacon(beacon_token))
             if session_id is None:
@@ -164,19 +203,24 @@ class SessionThreadPool(Generic[R]):
         """把已认证会话的阻塞任务提交到工作线程池。"""
 
         with self._lock:
-            lease = self._leases.get(session_id)
-            if lease is None or lease.active_requests < 1:
-                raise SessionLeaseExpired("登录已失效，请重新登录")
+            active = bool(self._reservations.get(session_id)) if self.shared else bool(
+                (lease := self._leases.get(session_id)) and lease.active_requests >= 1)
+        if not active or (self.shared and not self.is_active(session_id)):
+            raise SessionLeaseExpired("登录已失效，请重新登录")
         return self._executor.submit(function, *args, **kwargs)
 
     def reap_expired(self) -> int:
         """回收所有空闲达到超时时间且没有在途请求的会话槽。"""
 
+        if self.shared:
+            return self.shared.reap()
         with self._lock:
             return self._reap_expired_locked(self._clock())
 
     def online_users(self) -> dict[int, int]:
         """只读在线用户及其有效会话数，不刷新任何人的活动时间。"""
+        if self.shared:
+            return self.shared.snapshot()[0]
         with self._lock:
             self._reap_expired_locked(self._clock())
             users: dict[int, int] = {}
@@ -187,10 +231,14 @@ class SessionThreadPool(Generic[R]):
     def snapshot(self) -> dict[str, int | float]:
         """返回线程池容量和当前租约数量，供 readiness 与 metrics 观测。"""
 
-        with self._lock:
-            self._reap_expired_locked(self._clock())
-            active_sessions = len(self._leases)
-            active_requests = sum(lease.active_requests for lease in self._leases.values())
+        if self.shared:
+            users, active_requests = self.shared.snapshot()
+            active_sessions = sum(users.values())
+        else:
+            with self._lock:
+                self._reap_expired_locked(self._clock())
+                active_sessions = len(self._leases)
+                active_requests = sum(lease.active_requests for lease in self._leases.values())
         return {
             "max_workers": self.max_workers,
             "active_sessions": active_sessions,

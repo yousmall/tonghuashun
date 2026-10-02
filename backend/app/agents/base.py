@@ -9,6 +9,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from numbers import Real
+import math
 
 from backend.app.models import AgentResult, FactRecord, OrchestrationRequest
 
@@ -39,7 +40,7 @@ def numeric_fact_values(facts: Iterable[FactRecord]) -> list[tuple[FactRecord, f
     """返回可计算的数值事实，排除 ``bool`` 以免 True 被错误视为 1 分。"""
     values: list[tuple[FactRecord, float]] = []
     for fact in facts:
-        if isinstance(fact.value, Real) and not isinstance(fact.value, bool):
+        if isinstance(fact.value, Real) and not isinstance(fact.value, bool) and math.isfinite(fact.value):
             values.append((fact, float(fact.value)))
     return values
 

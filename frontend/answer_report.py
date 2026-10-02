@@ -14,7 +14,7 @@ from threading import Lock
 from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
-from frontend.financial_view import period_info, fact_unit
+from frontend.financial_view import period_info, fact_unit, fact_numeric_value
 
 FONT_PATHS = [os.getenv('WENCE_REPORT_FONT', ''), 'C:/Windows/Fonts/simsun.ttc',
               '/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc',
@@ -50,9 +50,8 @@ def chart_groups(advice: dict) -> list[dict]:
         if field not in METRICS or isinstance(fact.get('value'), bool):
             continue
         info = period_info(fact.get('period'))
-        try:
-            value = float(str(fact.get('value')).replace(',', '').replace('%', '').strip())
-        except (ValueError, TypeError):
+        value = fact_numeric_value(fact)
+        if value is None:
             continue
         if not info or info[1] > date.today() or not math.isfinite(value):
             continue

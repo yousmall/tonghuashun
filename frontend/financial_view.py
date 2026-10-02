@@ -3,6 +3,7 @@ from calendar import monthrange
 from datetime import date
 import math
 import re
+from backend.app.fact_units import percentage_points
 
 
 PERCENT_FIELDS = {"change", "nav_change", "turnover_rate", "roe", "roe_weighted", "revenue_growth", "net_profit_growth", "fee_rate", "tracking_error", "conversion_premium_rate", "pure_bond_premium_rate", "yield_to_maturity"}
@@ -62,3 +63,9 @@ def fact_unit(fact):
     if field == "fund_nav":
         return currency or "元"
     return ""
+
+
+def fact_numeric_value(fact):
+    if fact.get("field") in PERCENT_FIELDS:
+        return percentage_points(fact.get("value"), fact.get("unit"))
+    return numeric_value(fact.get("value"))

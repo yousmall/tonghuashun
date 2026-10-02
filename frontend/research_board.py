@@ -9,7 +9,7 @@ from time import monotonic
 from typing import Any, Callable
 
 import streamlit as st
-from frontend.financial_view import fact_unit
+from frontend.financial_view import fact_unit, fact_numeric_value
 from streamlit.runtime.scriptrunner import get_script_run_ctx
 
 DIRECTIONS = {"市场解读": "market", "行业分析": "industry", "个股研究": "stock", "基金筛选": "fund", "可转债分析": "convertible"}
@@ -59,7 +59,9 @@ def format_fact(fact: dict | None, *, index: bool = False) -> str:
     if numeric is None:
         return str(value) if value not in (None, "") else "—"
     if field in PERCENT_FIELDS:
-        # 问财返回百分数的百分点值；0.5 的管理费率是 0.5%，不能再乘 100。
+        numeric = fact_numeric_value(fact)
+        if numeric is None:
+            return f"{value}（单位待确认）"
         return f"{numeric:+.2f}%" if field in {"change", "nav_change", "revenue_growth", "net_profit_growth"} else f"{numeric:.2f}%"
     if field in MONEY_FIELDS:
         raw = str(fact.get("source_field") or "")
@@ -114,7 +116,7 @@ def entity_rows(facts: list[dict]) -> list[dict]:
             if new_date < old_date:
                 continue
             if new_date == old_date:
-                first, second = number(previous.get("value")), number(fact.get("value"))
+                first, second = fact_numeric_value(previous), fact_numeric_value(fact)
                 same = math.isclose(first, second, rel_tol=1e-8, abs_tol=5e-5 if field in PERCENT_FIELDS else 0) if first is not None and second is not None else previous.get("value") == fact.get("value")
                 if not same:
                     row["conflicts"].add(field)

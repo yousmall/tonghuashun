@@ -13,6 +13,7 @@ from frontend.research_board import data_period, entity_rows, format_fact
 
 def fact(field="close_price", value=10, *, period="2026-09-24", entity="公司甲", code="600001.SH", raw=None):
     return FactRecord(fact_id="fixture-" + field, entity=entity, entity_code=code, field=field, value=value,
+                      unit="percent" if field in {"fee_rate", "roe", "nav_change", "change"} else None,
                       period=period, source_field=raw, snapshot_time=datetime.now(timezone.utc), source_id="TEST", quality=.9)
 
 

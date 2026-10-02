@@ -100,7 +100,7 @@ def test_confirm_recomputes_client_tampering_and_expired_profile_blocks_plan():
     assert plan.clarification_question and not plan.nodes
 
 
-def test_api_reloads_answers_prevents_repeat_save_and_isolates_users(monkeypatch, request):
+def test_api_reloads_answers_allows_same_day_reassessment_and_isolates_users(monkeypatch, request):
     database = Database("sqlite+pysqlite:///:memory:", "test-secret-that-is-longer-than-thirty-two-characters")
     database.initialize()
     monkeypatch.setattr(main_module, "database", database)
@@ -124,9 +124,17 @@ def test_api_reloads_answers_prevents_repeat_save_and_isolates_users(monkeypatch
         assert saved.json()["valid_until"] != "2099-01-01"
         restored = client.get("/api/v1/profile", headers=headers).json()["profile"]
         assert restored["risk_answers"] == SCREEN_ANSWERS and restored["confirmed"]
-        repeat = client.post("/api/v1/profile/confirm", headers=headers, json={"profile": restored})
-        assert repeat.status_code == 409 and "每日" in repeat.json()["detail"]
-        assert client.get("/api/v1/profile", headers=headers).json()["profile"]["version"] == restored["version"]
+        edited = dict(restored, risk_answers=dict(restored["risk_answers"], q15="A"))
+        repeat = client.post("/api/v1/profile/confirm", headers=headers, json={"profile": edited})
+        assert repeat.status_code == 200
+        assert repeat.json()["investor_category"] == "C1"
+        updated = client.get("/api/v1/profile", headers=headers).json()["profile"]
+        assert updated["risk_answers"] == edited["risk_answers"]
+        assert updated["assessed_on"] == restored["assessed_on"]
+        assert updated["version"] == restored["version"] + 1
+        stale = client.post("/api/v1/profile/confirm", headers=headers, json={"profile": restored})
+        assert stale.status_code == 409 and "其他页面更新" in stale.json()["detail"]
+        assert client.get("/api/v1/profile", headers=headers).json()["profile"] == updated
         other = client.post("/api/v1/auth/register", json={"username":"risk-user-b", "password":"Strong-risk-123"})
         other_headers = {"Authorization": f"Bearer {other.json()['access_token']}"}
         assert not client.get("/api/v1/profile", headers=other_headers).json()["profile"]["confirmed"]

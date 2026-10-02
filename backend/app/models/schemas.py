@@ -173,6 +173,10 @@ class FactRecord(BaseModel):
     field: str
     # 具体值可为数值、字符串或结构化对象；具体字段的类型约束由领域层定义。
     value: Any
+    # value preserves the source value. normalized_value is computed by the
+    # server in percentage points; callers cannot override the conversion.
+    unit: str | None = Field(default=None, max_length=40)
+    normalized_value: float | None = None
     # 数据抓取或快照生成时间，核验器据此判断事实是否过期。
     snapshot_time: datetime
     # 数据来源标识；演示快照必须明确使用 DEMO_SNAPSHOT，不能伪装成实时源。
@@ -191,6 +195,16 @@ class FactRecord(BaseModel):
     # 产出这条事实的取数调用键（方法@研究目标）。仅用于判断能否复用已有资料、
     # 避免同一份数据被反复取回；不参与展示、评分或合规判断。
     produced_by: str | None = None
+    derivation_rule: str | None = Field(default=None, max_length=500)
+
+    @model_validator(mode="after")
+    def normalize_percentage(self) -> "FactRecord":
+        from backend.app.fact_units import PERCENT_FIELDS, percentage_points
+        if self.field.casefold() in PERCENT_FIELDS:
+            self.normalized_value = percentage_points(self.value, self.unit)
+        else:
+            self.normalized_value = None
+        return self
 
     @field_validator("source_url")
     @classmethod
@@ -305,6 +319,10 @@ class AgentResult(BaseModel):
     opinion: str
     # 可选的 0-100 标准化评分；无可比评分时应保持 None。
     score: float | None = Field(default=None, ge=0, le=100)
+    rule_score: float | None = Field(default=None, ge=0, le=100)
+    model_score: float | None = Field(default=None, ge=0, le=100)
+    score_policy: Literal["rule_only"] = "rule_only"
+    score_difference_reason: str | None = None
     # 0-1 的结果可信度，必须同时给出降低原因以便解释。
     confidence: float = Field(ge=0, le=1)
     # 影响置信度的因素，例如“数据过期”“样本不足”。
@@ -365,6 +383,7 @@ class OrchestrationRequest(BaseModel):
     facts: list[FactRecord] = Field(default_factory=list)
     # 默认由后端按意图自动补充真实数据；显式关闭时只使用调用方提供的事实。
     auto_fetch: bool = True
+    research_mode: Literal["fast", "deep"] = "deep"
     # 用户授权导入的持仓快照；真实系统还应增加权限与敏感字段脱敏。
     portfolio: list[dict[str, Any]] = Field(default_factory=list)
     # 最近对话由客户端显式传入，既支持多轮理解，也避免服务端跨用户串话。
@@ -571,6 +590,7 @@ class CrossValidationIssue(BaseModel):
     message: str
     agent_ids: list[str] = Field(default_factory=list)
     fact_ids: list[str] = Field(default_factory=list)
+    evidence_details: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class CrossValidationResult(BaseModel):
@@ -596,6 +616,7 @@ class DataAcquisitionResult(BaseModel):
     reused_capabilities: list[str] = Field(default_factory=list)
     empty_capabilities: list[str] = Field(default_factory=list)
     failed_capabilities: list[str] = Field(default_factory=list)
+    capability_errors: dict[str, dict[str, Any]] = Field(default_factory=dict)
     supplied_fact_count: int = Field(default=0, ge=0)
     fetched_fact_count: int = Field(default=0, ge=0)
     derived_fact_count: int = Field(default=0, ge=0)
@@ -606,6 +627,43 @@ class DataAcquisitionResult(BaseModel):
     # 结构化降级原因码（不含内部实现细节），供界面翻译成用户可理解的话术。
     reason_code: str | None = None
     message: str | None = None
+    missing_fields_by_agent: dict[str, list[str]] = Field(default_factory=dict)
+    capability_timings_ms: dict[str, float] = Field(default_factory=dict)
+    cached_capabilities: list[str] = Field(default_factory=list)
+    # 每次分析最多追加一轮补取；与第一轮审计分开，保留失败及未解决的问题。
+    recovery_rounds: int = Field(default=0, ge=0, le=1)
+    recovery_capabilities: list[str] = Field(default_factory=list)
+    recovery_successful_capabilities: list[str] = Field(default_factory=list)
+    recovery_empty_capabilities: list[str] = Field(default_factory=list)
+    recovery_failed_capabilities: list[str] = Field(default_factory=list)
+    recovery_errors: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    recovery_reanalyzed: bool = False
+    recovery_phase: Literal["before_analysis", "after_analysis"] | None = None
+    recovery_missing_fields_before: dict[str, list[str]] = Field(default_factory=dict)
+    recovery_timings_ms: dict[str, float] = Field(default_factory=dict)
+    recovery_cached_capabilities: list[str] = Field(default_factory=list)
+
+
+class StockRecommendationCandidate(BaseModel):
+    symbol: str
+    name: str
+    status: Literal["recommended", "review", "excluded"] = "review"
+    score: float | None = Field(default=None, ge=0, le=100)
+    confidence: float = Field(default=0, ge=0, le=1)
+    reasons: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
+    evidence: list[str] = Field(default_factory=list)
+    snapshot_time: datetime | None = None
+    missing_fields: dict[str, list[str]] = Field(default_factory=dict)
+
+
+class StockRecommendationResult(BaseModel):
+    strategy_version: str = "profile-stock-v1"
+    requested_count: int = Field(default=3, ge=1, le=5)
+    screening_query: str = ""
+    screening_conditions: dict[str, Any] = Field(default_factory=dict)
+    candidates: list[StockRecommendationCandidate] = Field(default_factory=list)
+    recommendations: list[StockRecommendationCandidate] = Field(default_factory=list)
 
 
 class AdvicePackage(BaseModel):
@@ -615,6 +673,9 @@ class AdvicePackage(BaseModel):
     trace_id: str
     # 各真实阶段与完整分析的耗时（毫秒）；不把流式首包当作最终回答。
     timings_ms: dict[str, float] = Field(default_factory=dict)
+    model_calls: list[dict[str, Any]] = Field(default_factory=list)
+    model_cost: dict[str, Any] = Field(default_factory=dict)
+    research_mode: Literal["fast", "deep"] = "deep"
     # 用于决定展示模板和后续追问策略的意图。
     intent: Intent
     # 本次使用的已确认画像版本，供界面及历史记录核对。
@@ -649,6 +710,7 @@ class AdvicePackage(BaseModel):
     agent_results: list[AgentResult] = Field(default_factory=list)
     # 单独保留一致性审查，避免把专业分歧藏进一个平均分。
     cross_validation: CrossValidationResult = Field(default_factory=CrossValidationResult)
+    stock_recommendation: StockRecommendationResult | None = None
 
 
 class SnapshotOptions(BaseModel):

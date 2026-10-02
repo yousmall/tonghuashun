@@ -321,7 +321,7 @@ async def test_iwencai_provider_exposes_selected_skillhub_capabilities() -> None
 
     returned_fields = {fact.field for facts in results for fact in facts}
     assert {"announcement", "research_report"} <= returned_fields
-    assert paths.count("/v1/comprehensive/search") == 2
+    assert paths.count("/v1/comprehensive/search") == 3
     assert set(channels) == {"report", "announcement"}
     assert ("report-search", "2.0.0") in skill_headers
     assert ("announcement-search", "1.0.0") in skill_headers
@@ -332,7 +332,6 @@ async def test_iwencai_provider_exposes_selected_skillhub_capabilities() -> None
         "基本资料",
         "主营构成",
         "控股股东",
-        "重大事件",
         "宏观数据",
         "机构研究",
         "券商研报",

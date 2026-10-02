@@ -38,6 +38,7 @@ from frontend.api_client import backend_http_client, request_json, overview_fetc
 from frontend.account_prefetch import (
     PENDING, NOT_PREFETCHED, cancel_account_prefetch, start_account_prefetch,
     take_account_result, poll_account_prefetch, discard_account_result,
+    read_account_data, account_read_executor,
 )
 from frontend.research_board import cancel_board_prefetch, render_research_board, restore_board_scroll, start_board_prefetch
 from streamlit.runtime import get_instance
@@ -52,11 +53,22 @@ DEFAULT_API_BASE = os.getenv("WENCE_API_BASE", "http://127.0.0.1:8000/api/v1")
 BRAND_LOGO = Path(__file__).resolve().parent / "assets" / "brand-logo.png"
 
 
-@st.cache_data(show_spinner=False)
-def brand_logo_uri(asset_version: int) -> str:
-    """为现有品牌行提供随项目发布的 Logo。"""
+@st.cache_data(show_spinner=False, max_entries=2)
+def brand_logo_bytes(asset_version: int) -> bytes:
+    """按文件版本缓存原图，保留全部原始像素。"""
+    return BRAND_LOGO.read_bytes()
 
-    return "data:image/png;base64," + base64.b64encode(BRAND_LOGO.read_bytes()).decode("ascii")
+
+def brand_logo_uri(asset_version: int) -> str:
+    """每轮登记会话的媒体引用，避免重复发送大段图像编码。"""
+    data = brand_logo_bytes(asset_version)
+    try:
+        runtime = get_instance()
+    except RuntimeError:
+        return "data:image/png;base64," + base64.b64encode(data).decode("ascii")
+    uri = runtime.media_file_mgr.add(data, "image/png", "wence-brand-logo")
+    base_path = st.get_option("server.baseUrlPath").strip("/")
+    return f"/{base_path}{uri}" if base_path else uri
 
 
 @st.cache_data(show_spinner=False)
@@ -132,32 +144,20 @@ def render_stat_cards(cards: list[tuple[str, str, str]], *, accent_first: bool =
     st.html(f"<div class='stat-grid'>{blocks}</div>")
 
 
-def toggle_preference_navigation() -> None:
-    """父入口只控制子菜单的展开状态，不改变当前页面。"""
-    st.session_state.preference_navigation_open = not st.session_state.get("preference_navigation_open", False)
-
-
 def page_navigation() -> str:
-    """侧栏主入口与投资偏好子菜单；页面状态仍由 navigation 保存。"""
+    """侧栏主入口；旧偏好与调整入口统一迁移到风险评估。"""
     st.session_state.setdefault("navigation", "主页")
     current = st.session_state.navigation
-    if current == "投资偏好":  # 兼容旧浏览器会话
+    if current in {"投资偏好", "风险调整"}:  # 兼容旧浏览器会话
         current = "风险评估"
         st.session_state.navigation = current
-    st.session_state.setdefault("preference_navigation_open", current in {"风险评估", "风险调整"})
     with st.container(key="nav"):
         st.button("主页", key="nav_home", width="stretch",
                   type="primary" if current == "主页" else "tertiary",
                   on_click=go_to, args=("主页",))
-        st.button("投资偏好", key="nav_preference", width="stretch",
-                  icon=":material/expand_less:" if st.session_state.preference_navigation_open else ":material/expand_more:",
-                  on_click=toggle_preference_navigation)
-        if st.session_state.preference_navigation_open:
-            with st.container(key="nav-preference-children"):
-                for page, key in (("风险评估", "nav_assessment"), ("风险调整", "nav_adjustment")):
-                    st.button(page, key=key, width="stretch",
-                              type="primary" if current == page else "tertiary",
-                              on_click=go_to, args=(page,))
+        st.button("风险评估", key="nav_assessment", width="stretch",
+                  type="primary" if current == "风险评估" else "tertiary",
+                  on_click=go_to, args=("风险评估",))
         for page, key in (("投资问答", "nav_questions"), ("自选研究", "nav_watchlist"),
                           ("持仓分析", "nav_portfolio")):
             st.button(page, key=key, width="stretch",
@@ -173,7 +173,7 @@ def render_side_user(api_base: str) -> None:
     account_name = str(user.get("username", ""))
     username = "微信用户" if re.fullmatch(r"wx_[0-9a-f]{40}", account_name) else escape(account_name)
     ready = profile_ready()
-    state = "投资偏好已确认" if ready else "待确认投资偏好"
+    state = "风险评估已确认" if ready else "待完成风险评估"
     dot = "dot" if ready else "dot pending"
     st.html(
         f"<div class='side-user'><div class='who'>{username}</div>"
@@ -188,14 +188,15 @@ def invalidate_recent_conversations(api_base: str | None = None) -> None:
     st.session_state.recent_conversations_loaded_at = 0.0
 
 
-def recent_conversations(api_base: str) -> list[dict[str, Any]] | None:
+def recent_conversations(api_base: str, *, nonblocking: bool = False) -> list[dict[str, Any]] | None:
     """按浏览器会话短暂缓存当前账号的最近咨询，避免每次控件重跑都查库。"""
 
     now = monotonic()
     loaded_at = st.session_state.get("recent_conversations_loaded_at", 0.0)
     if now - loaded_at < 30 and "recent_conversations" in st.session_state:
         return st.session_state.recent_conversations
-    result = take_account_result(api_base, "/history?limit=20")
+    result = (read_account_data(api_base, "/history?limit=20", st.session_state.get("auth_token"), backend_http_client(api_base))
+              if nonblocking else take_account_result(api_base, "/history?limit=20"))
     if result is PENDING:
         return st.session_state.get("recent_conversations")
     if result is NOT_PREFETCHED:
@@ -239,7 +240,7 @@ def render_recent_chats(api_base: str) -> None:
                      icon=":material/history:", on_change="rerun") as section:
         if not section.open:
             return
-        histories = recent_conversations(api_base)
+        histories = recent_conversations(api_base, nonblocking=True)
         if histories is None:
             st.caption("正在加载咨询记录。" if st.session_state.get("account_prefetch")
                        else "咨询记录暂不可用，请稍后重试。")
@@ -277,6 +278,7 @@ def render_sidebar(api_base: str, *, full: bool) -> str | None:
                 reset_user_session()
                 st.rerun()
             if st.button("重试连接", width="stretch", icon=":material/refresh:"):
+                st.session_state.session_status_checked_at = 0.0
                 st.rerun()
             return None
         st.button("发起咨询", width="stretch", type="primary", on_click=new_conversation,
@@ -397,18 +399,51 @@ def register_browser_session(api_base: str) -> None:
         browser_session_reclaimer().register(session_id, api_base, beacon_token)
 
 
-@st.fragment(run_every=30)
 def enforce_session_timeout(api_base: str) -> None:
-    """定时检查服务端租约；同时保留后端断开时的兜底状态。"""
+    """租约检查在后台进行；等待结果时才启用短轮询。"""
+    pending = bool(st.session_state.get("session_status_task")) or (
+        bool(st.session_state.get("auth_token"))
+        and monotonic() - st.session_state.get("session_status_checked_at", 0.0) >= 30
+    )
+    st.fragment(run_every=1 if pending else 30)(_check_session_timeout)(api_base, pending)
 
-    if st.session_state.get("auth_token"):
-        now = monotonic()
-        if now - st.session_state.get("session_status_checked_at", 0.0) < 30:
+
+def _check_session_timeout(api_base: str, polling: bool) -> None:
+    token = st.session_state.get("auth_token")
+    if not token:
+        return
+    task = st.session_state.get("session_status_task")
+    if task:
+        if not task["future"].done():
             return
-        st.session_state.session_status_checked_at = now
-        st.session_state.service_unavailable = (
-            api_request(api_base, "GET", "/auth/session/status") is None
-        )
+        st.session_state.pop("session_status_task", None)
+        if task["token"] != token or task["api_base"] != api_base:
+            return
+        try:
+            result = task["future"].result()
+        except Exception:
+            result = None
+        st.session_state.session_status_checked_at = monotonic()
+        if result is not None and result.status == 401:
+            message = format_api_error(result.detail)
+            reset_user_session()
+            st.session_state.auth_notice = message
+            st.rerun()
+        unavailable = result is None or result.data is None
+        changed = unavailable != st.session_state.get("service_unavailable", False)
+        st.session_state.service_unavailable = unavailable
+        if changed or polling:
+            st.rerun()
+        return
+
+    if monotonic() - st.session_state.get("session_status_checked_at", 0.0) < 30:
+        return
+    future = account_read_executor().submit(request_json, backend_http_client(api_base),
+        api_base, "GET", "/auth/session/status", None, token)
+    st.session_state.session_status_task = {"future": future, "token": token, "api_base": api_base}
+    context = get_script_run_ctx(suppress_warning=True)
+    if context and getattr(context, "fragment_ids_this_run", None):
+        st.rerun()
 
 
 def utc_now() -> str:
@@ -596,7 +631,7 @@ def stream_analysis(api_base: str, payload: dict[str, Any]) -> dict[str, Any] | 
 def run_analysis(api_base: str, query: str) -> dict[str, Any] | None:
     """携带最近多轮上下文调用统一分析端点，并更新会话历史。"""
     if not profile_ready():
-        st.warning("请先在“投资偏好”中确认您的情况，再开始分析。")
+        st.warning("请先在“风险评估”中完成问卷并确认结果，再开始分析。")
         return None
     if not query.strip():
         st.warning("请输入研究问题。")
@@ -607,6 +642,7 @@ def run_analysis(api_base: str, query: str) -> dict[str, Any] | None:
         "profile": st.session_state.profile,
         "facts": st.session_state.facts,
         "auto_fetch": True,
+        "research_mode": st.session_state.get("research_mode", "deep"),
         "portfolio": st.session_state.portfolio,
         "conversation_id": st.session_state.conversation_id,
         "context_messages": [
@@ -652,6 +688,7 @@ def submit_chat_analysis(api_base: str, direction: str, query: str) -> None:
         "profile": dict(st.session_state.profile),
         "facts": [dict(fact) for fact in st.session_state.facts],
         "auto_fetch": True,
+        "research_mode": st.session_state.get("research_mode", "deep"),
         "portfolio": [dict(item) for item in st.session_state.portfolio],
         "conversation_id": conversation_id,
         "context_messages": [
@@ -706,8 +743,11 @@ def finish_chat_analyses() -> bool:
     return changed
 
 
-@st.fragment(run_every=2)
 def background_analysis_status() -> None:
+    st.fragment(run_every=2 if st.session_state.get("analysis_jobs") else None)(_background_analysis_status)()
+
+
+def _background_analysis_status() -> None:
     if finish_chat_analyses():
         st.rerun()
     jobs = st.session_state.get("analysis_jobs", {})
@@ -723,10 +763,8 @@ def close_history_view() -> None:
 
 
 def go_to(page: str) -> None:
-    if page == "投资偏好":
+    if page in {"投资偏好", "风险调整"}:
         page = "风险评估"
-    if page in {"风险评估", "风险调整"}:
-        st.session_state.preference_navigation_open = True
     if page == "历史记录":
         st.session_state.history_view = True
     else:
@@ -823,7 +861,7 @@ def render_research_page(api_base: str, direction: str) -> None:
         render_research_board(api_base, direction, create_board_fetch(api_base))
     if not profile_ready():
         st.info("请先确认投资偏好，再开始分析。", icon=":material/person_edit:")
-        st.button("填写投资偏好", type="primary", on_click=go_to, args=("投资偏好",))
+        st.button("进行风险评估", type="primary", on_click=go_to, args=("风险评估",))
     if st.session_state.conversation:
         with st.container(horizontal=True, vertical_alignment="center"):
             st.markdown(f"**对话中 · {len(st.session_state.conversation)} 条消息**")
@@ -856,6 +894,9 @@ def render_research_page(api_base: str, direction: str) -> None:
                     content = content.removeprefix(RESEARCH_PREFIX[direction])
                 st.write(plain_language(content) if turn["role"] == "assistant" else content)
     # 必须在页面顶层调用，Streamlit 才会将唯一输入框固定在底部。
+    st.selectbox("研究模式", options=["deep", "fast"],
+                 format_func=lambda mode: "深入研究" if mode == "deep" else "快速研究",
+                 key="research_mode", help="快速研究精简分析资料与篇幅；两种模式均执行事实核验和风险检查。")
     query = st.chat_input(QUICK_ASK_PROMPTS[direction], key=f"research_chat_{direction}",
                           disabled=not profile_ready() or direction in st.session_state.get("analysis_jobs", {}),
                           width="stretch")
@@ -940,6 +981,7 @@ def render_materials_body(api_base: str) -> None:
                     preserve_analysis_materials()
                     add_fact({"fact_id": f"MANUAL-{uuid.uuid4().hex[:12]}", "entity": entity.strip(),
                               "field": field, "value": value,
+                              "unit": "percent" if isinstance(value, str) and value.endswith(("%", "％")) else None,
                               "snapshot_time": datetime.combine(as_of, datetime.min.time(),
                                                                 tzinfo=timezone(timedelta(hours=8))).isoformat(),
                               "source_id": f"USER_SUPPLIED:{source.strip()}", "quality": 0.8})
@@ -977,11 +1019,11 @@ def render_materials_body(api_base: str) -> None:
                     st.rerun()
 
 
-def page_profile(api_base: str, *, view: str = "风险评估") -> None:
-    """投资偏好统一使用十九题风险测评。"""
-    render_page_header(view)
-    st.title(view)
-    render_risk_assessment(api_base, view=view, api_request=api_request)
+def page_profile(api_base: str) -> None:
+    """风险评估统一使用十九题问卷。"""
+    render_page_header("风险评估")
+    st.title("风险评估")
+    render_risk_assessment(api_base, api_request=api_request)
 
 
 def available_analyses() -> list[tuple[str, dict[str, Any]]]:
@@ -1026,10 +1068,10 @@ def manual_fact_value(field: str, value_text: str) -> Any:
         return raw
     if not math.isfinite(numeric):
         raise ValueError("请填写有效数字。")
-    if field in {"fee_rate", "weight"} and percent:
+    if field == "weight" and percent:
         return numeric / 100
     # 其他供应商百分比的口径不统一，保留显式单位，避免猜测并转换错误。
-    return f"{numeric:g}%" if percent else numeric
+    return raw if percent else numeric
 
 
 def render_professional_views(advice: dict[str, Any]) -> None:
@@ -1110,16 +1152,27 @@ def render_analysis_details() -> None:
                 st.caption("这里显示所选分析的完成记录。")
             else:
                 st.caption("本次暂无可展示的分项记录。")
+            results = advice.get("agent_results") or []
+            if results:
+                st.dataframe([{"分析环节": TOPIC_LABELS.get(result.get("agent_id"), "相关分析"),
+                               "规则计算分": result.get("rule_score", result.get("score")),
+                               "模型研判分": result.get("model_score"),
+                               "汇总采用分": result.get("score"),
+                               "差异说明": result.get("score_difference_reason") or "—",
+                               "耗时（毫秒）": (result.get("details") or {}).get("duration_ms")}
+                              for result in results], width="stretch", hide_index=True)
+                st.caption("汇总采用可复算的规则分；模型分单独保留供复核，分数不代表预期收益。")
 
 
-def ensure_watchlist_loaded(api_base: str) -> None:
+def ensure_watchlist_loaded(api_base: str, *, nonblocking: bool = False) -> None:
     """每个登录会话只加载一次账号自选；失败时保留重试机会。"""
 
     if st.session_state.get("watchlist_loaded"):
         return
     if monotonic() < st.session_state.get("watchlist_retry_at", 0.0):
         return
-    result = take_account_result(api_base, "/watchlist")
+    result = (read_account_data(api_base, "/watchlist", st.session_state.get("auth_token"), backend_http_client(api_base))
+              if nonblocking else take_account_result(api_base, "/watchlist"))
     if result is PENDING:
         return
     if result is NOT_PREFETCHED:
@@ -1396,10 +1449,11 @@ def page_portfolio(api_base: str) -> None:
             )
 
 
-def _restore_profile(api_base: str) -> bool:
+def _restore_profile(api_base: str, *, nonblocking: bool = False) -> bool:
     """登录后恢复服务端保存的画像，避免每次重新登录都要重填问卷。"""
 
-    result = take_account_result(api_base, "/profile")
+    result = (read_account_data(api_base, "/profile", st.session_state.get("auth_token"), backend_http_client(api_base))
+              if nonblocking else take_account_result(api_base, "/profile"))
     if result is PENDING:
         return False
     if result is NOT_PREFETCHED:
@@ -1422,6 +1476,9 @@ def reset_user_session() -> None:
     """退出时清理仅属于当前账号的浏览器状态。"""
     cancel_board_prefetch()
     cancel_account_prefetch()
+    status_task = st.session_state.pop("session_status_task", None)
+    if status_task:
+        status_task["future"].cancel()
     for job in st.session_state.get("analysis_jobs", {}).values():
         job["future"].cancel()
     for key in list(st.session_state):
@@ -1693,7 +1750,7 @@ def main() -> None:
         st.session_state.auth_user = current_user
     register_browser_session(api_base)
     enforce_session_timeout(api_base)
-    if st.session_state.pop("service_unavailable", False):
+    if st.session_state.get("service_unavailable", False):
         # 状态接口不查询用户表，比每次调用 /auth/me 更轻；连接失败时仍沿用原兜底页。
         _render_service_unavailable(api_base)
         return
@@ -1702,9 +1759,7 @@ def main() -> None:
         render_admin(api_base, api_request, reset_user_session)
         return
     if not st.session_state.get("profile_restored"):
-        st.session_state.profile_restored = _restore_profile(api_base)
-    if st.session_state.get("account_prefetch"):
-        poll_account_prefetch()
+        st.session_state.profile_restored = _restore_profile(api_base, nonblocking=True)
     if st.session_state.get("pending_navigation"):
         st.session_state.navigation = st.session_state.pop("pending_navigation")
         st.session_state.history_view = False
@@ -1713,16 +1768,21 @@ def main() -> None:
         st.session_state.navigation = "投资问答"
         st.session_state.history_view = True
     page = render_sidebar(api_base, full=True)
-    if not st.session_state.get("profile_restored") and page in {"风险评估", "风险调整"}:
-        st.info("正在恢复投资偏好，请稍候。", icon=":material/sync:")
+    if page in {"主页", "自选研究"}:
+        ensure_watchlist_loaded(api_base, nonblocking=True)
+    if not st.session_state.get("profile_restored") and (api_base, "/profile") in st.session_state.get("account_prefetch_results", {}):
+        st.session_state.profile_restored = _restore_profile(api_base, nonblocking=True)
+    if not st.session_state.get("profile_restored") and page == "风险评估":
+        st.info("正在恢复风险评估，请稍候。", icon=":material/sync:")
+        if st.session_state.get("account_prefetch"):
+            poll_account_prefetch()
         return
     if st.session_state.get("history_view"):
         page = "历史记录"
-    if page in {"主页", "自选研究"}:
-        ensure_watchlist_loaded(api_base)
     if page == "自选研究" and (api_base, "/watchlist") in st.session_state.get("account_prefetch", {}):
         render_page_header("自选研究")
         st.info("正在加载自选标的，请稍候。", icon=":material/sync:")
+        poll_account_prefetch()
         return
     pages = {
         "主页": lambda: page_home(api_base),
@@ -1731,9 +1791,11 @@ def main() -> None:
         "持仓分析": lambda: page_portfolio(api_base),
         "历史记录": lambda: page_insights(api_base),
         "风险评估": lambda: page_profile(api_base),
-        "风险调整": lambda: page_profile(api_base, view="风险调整"),
     }
     pages.get(page, lambda: page_home(api_base))()
+    # 注册轮询前先处理本轮页面提交，避免已完成的读取打断聊天输入。
+    if st.session_state.get("account_prefetch"):
+        poll_account_prefetch()
 
 
 def new_conversation() -> None:

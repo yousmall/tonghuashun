@@ -11,7 +11,9 @@ from datetime import datetime, timedelta
 from backend.app.models import FactRecord
 
 FAST_MARKET_FIELDS = frozenset(
-    {"close_price", "change", "change_amount", "volume", "turnover_rate", "volatility"}
+    {"close_price", "change", "change_amount", "volume", "turnover_rate", "volatility",
+     "capital_flow", "turnover_value", "market_advancing_ratio", "industry_turnover_percentile",
+     "max_drawdown_1y", "avg_turnover_20d", "trading_status", "is_st"}
 )
 NEWS_FIELDS = frozenset({"news", "announcement", "research_report", "news_summary",
                          "announcement_summary", "research_report_summary"})
@@ -61,12 +63,21 @@ SLOW_FINANCIAL_FIELDS = frozenset(
         "revenue_growth",
         "fee_rate",
         "tracking_error",
+        "gross_margin", "net_margin", "operating_margin",
     }
 )
 PORTFOLIO_FIELDS = frozenset({"weight", "portfolio_weight", "sector_weight", "fund_risk_level"})
 
 # 面向用户的中文指标名：任何展示给用户的文案都必须经它转换，不能回显内部字段编码。
 FIELD_LABELS: dict[str, str] = {
+    "max_drawdown_1y": "近一年最大回撤", "avg_turnover_20d": "近20日平均成交额",
+    "trading_status": "交易状态", "is_st": "风险警示状态",
+    "m2_growth": "广义货币同比增长率", "market_advancing_ratio": "市场上涨家数占比",
+    "industry_revenue_growth": "行业营业收入同比增长率", "industry_turnover_percentile": "行业换手率历史百分位",
+    "policy_assessment": "政策证据评估", "event_assessment": "公司事件证据评估",
+    "governance_assessment": "公司治理证据评估",
+    "gross_margin": "毛利率", "net_margin": "净利率", "operating_margin": "营业利润率",
+    "industry_median_change": "行业涨跌幅中值",
     "close_price": "最新价",
     "change": "涨跌幅",
     "change_amount": "涨跌额",

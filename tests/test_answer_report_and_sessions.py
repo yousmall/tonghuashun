@@ -16,8 +16,8 @@ def advice():
             'compliance': {'status': 'REVIEW', 'risk_notice': '不保证收益。', 'required_disclosures': ['请注意信息时效。']},
             'risks': ['风险甲', '风险乙'], 'next_steps': ['核对最新公告'], 'data_acquisition': {'mode': 'unavailable'},
             'evidence': ['a', 'b'], 'facts': [
-                {'fact_id': 'a', 'entity': '公司甲', 'field': 'change', 'value': 2, 'period': '2026-09-24', 'snapshot_time': '2026-09-24T08:00:00Z', 'source_id': 'TEST'},
-                {'fact_id': 'b', 'entity': '公司乙', 'field': 'change', 'value': -1, 'period': '2026-09-24', 'snapshot_time': '2026-09-24T08:00:00Z', 'source_id': 'TEST'}]}
+                {'fact_id': 'a', 'entity': '公司甲', 'field': 'change', 'value': 2, 'unit': 'percent', 'period': '2026-09-24', 'snapshot_time': '2026-09-24T08:00:00Z', 'source_id': 'TEST'},
+                {'fact_id': 'b', 'entity': '公司乙', 'field': 'change', 'value': -1, 'unit': 'percent', 'period': '2026-09-24', 'snapshot_time': '2026-09-24T08:00:00Z', 'source_id': 'TEST'}]}
 
 
 def test_images_only_chart_cited_numbers_with_matching_dates_and_no_conflicts():

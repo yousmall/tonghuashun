@@ -5,6 +5,9 @@ from typing import Any
 import streamlit as st
 from frontend.answer_report import answer_images, build_answer_pdf, chart_groups, cited_facts
 from frontend.presentation import (plain_language, render_conclusion_panel, render_logic_chain, render_source_trace, source_trace_rows, TOPIC_LABELS)
+from frontend.presentation import render_verification_records
+from frontend.answer_visibility import coverage_notices, verification_notes, visible_risks, visible_next_steps, visible_risk_conclusion, visible_compliance_reason
+
 
 def show_status(status: str) -> None:
     if status == "REVIEW":
@@ -16,7 +19,6 @@ def show_status(status: str) -> None:
 def render_answer_charts(advice, *, key="answer"):
     groups = chart_groups(advice)
     if not groups:
-        st.caption("同口径的数值资料不足，暂不绘制趋势或对比图。")
         return
     import altair as alt
     import pandas as pd
@@ -54,10 +56,6 @@ def render_advice(advice: dict[str, Any], *, export_key: str = "answer", questio
     notices = []
     if compliance.get("status") != "PASS":
         notices.append("这份分析仍需核实，请勿直接据此买卖。")
-    if acquisition.get("mode") == "unavailable":
-        notices.append("本次未能取得最新市场数据，分析可能不完整。")
-    elif acquisition.get("failed_capabilities") or acquisition.get("empty_capabilities"):
-        notices.append("部分资料暂未取得，相关判断仍需补充信息。")
     if acquisition.get("mode") == "demo" or any(f.get("source_id") == "DEMO_SNAPSHOT" for f in advice["facts"]):
         notices.append("本结果含示例数据，仅用于演示。")
     if notices:
@@ -71,8 +69,7 @@ def render_advice(advice: dict[str, Any], *, export_key: str = "answer", questio
     if compact:
         st.markdown("**分析结论**")
         st.write(plain_language(advice.get("conclusion")) or "资料不足，暂未形成结论。")
-        risks = [advice.get("risk_conclusion"), *advice.get("risks", []),
-                 *[item.get("message") for item in (advice.get("cross_validation") or {}).get("issues", [])],
+        risks = [visible_risk_conclusion(advice), *visible_risks(advice),
                  *compliance.get("required_disclosures", []), compliance.get("risk_notice")]
         risks = list(dict.fromkeys(plain_language(value) for value in risks if value))
         if risks:
@@ -84,6 +81,7 @@ def render_advice(advice: dict[str, Any], *, export_key: str = "answer", questio
                 render_answer_charts(advice, key=export_key)
                 render_logic_chain(advice)
                 render_source_trace(advice)
+        render_verification_records(advice, key=export_key)
     else:
         render_conclusion_panel(advice, key=f"analysis-conclusion-{export_key}")
         render_answer_charts(advice, key=export_key)
@@ -109,22 +107,20 @@ def answer_export_payload(advice: dict[str, Any], images: list, question: str = 
     compliance = advice.get("compliance", {})
     acquisition = advice.get("data_acquisition", {})
     notices = ["风险检查：" + {"PASS": "可供参考，仍有投资风险", "BLOCK": "暂不提供投资建议"}.get(compliance.get("status"), "仍需进一步核实")]
-    if acquisition.get("mode") == "unavailable":
-        notices.append("本次未能取得最新市场数据，分析可能不完整。")
-    if acquisition.get("failed_capabilities") or acquisition.get("empty_capabilities"):
-        notices.append("部分资料暂未取得，相关判断仍需补充信息。")
     if acquisition.get("mode") == "demo" or any(fact.get("source_id") == "DEMO_SNAPSHOT" for fact in advice.get("facts", [])):
         notices.append("本结果含示例数据，仅用于演示。")
     sections = [
         ("分析结论", [advice.get("conclusion") or "资料不足，暂未形成结论。"]),
-        ("风险结论", [advice.get("risk_conclusion") or "请结合资料完整性及个人承受能力进一步核实。", *notices, compliance.get("reason"), compliance.get("risk_notice")]),
-        ("需要注意", [*advice.get("risks", []), *[item.get("message") for item in advice.get("cross_validation", {}).get("issues", [])], *compliance.get("required_disclosures", [])]),
-        ("后续研究建议", advice.get("next_steps", [])),
+        ("风险结论", [visible_risk_conclusion(advice) or "请结合资料完整性及个人承受能力进一步核实。", *notices, visible_compliance_reason(advice), compliance.get("risk_notice")]),
+        ("需要注意", [*visible_risks(advice), *compliance.get("required_disclosures", [])]),
+        ("后续研究建议", visible_next_steps(advice)),
         ("与您的投资偏好是否匹配", [advice.get("user_fit")]),
     ]
     for result in advice.get("agent_results", []):
         sections.append((TOPIC_LABELS.get(result.get("agent_id"), "相关分析"),
                          [result.get("opinion"), *result.get("confidence_reasons", []), *result.get("risk_flags", []), *result.get("invalidation_conditions", [])]))
+    if verification_notes(advice):
+        sections.append(("核验记录（附录）", verification_notes(advice)))
     return {"question": question, "images": images,
             "sections": [(title, [plain_language(text) for text in texts if text]) for title, texts in sections],
             "sources": source_trace_rows(advice)}
