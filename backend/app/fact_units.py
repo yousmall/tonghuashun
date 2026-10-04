@@ -6,13 +6,14 @@ import re
 from typing import Any
 
 PERCENT_FIELDS = frozenset({
+    "capital_flow_ratio", "interval_change",
     "max_drawdown_1y",
     "change", "roe", "roe_weighted", "revenue_growth", "net_profit_growth",
     "fee_rate", "tracking_error", "interest_rate", "cpi", "ppi",
     "turnover_rate", "volatility", "amplitude", "nav_change",
     "conversion_premium_rate", "pure_bond_premium_rate", "yield_to_maturity",
     "gross_margin", "net_margin", "operating_margin",
-    "m2_growth", "market_advancing_ratio", "industry_revenue_growth", "industry_turnover_percentile",
+    "m2_growth", "market_advancing_ratio", "industry_revenue_growth", "industry_turnover_percentile", "industry_turnover_history",
 })
 
 

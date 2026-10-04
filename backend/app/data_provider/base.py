@@ -29,8 +29,23 @@ class DataProvider(Protocol):
     async def get_institutional_research(self, target: str) -> list[FactRecord]: ...
     async def get_research_reports(self, target: str) -> list[FactRecord]: ...
     async def get_announcements(self, target: str) -> list[FactRecord]: ...
+    async def get_governance_disclosures(self, target: str) -> list[FactRecord]: ...
     async def screen_stocks(self, query: str) -> list[FactRecord]: ...
     async def get_stock_risk_metrics(self, symbol: str) -> list[FactRecord]: ...
+    async def get_stock_daily_history(self, symbol: str, start: str, end: str) -> list[FactRecord]: ...
+    async def get_market_calendar(self, start: str, end: str) -> list[FactRecord]: ...
+    async def get_exchange_calendar(self, start: str, end: str) -> list[FactRecord]: ...
+    async def get_adjusted_stock_history(self, code: str, start: str, end: str) -> list[FactRecord]: ...
+    async def get_stock_risk_state(self, code: str) -> list[FactRecord]: ...
+    async def get_stock_trading_status(self, symbol: str) -> list[FactRecord]: ...
+    async def get_industry_fundamentals(self, industry: str) -> list[FactRecord]: ...
+    async def get_industry_flow(self, industry: str) -> list[FactRecord]: ...
+    async def get_industry_turnover_history(self, industry: str, start: str, end: str) -> list[FactRecord]: ...
+    async def get_stock_disclosure_details(self, target: str) -> list[FactRecord]: ...
+    async def get_structured_events(self, target: str) -> list[FactRecord]: ...
+    async def get_industry_policy(self, industry: str) -> list[FactRecord]: ...
+    async def get_macro_policy(self, target: str) -> list[FactRecord]: ...
+    async def get_market_breadth(self, target: str) -> list[FactRecord]: ...
     async def screen_sectors(self, query: str) -> list[FactRecord]: ...
 
 
@@ -40,6 +55,48 @@ class SnapshotProvider:
     def __init__(self, facts: Sequence[FactRecord]) -> None:
         # 深拷贝隔离调用方后续修改，确保一次 Provider 实例始终代表同一审计快照。
         self._facts = [fact.model_copy(deep=True) for fact in facts]
+
+    async def get_stock_daily_history(self, symbol: str, start: str, end: str) -> list[FactRecord]:
+        return self._find(entity=symbol, fields={'adjusted_close_history', 'daily_turnover_history'})
+
+    async def get_market_calendar(self, start: str, end: str) -> list[FactRecord]:
+        return self._find(entity='中国A股交易日历', fields={'market_session', 'market_session_count', 'exchange_calendar_notice'})
+
+    async def get_exchange_calendar(self, start: str, end: str) -> list[FactRecord]:
+        return await self.get_market_calendar(start, end)
+
+    async def get_adjusted_stock_history(self, code: str, start: str, end: str) -> list[FactRecord]:
+        return self._find(entity=code, fields={'adjusted_close_history'})
+
+    async def get_stock_risk_state(self, code: str) -> list[FactRecord]:
+        return self._find(entity=code, fields={'is_st'}) + self._find(entity='沪深风险警示板', fields={'risk_warning_inventory'})
+
+    async def get_stock_trading_status(self, symbol: str) -> list[FactRecord]:
+        return self._find(entity=symbol, fields={'is_st', 'trading_status', 'is_suspended', 'listing_status'})
+
+    async def get_industry_fundamentals(self, industry: str) -> list[FactRecord]:
+        return self._find(entity=industry, fields={'industry_revenue_growth'})
+
+    async def get_industry_flow(self, industry: str) -> list[FactRecord]:
+        return self._find(entity=industry, fields={'capital_flow', 'turnover_value', 'capital_flow_ratio'})
+
+    async def get_industry_turnover_history(self, industry: str, start: str, end: str) -> list[FactRecord]:
+        return self._find(entity=industry, fields={'industry_turnover_history'})
+
+    async def get_stock_disclosure_details(self, target: str) -> list[FactRecord]:
+        return await self.get_governance_disclosures(target)
+
+    async def get_structured_events(self, target: str) -> list[FactRecord]:
+        return await self.get_event_data(target)
+
+    async def get_industry_policy(self, industry: str) -> list[FactRecord]:
+        return await self.get_news(industry)
+
+    async def get_macro_policy(self, target: str) -> list[FactRecord]:
+        return await self.get_news(target)
+
+    async def get_market_breadth(self, target: str) -> list[FactRecord]:
+        return self._find(entity=target, fields={'advancing_count', 'market_total_count'})
 
     def _find(self, *, entity: str | None = None, fields: set[str] | None = None) -> list[FactRecord]:
         """集中处理筛选；返回深拷贝，调用方无法修改 Provider 的内部快照。"""
@@ -122,6 +179,9 @@ class SnapshotProvider:
 
     async def get_announcements(self, target: str) -> list[FactRecord]:
         return self._find(entity=target, fields={"announcement"})
+
+    async def get_governance_disclosures(self, target: str) -> list[FactRecord]:
+        return self._find(entity=target, fields={"announcement", "announcement_summary"})
 
     async def screen_stocks(self, query: str) -> list[FactRecord]:
         del query

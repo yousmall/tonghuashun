@@ -129,6 +129,15 @@ class UserProfile(BaseModel):
     valid_until: date | None = None
     scoring_method: str | None = None
     scoring_notice: str | None = None
+    # 补充题原始区间与平台解释；确认时由服务端从答案重算。
+    financial_plan: dict[str, Any] = Field(default_factory=dict)
+    financial_capacity_label: str | None = None
+    effective_horizon_max_months: int | None = Field(default=None, ge=0)
+    assessment_reasons: list[dict[str, Any]] = Field(default_factory=list)
+    scoring_breakdown: list[dict[str, Any]] = Field(default_factory=list)
+    financial_warnings: list[str] = Field(default_factory=list)
+    allocation_guidance: list[dict[str, Any]] = Field(default_factory=list)
+    stress_scenarios: list[dict[str, Any]] = Field(default_factory=list)
 
     @field_validator("risk_answers")
     @classmethod
@@ -151,6 +160,8 @@ class UserProfile(BaseModel):
     holding_history: list[dict[str, Any]] = Field(default_factory=list)
     expected_annual_return: float | None = Field(default=None, ge=-1, le=5)
     behavioral_notes: list[str] = Field(default_factory=list)
+    # 股票交易行为与风险问卷分开保存；写接口仅接受服务端重新计算的结果。
+    trading_analysis: dict[str, Any] = Field(default_factory=dict)
     # 两类上限是组合/合规可执行的硬约束，不由语言模型自行决定。
     single_security_limit: float = Field(default=0.20, gt=0, le=1)
     industry_limit: float = Field(default=0.30, gt=0, le=1)
@@ -190,6 +201,8 @@ class FactRecord(BaseModel):
     quality: float = Field(ge=0, le=1)
     # 财务/经营数据的报告期，例如 2026Q1；行情数据可为空。
     period: str | None = None
+    # 行情/文档的实际日期，与用于同项比对的 REC 标识分开。
+    observation_date: date | None = None
     # 规则派生事实记录输入 fact_id；供应商原始事实保持为空。
     derived_from: list[str] = Field(default_factory=list)
     # 产出这条事实的取数调用键（方法@研究目标）。仅用于判断能否复用已有资料、
@@ -329,6 +342,8 @@ class AgentResult(BaseModel):
     confidence_reasons: list[str] = Field(default_factory=list)
     # 本结论实际使用的 FactRecord ID；用于防幻觉检查。
     facts_used: list[str] = Field(default_factory=list)
+    # 研判中发现的新缺项；后端自动调用对应问财能力并重新核验。
+    data_requirements: list[ResearchCapability] = Field(default_factory=list, max_length=8)
     # 展示层使用的引用标识，通常与 source_id 或引用中心记录对应。
     citations: list[str] = Field(default_factory=list)
     # 需要在建议卡片中展示的风险点。
@@ -617,6 +632,8 @@ class DataAcquisitionResult(BaseModel):
     empty_capabilities: list[str] = Field(default_factory=list)
     failed_capabilities: list[str] = Field(default_factory=list)
     capability_errors: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    # 接口有返回与业务字段齐全分别审计；partial 资料仍可用于其他已核验维度。
+    capability_evidence: dict[str, dict[str, Any]] = Field(default_factory=dict)
     supplied_fact_count: int = Field(default=0, ge=0)
     fetched_fact_count: int = Field(default=0, ge=0)
     derived_fact_count: int = Field(default=0, ge=0)
@@ -630,18 +647,26 @@ class DataAcquisitionResult(BaseModel):
     missing_fields_by_agent: dict[str, list[str]] = Field(default_factory=dict)
     capability_timings_ms: dict[str, float] = Field(default_factory=dict)
     cached_capabilities: list[str] = Field(default_factory=list)
-    # 每次分析最多追加一轮补取；与第一轮审计分开，保留失败及未解决的问题。
-    recovery_rounds: int = Field(default=0, ge=0, le=1)
+    # 分析前与 agent 研判后各最多补取一次，防止无限重试。
+    recovery_rounds: int = Field(default=0, ge=0, le=2)
+    recovery_phases: list[Literal["before_analysis", "after_analysis"]] = Field(default_factory=list, max_length=2)
+    recovery_attempts: list[dict[str, Any]] = Field(default_factory=list, max_length=2)
+    recovery_agent_requirements: dict[str, list[ResearchCapability]] = Field(default_factory=dict)
     recovery_capabilities: list[str] = Field(default_factory=list)
     recovery_successful_capabilities: list[str] = Field(default_factory=list)
     recovery_empty_capabilities: list[str] = Field(default_factory=list)
     recovery_failed_capabilities: list[str] = Field(default_factory=list)
     recovery_errors: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    recovery_evidence: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    recovery_deferred_capabilities: list[str] = Field(default_factory=list)
+    recovery_gap_metrics: dict[str, int] = Field(default_factory=dict)
     recovery_reanalyzed: bool = False
     recovery_phase: Literal["before_analysis", "after_analysis"] | None = None
     recovery_missing_fields_before: dict[str, list[str]] = Field(default_factory=dict)
     recovery_timings_ms: dict[str, float] = Field(default_factory=dict)
     recovery_cached_capabilities: list[str] = Field(default_factory=list)
+    assessment_status: Literal["not_required", "completed", "partial", "unavailable"] = "not_required"
+    assessment_targets: list[dict[str, str]] = Field(default_factory=list)
 
 
 class StockRecommendationCandidate(BaseModel):
@@ -664,6 +689,34 @@ class StockRecommendationResult(BaseModel):
     screening_conditions: dict[str, Any] = Field(default_factory=dict)
     candidates: list[StockRecommendationCandidate] = Field(default_factory=list)
     recommendations: list[StockRecommendationCandidate] = Field(default_factory=list)
+
+
+class ReturnScenario(BaseModel):
+    """机构目标价对应的价格情景，不代表期望收益或实现概率。"""
+
+    entity: str
+    current_price: float = Field(gt=0, allow_inf_nan=False)
+    target_price: float = Field(gt=0, allow_inf_nan=False)
+    price_return: float = Field(ge=-1, allow_inf_nan=False)
+    currency: str
+    price_date: str
+    target_date: str
+    horizon: str = "原始资料未提供目标期限，不作年化"
+    evidence: list[str] = Field(min_length=2, max_length=2)
+
+
+class ReturnExpectation(BaseModel):
+    status: Literal["unavailable", "scenario", "blocked"] = "unavailable"
+    summary: str = "尚无可核验的收益预测；请补充同一标的、同币种的价格与目标价依据。"
+    # 用户目标单独保存，严禁用它填充系统收益预测。
+    user_goal_annual: float | None = Field(default=None, ge=-1, le=5)
+    investment_horizon_months: int | None = Field(default=None, ge=1)
+    scenarios: list[ReturnScenario] = Field(default_factory=list)
+    assumptions: list[str] = Field(default_factory=lambda: [
+        "目标价情景空间 = 目标价 ÷ 参考价 − 1；未计入分红、费用和税费。",
+        "机构目标价是观点，可能无法实现；实际收益可能为负。",
+        "未提供目标期限和实现概率，不计算年化收益或期望收益。",
+    ])
 
 
 class AdvicePackage(BaseModel):
@@ -700,6 +753,7 @@ class AdvicePackage(BaseModel):
     user_fit: str | None = None
     # MVP 只允许目标区间或诊断摘要，严禁被当作自动交易指令。
     allocation: list[dict[str, Any]] = Field(default_factory=list)
+    return_expectation: ReturnExpectation = Field(default_factory=ReturnExpectation)
     # 没有足够证据时，明确告诉用户补什么数据或采取何种教育性下一步。
     next_steps: list[str] = Field(default_factory=list)
     # 合规结果必须始终存在，防止未审核内容直接渲染。

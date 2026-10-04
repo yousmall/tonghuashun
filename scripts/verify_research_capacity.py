@@ -41,7 +41,7 @@ async def probe(base, users, rounds, duration, offline=False):
             headers = {"Authorization": "Bearer " + response.json()["access_token"]}
             assessment = await client.post(base + "/api/v1/profile/assess", headers=headers, json={
                 "questionnaire_version": QUESTIONNAIRE_VERSION,
-                "risk_answers": dict(zip((q.id for q in QUESTIONS), "ACABDCCACCBBCCBCCDB", strict=True))})
+                "risk_answers": dict(zip((q.id for q in QUESTIONS), "ACABDCCACCBBCCBCCDBCADAECDC", strict=True))})
             assessment.raise_for_status()
             confirm = await client.post(base + "/api/v1/profile/confirm", headers=headers, json={"profile": assessment.json()["profile"]})
             confirm.raise_for_status()

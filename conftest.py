@@ -11,8 +11,8 @@ import tempfile
 import uuid
 from pathlib import Path
 
-LOCAL_TEMP = Path(__file__).resolve().parent / ".tmp_pytest"
-LOCAL_TEMP.mkdir(exist_ok=True)
+LOCAL_TEMP = Path(__file__).resolve().parent / ".tmp_pytest" / f"session-{uuid.uuid4().hex}"
+LOCAL_TEMP.mkdir(parents=True, exist_ok=True)
 tempfile.tempdir = str(LOCAL_TEMP)
 
 
@@ -28,6 +28,6 @@ tempfile.mkdtemp = _local_mkdtemp
 
 
 def pytest_sessionfinish(session, exitstatus):
-    """测试结束后清理本次会话产生的临时文件，不留下构建垃圾。"""
+    """仅清理本次会话目录，避免并行测试互相删除 AppTest 脚本。"""
 
     shutil.rmtree(LOCAL_TEMP, ignore_errors=True)

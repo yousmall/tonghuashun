@@ -65,7 +65,8 @@ st.session_state.request_paths = paths
 
 
 def test_navigation_and_profile_call_to_action():
-    app = AppTest.from_string(SETUP + MAIN).run()
+    # 导航测试使用已恢复的离线画像；后台恢复行为由专用预取测试覆盖。
+    app = AppTest.from_string(SETUP + "\nst.session_state.profile_restored = True\n" + MAIN).run(timeout=15)
     assert not app.exception
     assert app.session_state['navigation'] == '主页'
     assert not app.radio
@@ -1008,16 +1009,16 @@ with patch.object(ui, 'api_request', side_effect=fake_api):
     app.radio[0].set_value('C').run(timeout=15)
     next(b for b in app.button if b.label == '上一题').click().run(timeout=15)
     assert app.radio[0].value == 'A'
-    answers = 'ACABDC CACCB BCCBC CDB'.replace(' ', '')
+    answers = 'ACABDC CACCB BCCBC CDB CADAECDC'.replace(' ', '')
     for index, answer in enumerate(answers):
         assert app.session_state['risk_assessment_index'] == index
         app.radio[0].set_value(answer).run(timeout=15)
-        if index < 18:
+        if index < len(answers) - 1:
             next(b for b in app.button if b.label == '下一题').click().run(timeout=15)
     next(b for b in app.button if b.label == '提交').click().run(timeout=15)
     assert not app.exception and not app.radio
     payload = app.session_state['assessment_payload']
-    assert len(payload['risk_answers']) == 19
+    assert len(payload['risk_answers']) == 27
     assert 'questionnaire' not in payload and 'horizon_months' not in payload
     assert app.session_state['profile']['confirmed'] is False
     assert app.session_state['profile']['investor_category'] == 'C4'
@@ -1034,7 +1035,7 @@ with patch.object(ui, 'api_request', side_effect=fake_api):
 def test_risk_reassessment_restores_answers_and_retains_risk_limits():
     script = SETUP + """
 from backend.app.risk_questionnaire import evaluate_answers, QUESTIONS
-answers = dict(zip((q.id for q in QUESTIONS), 'ACABDC CACCB BCCBC CDB'.replace(' ', '')))
+answers = dict(zip((q.id for q in QUESTIONS), 'ACABDC CACCB BCCBC CDB CADAECDC'.replace(' ', '')))
 if 'risk_fixture_initialized' not in st.session_state:
     st.session_state.profile.update(evaluate_answers(answers), single_security_limit=0.1,
         industry_limit=0.25, constraints=['不使用杠杆'], confirmed=True, assessed_on='2026-01-01')
@@ -1056,9 +1057,9 @@ with patch.object(ui, 'api_request', side_effect=fake_api):
     assert app.radio[0].value == 'C'
     next(b for b in app.button if b.label == '上一题').click().run(timeout=15)
     assert app.radio[0].value == 'B'
-    for _ in range(18):
+    for _ in range(26):
         next(b for b in app.button if b.label == '下一题').click().run(timeout=15)
-    assert app.radio[0].value == 'B'
+    assert app.radio[0].value == 'C'
     next(b for b in app.button if b.label == '提交').click().run(timeout=15)
     assert not app.exception
     assert app.session_state['profile']['single_security_limit'] == 0.1
@@ -1075,7 +1076,7 @@ st.button('模拟退出', on_click=ui.reset_user_session)
 """
     app = AppTest.from_string(script).run(timeout=15)
     app.radio[0].set_value('B').run(timeout=15)
-    app.session_state['risk_assessment_index'] = 18
+    app.session_state['risk_assessment_index'] = 26
     app.run(timeout=15)
     assert next(b for b in app.button if b.label == '提交').disabled
     next(b for b in app.button if b.label == '模拟退出').click().run(timeout=15)

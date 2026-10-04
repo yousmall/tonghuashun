@@ -34,10 +34,20 @@ SKILL_KEY_ENV = {
     "hithink-macro-query": "IWENCAI_MACRO_API_KEY",
     "hithink-fund-query": "IWENCAI_FUND_API_KEY",
     "hithink-astock-selector": "IWENCAI_SELECTOR_API_KEY",
+    "hithink-basicinfo-query": "IWENCAI_BASICINFO_API_KEY",
+    "hithink-industry-query": "IWENCAI_INDUSTRY_API_KEY",
+    "hithink-business-query": "IWENCAI_BUSINESS_API_KEY",
+    "hithink-management-query": "IWENCAI_MANAGEMENT_API_KEY",
+    "hithink-insresearch-query": "IWENCAI_INSRESEARCH_API_KEY",
+    "hithink-sector-selector": "IWENCAI_SECTOR_SELECTOR_API_KEY",
+    "hithink-event-query": "IWENCAI_EVENT_API_KEY",
     "announcement-search": "IWENCAI_ANNOUNCEMENT_API_KEY",
     "news-search": "IWENCAI_NEWS_API_KEY",
     "report-search": "IWENCAI_REPORT_API_KEY",
 }
+
+# Invalidate persistent facts after changing official skill routes or field contracts.
+SKILL_CONTRACT_REVISION = "2026-10-04.3"
 
 
 # 实体名由 _entity_from_record 从这些字段提取并写入 FactRecord.entity，
@@ -51,6 +61,17 @@ SKIPPED_RECORD_FIELDS: frozenset[str] = frozenset(
 # 别名表：值为内部规范化字段名。匹配时按别名长度倒序（见 _alias_index），
 # 因此长别名优先命中，避免 "市盈率" 把 "静态市盈率" 一并吞掉这类子串误合并。
 FIELD_ALIASES = {
+    "上涨家数": "advancing_count",
+    "A股总家数": "market_total_count",
+    # A name LIKE predicate is not an exchange risk-warning declaration.
+    "股票简称like%st%": "name_contains_st",
+    "like_st": "name_contains_st",
+    "是否停牌": "is_suspended",
+    "上市状态": "listing_status",
+    "主力净买入额占成交额比例": "capital_flow_ratio",
+    "区间涨跌幅": "interval_change",
+    "成交额平均值": "interval_avg_turnover",
+    "平均成交额": "interval_avg_turnover",
     "近一年最大回撤": "max_drawdown_1y",
     "近20日平均成交额": "avg_turnover_20d",
     "近20个交易日平均成交额": "avg_turnover_20d",
@@ -100,6 +121,7 @@ FIELD_ALIASES = {
     "综合评分": "fundamental_score",
     "综合评分排名": "fundamental_rank",
     "所属同花顺行业": "industry",
+    "所属同花顺三级行业": "industry",
     "资金流向": "capital_flow",
     "主力净买入额": "capital_flow",
     "主力资金净流入": "capital_flow",
@@ -145,6 +167,7 @@ FIELD_ALIASES = {
     "研报标题": "research_report",
     "标题": "news",
     "公司全称": "company_name",
+    "中文名称": "company_name",
     "所属行业": "industry",
     "上市日期": "listing_date",
     "主营业务": "main_business",
@@ -311,15 +334,17 @@ class IwencaiSkillHubProvider:
         max_concurrency: int = 8,
         transport: httpx.AsyncBaseTransport | None = None,
         skill_api_keys: Mapping[str, str] | None = None,
+        public_recovery: Any | None = None,
     ) -> None:
         if not api_key.strip():
             raise ValueError("IWENCAI_API_KEY 不能为空")
         self._api_key = api_key.strip()
+        self.public_recovery = public_recovery
         self._skill_api_keys = {skill: key.strip() for skill, key in (skill_api_keys or {}).items()
                                 if skill in SKILL_KEY_ENV and key.strip()}
         # Partition public caches by entitlement without persisting credentials.
-        self.cache_namespace = hashlib.sha256(json.dumps([base_url, self._api_key,
-            self._skill_api_keys], sort_keys=True).encode()).hexdigest()
+        self.cache_namespace = hashlib.sha256(json.dumps([SKILL_CONTRACT_REVISION, base_url, self._api_key,
+            self._skill_api_keys, public_recovery is not None], sort_keys=True).encode()).hexdigest()
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
         self.max_retries = max_retries
@@ -327,26 +352,47 @@ class IwencaiSkillHubProvider:
         self._semaphore = asyncio.Semaphore(max_concurrency)
         # Provider 是应用级单例；复用一个异步客户端才能真正复用 TCP/TLS 连接池。
         # 每次调用仍生成独立追踪 ID，并保留原有超时、重试和熔断语义。
-        self._client = httpx.AsyncClient(transport=transport, timeout=timeout_seconds)
+        self._client = httpx.AsyncClient(transport=transport, timeout=timeout_seconds,
+            limits=httpx.Limits(max_connections=max_concurrency, max_keepalive_connections=max_concurrency))
         self.call_observer: Callable[[dict[str, Any]], Awaitable[None]] | None = None
         self._failure_count = 0
         self._circuit_open_until: datetime | None = None
+        self._quota_cooldowns: dict[str, tuple[datetime, int]] = {}
+        self._calendar_tasks: dict[tuple[str, str], tuple[datetime, asyncio.Task]] = {}
 
     async def aclose(self) -> None:
         """在应用退出时释放问财连接池。"""
 
+        for _, task in self._calendar_tasks.values():
+            if not task.done():
+                task.cancel()
+        if self._calendar_tasks:
+            await asyncio.gather(*(task for _, task in self._calendar_tasks.values()), return_exceptions=True)
         await self._client.aclose()
+        if self.public_recovery is not None:
+            await self.public_recovery.aclose()
 
     @classmethod
     def from_env(cls) -> "IwencaiSkillHubProvider | None":
         api_key = os.getenv("IWENCAI_API_KEY", "").strip()
         if not api_key:
             return None
+        from backend.app.data_provider.public_recovery import PublicMarketRecovery
         return cls(
             api_key,
             base_url=os.getenv("IWENCAI_BASE_URL", "https://openapi.iwencai.com"),
             skill_api_keys={skill: os.getenv(env_name, "") for skill, env_name in SKILL_KEY_ENV.items()},
+            public_recovery=PublicMarketRecovery() if os.getenv('IWENCAI_PUBLIC_RECOVERY_ENABLED', '1') == '1' else None,
         )
+
+    async def get_adjusted_stock_history(self, code: str, start: str, end: str):
+        return await self.public_recovery.get_adjusted_stock_history(code, start, end) if self.public_recovery else []
+
+    async def get_exchange_calendar(self, start: str, end: str):
+        return await self.public_recovery.get_exchange_calendar(start, end) if self.public_recovery else []
+
+    async def get_stock_risk_state(self, code: str):
+        return await self.public_recovery.get_stock_risk_state(code) if self.public_recovery else []
 
     async def query(
         self,
@@ -376,7 +422,7 @@ class IwencaiSkillHubProvider:
         skills = {
             "announcement": ("announcement-search", "1.0.0"),
             "news": ("news-search", "1.0.0"),
-            "report": ("report-search", "2.0.0"),
+            "report": ("report-search", "1.0.0"),
         }
         try:
             skill_id, skill_version = skills[channel]
@@ -386,6 +432,7 @@ class IwencaiSkillHubProvider:
             "channels": [channel],
             "app_id": "AIME_SKILL",
             "query": query,
+            "size": 10,
         }
         return await self._request(
             "/v1/comprehensive/search",
@@ -412,6 +459,10 @@ class IwencaiSkillHubProvider:
             raise RuntimeError("问财数据源熔断中，请稍后重试")
         last_error: Exception | None = None
         async with self._semaphore:
+            blocked = self._quota_cooldowns.get(skill_id)
+            if blocked and datetime.now(timezone.utc) < blocked[0]:
+                raise ProviderCallError("问财当前技能的查询额度已用完，额度恢复后可继续查询。",
+                                        code="PROVIDER_QUOTA_EXHAUSTED", status_code=blocked[1])
             for attempt in range(self.max_retries + 1):
                 headers = {
                     "Authorization": f"Bearer {self._skill_api_keys.get(skill_id, self._api_key)}",
@@ -431,6 +482,14 @@ class IwencaiSkillHubProvider:
                     )
                     self._failure_count = 0
                     return facts
+                except ProviderCallError as exc:
+                    if exc.code == "PROVIDER_QUOTA_EXHAUSTED":
+                        # Avoid repeating the same exhausted skill throughout
+                        # a candidate batch. This is a short cooldown, not an
+                        # assertion about the vendor's daily reset time.
+                        self._quota_cooldowns[skill_id] = (
+                            datetime.now(timezone.utc) + timedelta(minutes=5), exc.status_code or 200)
+                    raise
                 except httpx.HTTPStatusError as exc:
                     last_error = exc
                     status_code = exc.response.status_code
@@ -473,9 +532,16 @@ class IwencaiSkillHubProvider:
         try:
             response = await self._client.post(f"{self.base_url}{path}", headers=headers, json=payload)
             event["status_code"] = response.status_code
+            if _quota_exhausted(response):
+                raise ProviderCallError("问财当前技能的查询额度已用完，额度恢复后可继续查询。",
+                                        code="PROVIDER_QUOTA_EXHAUSTED", status_code=response.status_code)
             response.raise_for_status()
             result = response.json()
-            facts = (_history_facts(result, entity_hint=entity_hint, source_id=self.source_id,
+            if history_metric == 'industry_revenue_aggregate':
+                from backend.app.data_provider.industry_evidence import aggregate_industry_revenue
+                facts = aggregate_industry_revenue(result, target=entity_hint, source_id=self.source_id)
+            else:
+                facts = (_history_facts(result, entity_hint=entity_hint, source_id=self.source_id,
                                     metric=history_metric, limit=history_limit)
                      if history_metric else self._normalize(result, entity_hint=entity_hint, channel=channel))
             event["status"] = "success" if facts else "empty"
@@ -540,6 +606,137 @@ class IwencaiSkillHubProvider:
             entity_hint=symbol,
         )
 
+    async def _recovery_series(self, target: str, start: str, end: str, *, kind: str, query: str):
+        start_date, end_date = date.fromisoformat(start), date.fromisoformat(end)
+        if not 350 <= (end_date - start_date).days <= 366:
+            raise ValueError("恢复序列仅支持完整一年窗口")
+        facts, signatures = [], set()
+        for page in range(1, 4):
+            batch = await self._request('/v1/query2data',
+                {'query': query, 'page': str(page), 'limit': '100', 'is_cache': '1', 'expand_index': 'true'},
+                entity_hint=target, skill_id='hithink-industry-query' if kind == 'industry_series' else 'hithink-market-query',
+                skill_version='1.0.0', history_metric=kind)
+            batch = [f for f in batch if start <= (f.period or '') <= end]
+            signature = frozenset((f.entity_code, f.field, f.period, str(f.value), f.unit) for f in batch)
+            if not batch or signature in signatures:
+                break
+            signatures.add(signature)
+            facts.extend(batch)
+        return facts
+
+    async def get_stock_daily_history(self, symbol: str, start: str, end: str) -> list[FactRecord]:
+        return await self._recovery_series(symbol, start, end, kind='stock_series',
+            query=f'{symbol} {start}至{end} 每个交易日前复权收盘价、成交额，逐日列出交易日期及单位')
+
+    async def get_market_calendar(self, start: str, end: str) -> list[FactRecord]:
+        if self.public_recovery is not None:
+            key, now = (start, end), datetime.now(timezone.utc)
+            entry = self._calendar_tasks.get(key)
+            if entry is None or (now - entry[0]).total_seconds() > 60 or (
+                    entry[1].done() and (entry[1].cancelled() or entry[1].exception() is not None)):
+                self._calendar_tasks = {k: v for k, v in self._calendar_tasks.items()
+                                        if not v[1].done() or (now-v[0]).total_seconds() <= 60}
+                entry = (now, asyncio.create_task(self.public_recovery.get_exchange_calendar(start, end)))
+                self._calendar_tasks[key] = entry
+            return await asyncio.shield(entry[1])
+        return await self._recovery_series('中国A股交易日历', start, end, kind='calendar_series',
+            query=f'沪深北交易所 {start}至{end} 交易日历，逐日列出交易日期、区间交易日总数、区间开始日期、区间结束日期，不含非交易日')
+
+    async def get_stock_trading_status(self, symbol: str) -> list[FactRecord]:
+        return await self.query(f'{symbol} 是否ST、是否停牌、上市状态、交易状态', entity_hint=symbol)
+
+    async def get_industry_fundamentals(self, industry: str) -> list[FactRecord]:
+        from backend.app.data_provider.industry_evidence import industry_query_name
+        facts = await self.query(f'{industry_query_name(industry)}行业 营业收入同比增长率', entity_hint=industry,
+                                 skill_id='hithink-industry-query')
+        facts = [f.model_copy(update={'entity': industry}) if f.entity == industry_query_name(industry)
+                 and str(f.entity_code or '').endswith('.TI') else f for f in facts]
+        direct = [f.model_copy(update={'field': 'industry_revenue_growth'}) if f.field == 'revenue_growth' else f
+                for f in facts if f.entity == industry and f.entity_code and f.entity_code.upper().endswith('.TI')
+                and f.field in {'revenue_growth', 'industry_revenue_growth'}]
+        if direct:
+            return direct
+        codes = {f.entity_code for f in facts if f.entity == industry and f.entity_code and f.entity_code.endswith('.TI')}
+        if len(codes) != 1:
+            return []
+        from backend.app.data_provider.industry_evidence import latest_report_period, report_label
+        current, previous = latest_report_period(datetime.now(timezone.utc))
+        return await self._request('/v1/query2data', {'query':
+            f'{industry_query_name(industry)}行业成分股 {report_label(current)}营业收入 {report_label(previous)}营业收入 所属同花顺行业',
+            'page': '1', 'limit': '100', 'is_cache': '1', 'expand_index': 'true'},
+            entity_hint=f'{industry}|{next(iter(codes))}|{current}|{previous}',
+            skill_id='hithink-finance-query', skill_version='1.0.0', history_metric='industry_revenue_aggregate')
+
+    async def get_industry_policy(self, industry: str) -> list[FactRecord]:
+        return await self._comprehensive_search(f'{industry} 行业政策 官方发布', channel='news', entity_hint=industry)
+
+    async def get_macro_policy(self, target: str) -> list[FactRecord]:
+        return await self._comprehensive_search('中国 近期货币政策 财政政策 官方发布', channel='news', entity_hint=target)
+
+    async def get_market_breadth(self, target: str) -> list[FactRecord]:
+        facts = await self.query('同花顺全A(沪深京)指数 最新上涨家数、成份股总数、统计日期，两项统计范围及日期一致', entity_hint=target)
+        # Only the explicitly queried all-A index can represent this China scope.
+        return [f.model_copy(update={'entity': target}) if f.entity_code == '883957.TI' else f for f in facts]
+
+    async def get_industry_flow(self, industry: str) -> list[FactRecord]:
+        from backend.app.data_provider.industry_evidence import industry_query_name
+        facts = await self.query(f'{industry_query_name(industry)}行业 主力净买入额 成交额 市盈率 市净率',
+                                 entity_hint=industry, skill_id='hithink-industry-query')
+        facts = [f.model_copy(update={'entity': industry}) if f.entity == industry_query_name(industry)
+                 and str(f.entity_code or '').endswith('.TI') else f for f in facts]
+        return [f for f in facts if f.entity == industry and f.entity_code and f.entity_code.upper().endswith('.TI')
+                and f.field in {'capital_flow', 'turnover_value', 'capital_flow_ratio', 'pe_ttm', 'pb'}]
+
+    async def get_industry_turnover_history(self, industry: str, start: str, end: str) -> list[FactRecord]:
+        if self.public_recovery is not None:
+            calendar = await self.get_market_calendar(start, end)
+            days = sorted({f.period for f in calendar if f.field == 'market_session' and f.value == 1})
+            declarations = {int(f.value) for f in calendar if f.field == 'market_session_count'
+                            and f.period == f'{start}/{end}'}
+            if declarations != {len(days)} or not 200 <= len(days) <= 270:
+                return []
+            # A range query returns one interval turnover, not daily observations.
+            # Use bounded batches of actual exchange sessions, retaining column dates.
+            stopped = asyncio.Event()
+            lanes = asyncio.Semaphore(8)
+            async def fetch(batch):
+                from backend.app.data_provider.industry_evidence import industry_query_name
+                query = f'{industry_query_name(industry)}行业 ' + ' '.join(
+                    f'{day[:4]}年{int(day[5:7])}月{int(day[8:])}日换手率' for day in batch)
+                async with lanes:
+                    if stopped.is_set():
+                        return []
+                    try:
+                        return await self._request('/v1/query2data',
+                            {'query': query, 'page': '1', 'limit': '1', 'is_cache': '1', 'expand_index': 'true'},
+                            entity_hint=industry, skill_id='hithink-industry-query', skill_version='1.0.0', history_metric='industry_series')
+                    except ProviderCallError as error:
+                        if error.code in {'AUTHENTICATION_REJECTED', 'CAPABILITY_FORBIDDEN', 'PROVIDER_QUOTA_EXHAUSTED'}:
+                            stopped.set()
+                        raise
+            # The gateway resolves ten explicit daily indicators reliably;
+            # longer compounds can silently return just an interval or no data.
+            groups = [days[i:i+10] for i in range(0, len(days), 10)]
+            results = await asyncio.gather(*(fetch(group) for group in groups), return_exceptions=True)
+            successful = [f for result in results if not isinstance(result, BaseException) for f in result
+                          if f.field == 'industry_turnover_history' and f.period in days]
+            missing = sorted(set(days) - {f.period for f in successful})
+            # Repair at most three missing observations once; never replace them
+            # with an interval average or a prior day's turnover.
+            if successful and 0 < len(missing) <= 3 and not stopped.is_set():
+                try:
+                    repaired = await fetch(missing)
+                    successful.extend(f for f in repaired if f.field == 'industry_turnover_history' and f.period in missing)
+                except ProviderCallError:
+                    pass  # Preserve successful dates; coverage verification remains partial.
+            if not successful:
+                error = next((r for r in results if isinstance(r, Exception)), None)
+                if error:
+                    raise error
+            return [*calendar, *successful]
+        return await self._recovery_series(industry, start, end, kind='industry_series',
+            query=f'{industry}同花顺行业板块 {start}至{end} 每个交易日换手率，逐日列出交易日期及单位')
+
     async def get_financial_metrics(self, symbol: str) -> list[FactRecord]:
         return await self.query(
             f"{symbol} 最新财报的市盈率、市净率、ROE、营业收入同比增长率",
@@ -563,14 +760,15 @@ class IwencaiSkillHubProvider:
         )
 
     async def get_industry_rank(self, window: str) -> list[FactRecord]:
-        # 行业节点需要景气度/资金流向/拥挤度等分项，原查询只要"涨跌和排名"，
-        # 返回字段无法满足 IndustryAgent，故补齐维度。
-        return await self.query(
-            f"{window} 行业涨跌、估值、资金流向和景气度排名，"
-            "以及行业营业收入同比增长率、主力资金净流入、成交额、行业换手率历史百分位，"
-            "以及景气度评分、估值评分、资金流向评分、拥挤度评分和政策评分",
+        # Query actual columns rather than requesting our internal score names.
+        facts = await self.query(
+            f"{window}行业板块 市盈率、主力资金净流入、成交额",
             entity_hint="行业排名",
+            skill_id="hithink-industry-query",
         )
+        # The profile uses Tonghuashun industries. Shenwan (.SL) indexes may
+        # share their display names but have different constituents/valuations.
+        return [f for f in facts if not f.entity_code or f.entity_code.upper().endswith('.TI')]
 
     async def get_convertible_bond(self, target: str) -> list[FactRecord]:
         return await self.query(
@@ -579,18 +777,24 @@ class IwencaiSkillHubProvider:
         )
 
     async def get_basic_info(self, target: str) -> list[FactRecord]:
-        return await self.query(f"{target} 基本资料、所属行业、上市日期和主营业务", entity_hint=target)
+        return await self.query(
+            f"{target} 所属同花顺三级行业、上市日期和主营业务",
+            entity_hint=target,
+            skill_id="hithink-basicinfo-query",
+        )
 
     async def get_company_operations(self, target: str) -> list[FactRecord]:
         return await self.query(
             f"{target} 主营构成、主要客户、主要供应商、参控股公司和重大合同",
             entity_hint=target,
+            skill_id="hithink-business-query",
         )
 
     async def get_shareholder_equity(self, target: str) -> list[FactRecord]:
         return await self.query(
             f"{target} 控股股东、实际控制人、总股本、流通股本、股东人数和机构持股",
             entity_hint=target,
+            skill_id="hithink-management-query",
         )
 
     async def get_event_data(self, target: str) -> list[FactRecord]:
@@ -602,16 +806,18 @@ class IwencaiSkillHubProvider:
         # 同时索取原始指标与评分维度：research 的派生规则会用 CPI/PPI/PMI 等原始值
         # 算出 growth_score 等分项，只取评分名会失去派生来源。
         facts = await self.query(
+            query if query == "中国最新M2同比增长率" else
             f"{query} 宏观数据 CPI同比、PPI同比、制造业PMI、利率、汇率、社会融资、M2同比增长率、市场上涨家数占比、"
             "经济增长评分、通胀评分、流动性评分、政策评分和风险偏好评分",
             entity_hint="宏观数据",
             skill_id="hithink-macro-query",
+            limit=3 if query == "中国最新M2同比增长率" else 30,
         )
         # Indicator names identify columns, not separate economic regions.
         # Only this server-controlled China query and exact known indicator
         # names share a scope. User snapshots, custom/multi-country queries and
         # differently named regional series retain their original entities.
-        if query == "中国最新宏观经济":
+        if query in {"中国最新宏观经济", "中国最新M2同比增长率"}:
             indicators = {
                 "制造业PMI": "pmi", "CPI:当月同比": "cpi", "PPI:当月同比": "ppi",
                 "CPI同比": "cpi", "PPI同比": "ppi",
@@ -621,11 +827,23 @@ class IwencaiSkillHubProvider:
                 "市场上涨家数占比": "market_advancing_ratio",
             }
             return [fact.model_copy(update={"entity": "中国宏观经济"})
-                    if indicators.get(fact.entity) == fact.field else fact for fact in facts]
+                    if indicators.get(fact.entity.removeprefix("中国:")) == fact.field else fact for fact in facts]
         return facts
 
     async def get_institutional_research(self, target: str) -> list[FactRecord]:
-        return await self.query(f"{target} 最新机构研究、评级、目标价和盈利预测", entity_hint=target)
+        facts = await self.query(
+            f"{target} 研报目标价",
+            entity_hint=target,
+            skill_id="hithink-insresearch-query",
+        )
+        # Publication dates cannot date live prices embedded in report rows.
+        return [f for f in facts if f.field not in {'close_price', 'change'}]
+
+    async def get_target_prices(self, target: str) -> list[FactRecord]:
+        facts = await self.query(f'{target} 研报目标价',
+                                 entity_hint=target, skill_id='hithink-insresearch-query', limit=10)
+        # Irrelevant prices/profit forecasts cannot inflate a target-price repair.
+        return [f for f in facts if f.field == 'target_price']
 
     async def get_research_reports(self, target: str) -> list[FactRecord]:
         return await self._comprehensive_search(
@@ -641,6 +859,35 @@ class IwencaiSkillHubProvider:
             entity_hint=target,
         )
 
+    async def get_governance_disclosures(self, target: str) -> list[FactRecord]:
+        return await self._comprehensive_search(
+            f"{target} 年度报告 审计意见 信息披露 监管",
+            channel="announcement",
+            entity_hint=target,
+        )
+
+    async def get_stock_disclosure_details(self, target: str) -> list[FactRecord]:
+        # Distinct searches improve coverage without turning absence into a
+        # claim of clean governance. All results still require exact citations.
+        groups = await asyncio.gather(*(self._comprehensive_search(
+            f'{target} {topic}', channel='announcement', entity_hint=target)
+            for topic in ('最新年度报告 审计意见', '报告期内处罚与整改情况 监管措施',
+                          '定期报告信息披露 及时披露 延期披露', '近期业绩预告 利润分配 回购 限售解禁')))
+        return [fact for group in groups for fact in group]
+
+    async def get_structured_events(self, target: str) -> list[FactRecord]:
+        # A compound query can return an empty table for otherwise available events.
+        groups = await asyncio.gather(*(self.query(f'{target} {topic}', entity_hint=target,
+            skill_id='hithink-event-query', limit=10) for topic in
+            ('最新业绩预告 公告日期', '近期限售解禁 解禁日期')))
+        facts = [f for group in groups for f in group]
+        if any(f.field in {'announcement', 'announcement_summary', 'event'} and f.source_url and f.period for f in facts):
+            return facts
+        documents = await self._comprehensive_search(f'{target} 最新业绩预告 半年度报告 权益分派',
+                                                    channel='announcement', entity_hint=target)
+        # Embedded live quotes are not dated by an event announcement date.
+        return [f for f in facts if f.field not in {'close_price','change'}] + documents
+
     async def screen_stocks(self, query: str) -> list[FactRecord]:
         return await self.query(
             f"A股筛选：{query}",
@@ -652,12 +899,13 @@ class IwencaiSkillHubProvider:
         return await self.query(
             f"板块筛选：{query}",
             entity_hint="板块筛选",
-            skill_id="hithink-astock-selector",
+            skill_id="hithink-sector-selector",
         )
 
     def _normalize(self, payload: Any, *, entity_hint: str, channel: str | None = None) -> list[FactRecord]:
         records = list(_find_record_lists(payload))
         snapshot_time = datetime.now(timezone.utc)
+        columns = _root_column_metadata(payload)
         # 宽表（宏观、行业等）把多个指标放在同一列名下，靠"指标名称"区分。若不先
         # 展开，CPI/PPI/PMI 等会全部落到同一个字段名上，派生评分与专业节点就再也
         # 找不到所需字段。
@@ -665,6 +913,8 @@ class IwencaiSkillHubProvider:
         facts: list[FactRecord] = []
         requested_codes = set(re.findall(r"(?<!\d)\d{6}(?!\d)", entity_hint)) if channel is None else set()
         for record in expanded[:100]:
+            if channel in {'announcement', 'report', 'news'}:
+                record = _search_entity_record(record, entity_hint)
             returned_code = _entity_code_from_record(record)
             # 上游会把已摘牌/不存在的代码模糊匹配成另一只证券，不能沿用为目标行情。
             if requested_codes and returned_code:
@@ -680,6 +930,8 @@ class IwencaiSkillHubProvider:
             period = record_scope or _period_from_record(record)
             source_url = _source_url(record)
             for raw_field, value in record.items():
+                if raw_field in {"币种", "currency", "目标价币种", "价格币种"}:
+                    continue
                 if raw_field in SKIPPED_RECORD_FIELDS:
                     continue
                 if isinstance(value, (dict, list)) or value is None:
@@ -699,8 +951,12 @@ class IwencaiSkillHubProvider:
                         entity=entity,
                         field=field,
                         value=value,
-                        unit=_percentage_unit(field, str(raw_field), record),
-                        period=period if record_scope else (_field_period(str(raw_field)) or period),
+                        unit=_percentage_unit(field, str(raw_field), record,
+                                              column_unit=columns.get(str(raw_field), {}).get("unit")),
+                        period=period if record_scope else (_field_period(str(raw_field)) or
+                            _column_period(columns.get(str(raw_field), {})) or period),
+                        observation_date=_observation_date(record, field, _field_period(str(raw_field)) or
+                            _column_period(columns.get(str(raw_field), {}))),
                         entity_code=_entity_code_from_record(record),
                         source_field=(f"{record['指标名称']} ({raw_field})" if record.get("指标名称") else str(raw_field)),
                         snapshot_time=snapshot_time,
@@ -711,7 +967,8 @@ class IwencaiSkillHubProvider:
                 )
         if facts:
             return facts
-        if records:
+        if records or (isinstance(payload, dict) and isinstance(payload.get("datas"), list)):
+            # Empty gateway tables have QTime/token/status metadata, not an answer.
             return []
         # 即使供应商返回非表格答案，也保留为不可计算但可追溯的文本证据。
         summary = _first_scalar(payload)
@@ -730,17 +987,107 @@ class IwencaiSkillHubProvider:
         ]
 
 
-def _percentage_unit(field: str, source_field: str, record: Mapping[str, Any]) -> str | None:
-    if field in {"capital_flow", "turnover_value", "avg_turnover_20d"}:
-        declared = str(record.get("指标单位") or record.get("unit") or "").strip()
+def _quota_exhausted(response: httpx.Response) -> bool:
+    """Recognize vendor quota rejection without retaining its message or tokens."""
+    if response.status_code not in {200, 401, 403, 429}:
+        return False
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = response.text[:4096]
+    if isinstance(payload, str):
+        messages = [payload[:4096]]
+    elif isinstance(payload, dict):
+        if response.status_code == 200 and isinstance(payload.get("datas"), list) and payload["datas"]:
+            return False
+        messages = [payload.get(key) for key in ("message", "msg", "status_msg", "error_description")]
+    else:
+        return False
+    # Restrict to gateway message fields, never scan returned facts or queries.
+    phrases = ("今天的次数已用完", "今日查询额度已用完", "查询次数已用完",
+               "查询额度已用完", "额度不足", "查询次数超限", "今日次数已用尽")
+    return any(isinstance(message, str) and any(phrase in message for phrase in phrases)
+               for message in messages)
+
+
+def _root_column_metadata(payload: Any) -> dict[str, dict]:
+    """Use units/dates from this table only; nested tables keep independent scopes."""
+    columns = payload.get("columns") if isinstance(payload, dict) else None
+    if not isinstance(columns, list):
+        return {}
+    metadata = {}
+    for column in columns:
+        if not isinstance(column, dict):
+            continue
+        key = column.get("key")
+        if isinstance(key, str):
+            if key in metadata and metadata[key] != column:
+                metadata[key] = {}  # conflicting declarations are not evidence
+            else:
+                metadata[key] = column
+    return metadata
+
+
+def _column_period(column: Mapping[str, Any]) -> str | None:
+    parsed = _history_date(column.get("timestamp"))
+    return parsed.isoformat() if parsed else None
+
+
+def _observation_date(record: Mapping[str, Any], field: str, column_date: str | None) -> date | None:
+    if field == "target_price":
+        # 盈利预测的财报期不能冒充机构目标价的发布日期。
+        for key in ("研报发布日期", "发布日期", "publish_date", "发布时间"):
+            parsed = _history_date(record.get(key))
+            if parsed:
+                return parsed
+    # Range facts retain both endpoints in period; observation is the final day.
+    if column_date and re.fullmatch(r"\d{4}-\d{2}-\d{2}/\d{4}-\d{2}-\d{2}", column_date):
+        column_date = column_date.split("/")[1]
+    parsed = _history_date(column_date)
+    if parsed:
+        return parsed
+    for key in ("交易日期", "统计日期", "净值日期", "最新净值日期", "日期", "时间",
+                "研报发布日期", "发布日期", "publish_date", "发布时间", "公告日期"):
+        parsed = _history_date(record.get(key))
+        if parsed:
+            return parsed
+    return _history_date(record.get("报告期"))
+
+
+def _percentage_unit(field: str, source_field: str, record: Mapping[str, Any], *,
+                     column_unit: str | None = None) -> str | None:
+    declared = str(record.get("指标单位") or record.get("单位") or record.get("unit") or "").strip()
+    metadata_unit = str(column_unit or "").strip()
+    units = {"%": "percent", "％": "percent", "元": "CNY", "人民币": "CNY", "RMB": "CNY",
+             "港元": "HKD", "港币": "HKD", "美元": "USD", "百分比": "percent", "小数比例": "ratio"}
+    if declared and metadata_unit and units.get(declared, declared) != units.get(metadata_unit, metadata_unit):
+        return "conflicting"
+    declared = metadata_unit or declared
+    if field in {"close_price", "target_price", "conversion_price", "fund_nav"}:
+        currencies = {"元": "CNY", "人民币": "CNY", "CNY": "CNY", "RMB": "CNY",
+                      "港元": "HKD", "港币": "HKD", "HKD": "HKD", "美元": "USD", "USD": "USD"}
+        specific = str((record.get("目标价币种") if field == "target_price" else record.get("价格币种")) or "").strip()
+        specific = specific or str(record.get("币种") or record.get("currency") or "").strip()
+        currency = currencies.get(specific.upper())
+        declared_currency = currencies.get(declared.upper())
+        if currency and declared_currency and currency != declared_currency:
+            return "conflicting"
+        if currency or declared_currency:
+            return currency or declared_currency
+        match = re.search(r"[\[(（](人民币|港元|港币|美元|CNY|HKD|USD|元)[\])）]", source_field)
+        return currencies.get(match[1]) if match else None
+    if field in {"capital_flow", "turnover_value", "avg_turnover_20d", "interval_avg_turnover"}:
         if declared in {"CNY", "元", "万元", "亿元"}:
             return "CNY" if declared == "元" else declared
         match = re.search(r"[\[(（](亿元|万元|元)[\])）]", source_field)
         return {"元": "CNY"}.get(match[1], match[1]) if match else None
     if field not in PERCENT_FIELDS:
         return None
-    declared = str(record.get("指标单位") or record.get("unit") or "").strip().casefold()
+    declared = declared.casefold()
     source_field = source_field + " " + str(record.get("指标名称") or "")
+    if ("%" in source_field or "％" in source_field) and declared and declared not in {
+            "%", "％", "percent", "百分比"}:
+        return "conflicting"
     if declared in {"ratio", "小数比例"}:
         return "ratio"
     if declared in {"%", "％", "percent", "百分比"} or "%" in source_field or "％" in source_field:
@@ -759,6 +1106,7 @@ class CompositeProvider:
 
     def __init__(self, providers: Iterable[Any]) -> None:
         self.providers = list(providers)
+        self.public_recovery = any(getattr(provider, 'public_recovery', None) for provider in self.providers)
 
     async def _merge(self, method: str, *args: Any) -> list[FactRecord]:
         results = await asyncio.gather(
@@ -781,6 +1129,48 @@ class CompositeProvider:
 
     async def get_stock_risk_metrics(self, symbol: str) -> list[FactRecord]:
         return await self._merge("get_stock_risk_metrics", symbol)
+
+    async def get_stock_daily_history(self, symbol: str, start: str, end: str) -> list[FactRecord]:
+        return await self._merge('get_stock_daily_history', symbol, start, end)
+
+    async def get_market_calendar(self, start: str, end: str) -> list[FactRecord]:
+        return await self._merge('get_market_calendar', start, end)
+
+    async def get_exchange_calendar(self, start: str, end: str) -> list[FactRecord]:
+        return await self._merge('get_exchange_calendar', start, end)
+
+    async def get_adjusted_stock_history(self, code: str, start: str, end: str) -> list[FactRecord]:
+        return await self._merge('get_adjusted_stock_history', code, start, end)
+
+    async def get_stock_risk_state(self, code: str) -> list[FactRecord]:
+        return await self._merge('get_stock_risk_state', code)
+
+    async def get_stock_trading_status(self, symbol: str) -> list[FactRecord]:
+        return await self._merge('get_stock_trading_status', symbol)
+
+    async def get_industry_fundamentals(self, industry: str) -> list[FactRecord]:
+        return await self._merge('get_industry_fundamentals', industry)
+
+    async def get_industry_flow(self, industry: str) -> list[FactRecord]:
+        return await self._merge('get_industry_flow', industry)
+
+    async def get_industry_turnover_history(self, industry: str, start: str, end: str) -> list[FactRecord]:
+        return await self._merge('get_industry_turnover_history', industry, start, end)
+
+    async def get_stock_disclosure_details(self, target: str) -> list[FactRecord]:
+        return await self._merge('get_stock_disclosure_details', target)
+
+    async def get_structured_events(self, target: str) -> list[FactRecord]:
+        return await self._merge('get_structured_events', target)
+
+    async def get_industry_policy(self, industry: str) -> list[FactRecord]:
+        return await self._merge('get_industry_policy', industry)
+
+    async def get_macro_policy(self, target: str) -> list[FactRecord]:
+        return await self._merge('get_macro_policy', target)
+
+    async def get_market_breadth(self, target: str) -> list[FactRecord]:
+        return await self._merge('get_market_breadth', target)
 
     async def get_financial_metrics(self, symbol: str) -> list[FactRecord]:
         return await self._merge("get_financial_metrics", symbol)
@@ -820,6 +1210,9 @@ class CompositeProvider:
 
     async def get_announcements(self, target: str) -> list[FactRecord]:
         return await self._merge("get_announcements", target)
+
+    async def get_governance_disclosures(self, target: str) -> list[FactRecord]:
+        return await self._merge("get_governance_disclosures", target)
 
     async def screen_stocks(self, query: str) -> list[FactRecord]:
         return await self._merge("screen_stocks", query)
@@ -864,7 +1257,8 @@ def _expand_indicator_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]
         value_columns = [
             (key, value)
             for key, value in record.items()
-            if any(marker in str(key) for marker in INDICATOR_VALUE_MARKERS)
+            if (any(marker in str(key) for marker in INDICATOR_VALUE_MARKERS)
+                or (key not in INDICATOR_NAME_KEYS and _canonical_field(str(key)) == indicator))
             and not isinstance(value, (dict, list))
             and value not in (None, "")
         ]
@@ -886,7 +1280,7 @@ def _expand_indicator_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]
                 "指标名称": name,
                 indicator: value,
             }
-            for unit_key in ("指标单位", "unit"):
+            for unit_key in ("指标单位", "单位", "unit"):
                 if unit_key in record:
                     row[unit_key] = record[unit_key]
             suffix = _period_suffix(raw_key)
@@ -984,6 +1378,10 @@ def _history_facts(
 ) -> list[FactRecord]:
     """只接受明确标注日期的数值，不用抓取时间补齐缺失的交易日期。"""
 
+    if metric in {'stock_series', 'industry_series', 'calendar_series'}:
+        from backend.app.data_provider.recovery_series import parse_recovery_series
+        return parse_recovery_series(payload, target=entity_hint, source_id=source_id, kind=metric)
+
     records = list(_find_record_lists(payload))[:100]
     target_match = re.search(r"(?<!\d)(\d{6})(?!\d)", entity_hint)
     target_code = target_match.group(1) if target_match else None
@@ -1058,11 +1456,40 @@ def _source_url(record: dict[str, Any]) -> str | None:
         value = record.get(key)
         if not isinstance(value, str) or not value.strip() or len(value) > 2048:
             continue
+        from backend.app.services.disclosure_reader import canonical_disclosure_url
+        value = canonical_disclosure_url(value)
         try:
             return FactRecord.source_url_must_be_public_https(value)
         except ValueError:
             continue
     return None
+
+
+def _search_entity_record(record, fallback):
+    """Search relevance is not entity identity; use row security metadata first."""
+    record = dict(record)
+    infos = record.get('stock_infos')
+    securities = [item for item in infos if isinstance(item, dict)
+                  and re.fullmatch(r'\d{6}(?:\.(?:SH|SZ|BJ))?', str(item.get('code', '')))] if isinstance(infos, list) else []
+    title = str(record.get('title') or record.get('标题') or '')
+    title_codes = set(re.findall(r'(?<!\d)\d{6}(?!\d)', title))
+    selected = [item for item in securities if str(item['code']).split('.')[0] in title_codes]
+    if not selected and len(securities) == 1:
+        selected = securities
+    if len(selected) == 1:
+        record['证券代码'] = str(selected[0]['code'])
+        record['证券简称'] = selected[0].get('name') or str(selected[0]['code'])
+    elif len(title_codes) == 1:
+        record['证券代码'] = next(iter(title_codes))
+        record['证券简称'] = next(iter(title_codes))
+    elif '：' in title or ':' in title:
+        issuer = re.split('[：:]', title, maxsplit=1)[0].strip()
+        if 1 < len(issuer) <= 25:
+            record['证券简称'] = issuer
+    elif securities:
+        # Multi-company articles are not evidence for the queried security alone.
+        record['证券简称'] = '多证券资料'
+    return record
 
 
 def _record_scope(record: dict[str, Any]) -> str:
@@ -1122,6 +1549,13 @@ def _entity_code_from_record(record: dict[str, Any]) -> str | None:
 
 def _field_period(raw_field: str) -> str | None:
     """保留供应商逐列日期，财报期与行情日期不能互相代替。"""
+    interval = re.search(r"\[(\d{8})-(\d{8})\]$", raw_field)
+    if interval:
+        try:
+            start, end = (datetime.strptime(value, "%Y%m%d").date() for value in interval.groups())
+            return f"{start.isoformat()}/{end.isoformat()}" if start <= end else None
+        except ValueError:
+            return None
     match = re.search(r"\[(\d{8})\]$", raw_field)
     if match:
         try:
@@ -1132,7 +1566,8 @@ def _field_period(raw_field: str) -> str | None:
 
 
 def _period_from_record(record: dict[str, Any]) -> str | None:
-    for key in ("报告期", "日期", "时间", "交易日期", "净值日期", "最新净值日期"):
+    for key in ("报告期", "统计日期", "日期", "时间", "交易日期", "净值日期", "最新净值日期",
+                "研报发布日期", "发布日期", "发布时间", "公告日期", "publish_date"):
         value = record.get(key)
         if value not in (None, ""):
             return str(value)
@@ -1142,6 +1577,11 @@ def _period_from_record(record: dict[str, Any]) -> str | None:
 def _canonical_field(raw: str, *, channel: str | None = None) -> str:
     normalized = re.sub(r"\[[^]]*]", "", raw).strip()
     key = normalized.casefold().replace(" ", "")
+    if key == "停牌":
+        return "is_suspended"
+    # A date-range return must not conflict with the latest daily price change.
+    if key == "涨跌幅" and re.search(r"\[\d{8}-\d{8}\]$", raw):
+        return "interval_change"
     for marker, prefix in (("行业中值", "industry_median"), ("行业均值", "industry_mean"), ("行业平均", "industry_mean")):
         if marker in key:
             return f"{prefix}_{_canonical_field(key.replace(marker, ''))}"

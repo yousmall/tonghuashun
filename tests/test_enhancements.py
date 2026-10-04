@@ -323,17 +323,20 @@ async def test_iwencai_provider_exposes_selected_skillhub_capabilities() -> None
     assert {"announcement", "research_report"} <= returned_fields
     assert paths.count("/v1/comprehensive/search") == 3
     assert set(channels) == {"report", "announcement"}
-    assert ("report-search", "2.0.0") in skill_headers
+    assert ("report-search", "1.0.0") in skill_headers
     assert ("announcement-search", "1.0.0") in skill_headers
     assert ("hithink-macro-query", "1.0.0") in skill_headers
     assert ("hithink-astock-selector", "1.0.0") in skill_headers
+    for skill in ("hithink-basicinfo-query", "hithink-business-query",
+                  "hithink-management-query", "hithink-insresearch-query", "hithink-sector-selector"):
+        assert (skill, "1.0.0") in skill_headers
     combined = "\n".join(queries)
     for marker in (
-        "基本资料",
+        "所属同花顺三级行业",
         "主营构成",
         "控股股东",
         "宏观数据",
-        "机构研究",
+        "研报目标价",
         "券商研报",
         "上市公司公告",
         "A股筛选",

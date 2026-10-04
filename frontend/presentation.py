@@ -7,6 +7,7 @@ from html import escape
 from typing import Any
 import streamlit as st
 from frontend.answer_visibility import verification_notes, visible_risks, visible_next_steps, visible_risk_conclusion, visible_compliance_reason
+from frontend.investment_panel import render_investment_panel
 
 RISK_LEVELS = ["R1", "R2", "R3", "R4", "R5"]
 PROFILE_LABELS = {
@@ -175,6 +176,7 @@ def friendly_fact_rows(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "内容 / 数值": display_fact_value(fact) if not isinstance(fact.get("value"), dict) else value,
             "数据时间（北京时间）": fact_time(fact.get("snapshot_time")),
             "来源": fact_source(fact), "报告期": fact_period(fact.get("period")),
+            **({"实际资料日期": str(fact["observation_date"])} if fact.get("observation_date") else {}),
         })
     return rows
 
@@ -423,6 +425,7 @@ def _render_conclusion_content(advice: dict[str, Any], *, key: str = "analysis-c
         if compliance_note and compliance_note != conclusion:
             st.caption(compliance_note)
     render_points("需要注意", visible_risks(advice), visible=99)
+    render_investment_panel(advice, key=key)
     render_points("后续研究建议", visible_next_steps(advice))
     render_verification_records(advice, key=key)
     if advice.get("user_fit"):
@@ -493,7 +496,14 @@ def render_logic_chain(advice: dict[str, Any]) -> None:
             st.write(plain_language(result.get("opinion")) or "资料不足，暂未形成结论。")
             if linked:
                 st.markdown("**该观点引用的数据**")
-                st.dataframe(friendly_fact_rows(linked), width="stretch", hide_index=True)
+                traced = source_trace_rows({**advice, "evidence": [fact["fact_id"] for fact in linked],
+                                            "agent_results": [result]})
+                st.dataframe(traced, width="stretch", hide_index=True,
+                             column_config={"原文": st.column_config.LinkColumn(display_text="查看原文")})
+                derived = [fact for fact in linked if fact.get("derived_from")]
+                for fact in derived:
+                    if fact.get("derivation_rule"):
+                        st.caption("计算依据：" + str(fact["derivation_rule"]))
             else:
                 st.caption("这一分析维度没有通过核验的资料引用，因此只能作为有限参考。")
             render_points("判断把握受哪些因素影响", result.get("confidence_reasons", []), visible=99)
@@ -545,8 +555,14 @@ def render_source_trace(advice: dict[str, Any], *, collapsed: bool = True) -> No
     def body() -> None:
         if rows:
             st.caption("每条资料都标明它支持的分析维度、数据时间与来源；有原文地址时可直接打开。")
+            selected_rows = rows
+            if not collapsed:
+                topics = list(dict.fromkeys(topic for row in rows for topic in row["支持分析"].split("、")))
+                selected = st.multiselect("筛选分析维度", topics, key="source_trace_topics")
+                if selected:
+                    selected_rows = [row for row in rows if set(selected) & set(row["支持分析"].split("、"))]
             st.dataframe(
-                rows, width="stretch", hide_index=True,
+                selected_rows, width="stretch", hide_index=True,
                 column_config={"原文": st.column_config.LinkColumn("原文", display_text="查看原文")},
             )
         else:

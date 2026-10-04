@@ -51,12 +51,12 @@ async def assess_profile(request: ProfileAssessmentRequest, semantic: SemanticSe
                 profile=UserProfile(user_id=request.user_id, questionnaire_version=QUESTIONNAIRE_VERSION,
                                     risk_answers=request.risk_answers),
                 missing_fields=missing + (["answer_consistency"] if issues else []),
-                evidence=issues or ["请完成全部19道题后再提交。"],
+                evidence=issues or [f"请完成全部{len(QUESTIONS)}道题后再提交。"],
             )
         values = evaluate_answers(request.risk_answers)
-        # 新题目不收集精确收益率、回撤百分比和投资月数；不从定性选项猜测。
+        # 金额、收益与期限保留区间；仅第26题明确的回撤上限写入数值字段。
         profile = UserProfile(user_id=request.user_id, confirmed=False, **values)
-        return ProfileAssessment(profile=profile, evidence=[SCORING_NOTICE, "已按19题答案计算风险等级并记录投资品种和期限。"])
+        return ProfileAssessment(profile=profile, evidence=[SCORING_NOTICE, "已按前19题计算基础风险分，并按全部答案记录评级依据、财务约束和配置参考。"])
 
     # 旧 API 保留兼容；新界面只提交逐题答案。
     narrative_patch, evidence = await (semantic or SemanticService()).extract_profile(request.narrative or "")
@@ -113,7 +113,7 @@ def confirm_profile(profile: UserProfile) -> UserProfile:
             raise ValueError("问卷版本已更新，请重新测评。")
         # 客户端不能修改分数、等级、有效期或把未答完的草稿直接确认。
         values = evaluate_answers(profile.risk_answers)
-        values.update(horizon_months=None, max_drawdown=None, liquidity_need=None,
+        values.update(horizon_months=None,
                       investment_experience_years=None, expected_annual_return=None,
                       investment_history=[], holding_history=[], behavioral_notes=[])
         profile = profile.model_copy(update=values)

@@ -18,8 +18,8 @@ from backend.app.services.profile import assess_profile, confirm_profile
 from backend.app.session_pool import SessionThreadPool
 
 
-SCREEN_ANSWERS = dict(zip((q.id for q in QUESTIONS), "ACABDC CACCB BCCBC CDB".replace(" ", ""), strict=True))
-MAX_ANSWERS = dict(zip((q.id for q in QUESTIONS), "AEADDDD DADCD EDD BB AA".replace(" ", ""), strict=True))
+SCREEN_ANSWERS = dict(zip((q.id for q in QUESTIONS), "ACABDC CACCB BCCBC CDB CADAECDC".replace(" ", ""), strict=True))
+MAX_ANSWERS = dict(zip((q.id for q in QUESTIONS), "AEADDDD DADCD EDD BB AA AADAEDEA".replace(" ", ""), strict=True))
 
 
 @pytest.mark.parametrize("score,band", [(0,1),(19.9,1),(20,2),(36.9,2),(37,3),(53.9,3),(54,4),(82.9,4),(83,5),(100,5)])
@@ -64,7 +64,7 @@ async def test_new_questionnaire_does_not_call_llm_or_require_removed_fields():
     assert not draft.missing_fields
     assert not draft.profile.confirmed
     assert draft.profile.horizon_months is None
-    assert draft.profile.max_drawdown is None
+    assert draft.profile.max_drawdown == .20
     assert draft.profile.expected_annual_return is None
     assert draft.profile.investment_experience_years is None
     semantic.extract_profile.assert_not_called()
@@ -77,7 +77,7 @@ async def test_partial_and_inconsistent_answers_cannot_be_confirmed():
     draft = await assess_profile(ProfileAssessmentRequest(questionnaire_version=QUESTIONNAIRE_VERSION, risk_answers=partial))
     assert draft.missing_fields == ["q19"]
     assert draft.profile.risk_level is None
-    with pytest.raises(ValueError, match="19"):
+    with pytest.raises(ValueError, match="27"):
         confirm_profile(draft.profile)
     contradictory = dict(SCREEN_ANSWERS, q16="E")
     draft = await assess_profile(ProfileAssessmentRequest(questionnaire_version=QUESTIONNAIRE_VERSION, risk_answers=contradictory))
@@ -124,6 +124,10 @@ def test_api_reloads_answers_allows_same_day_reassessment_and_isolates_users(mon
         assert saved.json()["valid_until"] != "2099-01-01"
         restored = client.get("/api/v1/profile", headers=headers).json()["profile"]
         assert restored["risk_answers"] == SCREEN_ANSWERS and restored["confirmed"]
+        assert restored["max_drawdown"] == .20 and restored["liquidity_need"] == "低"
+        assert restored["financial_plan"]["goal_label"] == "长期财富积累"
+        assert restored["allocation_guidance"] == saved.json()["allocation_guidance"]
+        assert restored["assessment_reasons"] == saved.json()["assessment_reasons"]
         edited = dict(restored, risk_answers=dict(restored["risk_answers"], q15="A"))
         repeat = client.post("/api/v1/profile/confirm", headers=headers, json={"profile": edited})
         assert repeat.status_code == 200

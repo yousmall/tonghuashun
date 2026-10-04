@@ -230,11 +230,14 @@ class FundAgent(BaseAgent):
                     rejected.append(entity)
                     continue
                 holding = values.get("minimum_holding_months", values.get("product_horizon_months"))
-                if request.profile.horizon_max_months is not None:
+                horizon_max = request.profile.effective_horizon_max_months
+                if horizon_max is None:
+                    horizon_max = request.profile.horizon_max_months
+                if horizon_max is not None:
                     if not isinstance(holding, (int, float)) or holding < 0:
                         suitability_missing.append(f"{entity}缺少可核验的投资期限")
                         continue
-                    if holding > request.profile.horizon_max_months:
+                    if holding > horizon_max:
                         rejected.append(entity)
                         continue
             quality = [value for _, value in numeric_fact_values(facts) if value is not None]
@@ -285,7 +288,7 @@ class PortfolioAgent(BaseAgent):
         largest_fact, largest_weight = max(fact_weights, key=lambda item: item[1])
         concentration_excess = largest_weight > request.profile.single_security_limit
         fact_ids, citations = evidence_metadata(fact for fact, _ in fact_weights)
-        risk_flags = []
+        risk_flags = list(request.profile.financial_warnings)
         if concentration_excess:
             risk_flags.append("单标的集中度超限")
         if total_weight > 1.05:
@@ -294,6 +297,7 @@ class PortfolioAgent(BaseAgent):
             request.profile.liquidity_need == "高"
             or (request.profile.max_drawdown is not None and request.profile.max_drawdown <= 0.08)
             or (request.profile.horizon_max_months is not None and request.profile.horizon_max_months <= 12)
+            or (request.profile.effective_horizon_max_months is not None and request.profile.effective_horizon_max_months <= 12)
         ) else "按已确认风险等级设定资产区间"
         return AgentResult(
             agent_id=self.agent_id,

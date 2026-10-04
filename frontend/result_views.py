@@ -6,6 +6,7 @@ import streamlit as st
 from frontend.answer_report import answer_images, build_answer_pdf, chart_groups, cited_facts
 from frontend.presentation import (plain_language, render_conclusion_panel, render_logic_chain, render_source_trace, source_trace_rows, TOPIC_LABELS)
 from frontend.presentation import render_verification_records
+from frontend.investment_panel import render_investment_panel, investment_summary
 from frontend.answer_visibility import coverage_notices, verification_notes, visible_risks, visible_next_steps, visible_risk_conclusion, visible_compliance_reason
 
 
@@ -76,8 +77,10 @@ def render_advice(advice: dict[str, Any], *, export_key: str = "answer", questio
             st.markdown("**风险与待核实事项**")
             for value in risks:
                 st.write("- " + value)
+        render_investment_panel(advice, key=export_key, compact=True)
         with st.expander("展开这条回答的图表与完整分析", key=f"answer_details_{export_key}", on_change="rerun") as details:
             if details.open:
+                render_investment_panel(advice, key=export_key)
                 render_answer_charts(advice, key=export_key)
                 render_logic_chain(advice)
                 render_source_trace(advice)
@@ -116,6 +119,7 @@ def answer_export_payload(advice: dict[str, Any], images: list, question: str = 
         ("后续研究建议", visible_next_steps(advice)),
         ("与您的投资偏好是否匹配", [advice.get("user_fit")]),
     ]
+    sections.extend(investment_summary(advice))
     for result in advice.get("agent_results", []):
         sections.append((TOPIC_LABELS.get(result.get("agent_id"), "相关分析"),
                          [result.get("opinion"), *result.get("confidence_reasons", []), *result.get("risk_flags", []), *result.get("invalidation_conditions", [])]))

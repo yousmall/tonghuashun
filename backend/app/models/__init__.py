@@ -1,5 +1,7 @@
 from .schemas import (
     AdvicePackage,
+    ReturnExpectation,
+    ReturnScenario,
     StockRecommendationCandidate,
     StockRecommendationResult,
     AgentResult,
@@ -42,6 +44,8 @@ from .auth_schemas import (
 
 __all__ = [
     "AdvicePackage",
+    "ReturnExpectation",
+    "ReturnScenario",
     "StockRecommendationCandidate",
     "StockRecommendationResult",
     "AgentResult",

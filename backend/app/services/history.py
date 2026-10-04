@@ -15,7 +15,7 @@ from backend.app.models import FactRecord
 # 消息行只保留预览；完整引用和派生血缘由 database 的独立证据表保存。
 MAX_STORED_EVIDENCE = 60
 
-_FACT_KEYS = ("fact_id", "entity", "entity_code", "field", "value", "unit", "normalized_value", "snapshot_time", "source_id", "source_url", "source_field", "quality", "period", "derived_from", "produced_by", "derivation_rule")
+_FACT_KEYS = ("fact_id", "entity", "entity_code", "field", "value", "unit", "normalized_value", "snapshot_time", "source_id", "source_url", "source_field", "quality", "period", "observation_date", "derived_from", "produced_by", "derivation_rule")
 
 
 def summarise_advice(advice: dict[str, Any], used_fact_ids: set[str] | None = None) -> dict[str, Any]:
@@ -41,6 +41,7 @@ def summarise_advice(advice: dict[str, Any], used_fact_ids: set[str] | None = No
         "snapshot_time": advice.get("snapshot_time"),
         "conclusion": advice.get("conclusion"),
         "risk_conclusion": advice.get("risk_conclusion"),
+        "return_expectation": advice.get("return_expectation"),
         "risks": list(advice.get("risks") or []),
         "next_steps": list(advice.get("next_steps") or []),
         "evidence": list(advice.get("evidence") or []),
@@ -113,12 +114,15 @@ def _compact_acquisition(acquisition: Any) -> dict[str, Any] | None:
             "empty_capabilities",
             "failed_capabilities",
             "capability_errors", "recovery_errors",
+            "capability_evidence", "recovery_evidence", "recovery_deferred_capabilities", "recovery_gap_metrics",
             "fetched_fact_count",
             "missing_fields_by_agent",
             "capability_timings_ms",
             "cached_capabilities",
-            "recovery_rounds", "recovery_capabilities", "recovery_successful_capabilities",
+            "recovery_rounds", "recovery_phases", "recovery_attempts", "recovery_agent_requirements",
+            "recovery_capabilities", "recovery_successful_capabilities",
             "recovery_empty_capabilities", "recovery_failed_capabilities", "recovery_reanalyzed",
+            "assessment_status", "assessment_targets", "recovery_phase", "recovery_capabilities",
         )
         if acquisition.get(key) is not None
     }

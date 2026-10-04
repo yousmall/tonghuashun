@@ -701,7 +701,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible,
     border: 1px solid #d9dfe4 !important; border-radius: 14px; overflow: hidden;
     padding: 24px 30px !important;
 }
-.st-key-risk-assessment-box, .st-key-risk-assessment-box p, .st-key-risk-assessment-box span,
+.st-key-risk-assessment-box, .st-key-risk-assessment-box p, .st-key-risk-assessment-box span:not([data-testid="stIconMaterial"]),
 .st-key-risk-assessment-box dt, .st-key-risk-assessment-box dd {
     font-family:"Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif !important;
 }

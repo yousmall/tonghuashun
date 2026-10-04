@@ -11,11 +11,14 @@ from datetime import datetime, timedelta
 from backend.app.models import FactRecord
 
 FAST_MARKET_FIELDS = frozenset(
-    {"close_price", "change", "change_amount", "volume", "turnover_rate", "volatility",
+    {"capital_flow_ratio", "interval_change", "interval_avg_turnover", "name_contains_st", "close_price", "change", "change_amount", "volume", "turnover_rate", "volatility",
      "capital_flow", "turnover_value", "market_advancing_ratio", "industry_turnover_percentile",
-     "max_drawdown_1y", "avg_turnover_20d", "trading_status", "is_st"}
+     "max_drawdown_1y", "avg_turnover_20d", "trading_status", "is_st", "is_suspended", "listing_status",
+     "adjusted_close_history", "daily_turnover_history", "industry_turnover_history",
+     "market_session", "market_session_count", "risk_warning_inventory",
+     "advancing_count", "market_total_count"}
 )
-NEWS_FIELDS = frozenset({"news", "announcement", "research_report", "news_summary",
+NEWS_FIELDS = frozenset({"announcement_excerpt", "news", "announcement", "research_report", "news_summary",
                          "announcement_summary", "research_report_summary"})
 # 天然"多条并列"的字段：同一实体在同一时点可以合法存在多条不同记录（两条新闻、
 # 多起事件、多家券商的评级与目标价）。它们之间不存在"同一项记录自相矛盾"，因此
@@ -24,6 +27,9 @@ NEWS_FIELDS = frozenset({"news", "announcement", "research_report", "news_summar
 MULTI_VALUE_FIELDS = frozenset(
     {
         *NEWS_FIELDS,
+        'exchange_calendar_notice',
+        'risk_warning_inventory',
+        'audit_opinion_evidence', 'regulatory_status_evidence', 'disclosure_status_evidence',
         "event",
         # 机构调研按"每家机构一行"返回，评级/目标价/盈利预测/机构名称都是行内取值。
         "rating",
@@ -70,6 +76,20 @@ PORTFOLIO_FIELDS = frozenset({"weight", "portfolio_weight", "sector_weight", "fu
 
 # 面向用户的中文指标名：任何展示给用户的文案都必须经它转换，不能回显内部字段编码。
 FIELD_LABELS: dict[str, str] = {
+    'industry_constituent_inventory': '行业成分股完整名单',
+    'constituent_revenue': '行业成分股营业收入',
+    'exchange_calendar_notice': '交易所年度休市公告',
+    'risk_warning_inventory': '沪深风险警示分类完整名单',
+    'price_adjustment_contract': '公开历史行情复权口径',
+    'constituent_revenue': '行业成分股营业收入', 'industry_constituent_inventory': '行业成分股完整名单',
+    'audit_opinion_evidence': '审计意见原文证据', 'regulatory_status_evidence': '报告期监管状态原文证据',
+    'disclosure_status_evidence': '报告期披露状态原文证据',
+    "announcement_excerpt": "公告原文节选", "market_session": "交易日历", "market_session_count": "区间交易日总数",
+    "adjusted_close_history": "前复权历史收盘价", "daily_turnover_history": "逐日成交额",
+    "industry_turnover_history": "行业历史换手率", "listing_status": "上市状态", "is_suspended": "停牌状态",
+    "advancing_count": "上涨股票家数", "market_total_count": "A股股票总家数",
+    "capital_flow_ratio": "主力净买入额占成交额比例", "interval_change": "区间涨跌幅",
+    "interval_avg_turnover": "区间平均成交额", "name_contains_st": "简称含ST标记",
     "max_drawdown_1y": "近一年最大回撤", "avg_turnover_20d": "近20日平均成交额",
     "trading_status": "交易状态", "is_st": "风险警示状态",
     "m2_growth": "广义货币同比增长率", "market_advancing_ratio": "市场上涨家数占比",

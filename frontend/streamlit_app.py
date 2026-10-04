@@ -32,6 +32,7 @@ from urllib.parse import quote, urlparse
 import httpx
 import streamlit as st
 from frontend.risk_assessment import render_risk_assessment
+from frontend.trade_profile import render_trade_profile
 from backend.app.risk_questionnaire import assessment_is_current
 from frontend.result_views import render_advice, cached_answer_images, answer_export_payload, show_status
 from frontend.api_client import backend_http_client, request_json, overview_fetch, snapshot_fetch_factory
@@ -557,7 +558,7 @@ def api_request(
         return result.data
     if quiet:
         return None
-    if result.status == 409 and path == "/profile/confirm":
+    if result.status == 409 and path in {"/profile/confirm", "/profile/trades/confirm"}:
         st.session_state.profile_restored = False
     message = format_api_error(result.detail)
     st.error(message)
@@ -1020,10 +1021,11 @@ def render_materials_body(api_base: str) -> None:
 
 
 def page_profile(api_base: str) -> None:
-    """风险评估统一使用十九题问卷。"""
+    """保留风险问卷，支持从股票交易记录补充行为画像。"""
     render_page_header("风险评估")
     st.title("风险评估")
     render_risk_assessment(api_base, api_request=api_request)
+    render_trade_profile(api_base, api_request=api_request)
 
 
 def available_analyses() -> list[tuple[str, dict[str, Any]]]:
@@ -1503,7 +1505,7 @@ def reset_user_session() -> None:
     ):
         st.session_state.pop(key, None)
     for key in list(st.session_state):
-        if key.startswith(("risk_score_", "risk_answer_", "research_chat_", "board_target_", "board_refresh_", "board_poll_", "admin_")) or key == "profile_narrative":
+        if key.startswith(("trade_profile_", "risk_score_", "risk_answer_", "research_chat_", "board_target_", "board_refresh_", "board_poll_", "admin_")) or key == "profile_narrative":
             st.session_state.pop(key, None)
     st.session_state.conversation_id = str(uuid.uuid4())
     # 账号标识只来自服务端令牌，浏览器状态里不保存用户 id。

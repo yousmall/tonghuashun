@@ -28,6 +28,7 @@ from backend.app.services.research_cache import ResearchFactCache
 from backend.app.services.provider_errors import failure_summary
 from backend.app.services.scoring_dimensions import additional_dimensions
 from backend.app.services.derived_score_cache import DerivedScoreCache
+from backend.app.services.research_requirements import evidence_status
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,11 @@ class DataCall:
     # 研究对象生成，与发给数据源的查询文本无关，因此换一种问法仍能识别出"这份
     # 资料已经取过"。
     key: str
+    # 服务端规划元数据；不接受模型提供的方法、预算或任意 URL。
+    priority: int = 50
+    bundle: str | None = None
+    required_fields: tuple[str, ...] = ()
+    expected_entity: str | None = None
 
 
 # 只带查询摘要、没有任何业务字段的调用不算"已经取到资料"：这类返回不是结果，
@@ -90,6 +96,7 @@ class AutomatedResearchPipeline:
         now: Callable[[], datetime] | None = None,
         max_portfolio_entities: int = 4,
         call_timeout_seconds: float | None = None,
+        recovery_timeout_seconds: float | None = None,
         cache: ResearchFactCache | None = None,
     ) -> None:
         self.provider = provider
@@ -101,6 +108,10 @@ class AutomatedResearchPipeline:
                                           else os.getenv("WENCE_DATA_CALL_TIMEOUT_SECONDS", "30"))
         if not 0 < self.call_timeout_seconds <= 60:
             raise ValueError("数据能力总超时须大于 0 且不超过 60 秒")
+        self.recovery_timeout_seconds = float(recovery_timeout_seconds if recovery_timeout_seconds is not None
+                                               else os.getenv("WENCE_RECOVERY_TIMEOUT_SECONDS", "45"))
+        if not 0 < self.recovery_timeout_seconds <= 120:
+            raise ValueError("补取总超时须大于 0 且不超过 120 秒")
 
     def _derive(self, facts):
         return self.score_cache.derive(facts, self.now(), derive_scoring_facts)
@@ -188,15 +199,21 @@ class AutomatedResearchPipeline:
         empty: list[str] = []
         failed: list[str] = []
         errors = {}
+        fulfillment = {}
         for call, result in zip(pending, results, strict=True):
             if isinstance(result, BaseException):
                 failed.append(call.label)
                 errors[call.label] = failure_summary(result)
+                fulfillment[call.label] = {"status": "failed", "reason_codes": [errors[call.label]["code"]]}
             elif result:
                 successful.append(call.label)
                 fetched.extend(result)
             else:
                 empty.append(call.label)
+            if not isinstance(result, BaseException):
+                fulfillment[call.label] = evidence_status(call, result, self.now())
+        for call in reusable:
+            fulfillment[call.label] = evidence_status(call, [f for f in base_facts if f.produced_by == call.key], self.now())
 
         source_facts = _merge_by_fact_id([*base_facts, *fetched])
         derived = self._derive(source_facts)
@@ -229,6 +246,7 @@ class AutomatedResearchPipeline:
             empty_capabilities=empty,
             failed_capabilities=failed,
             capability_errors=errors,
+            capability_evidence=fulfillment,
             supplied_fact_count=len(supplied),
             fetched_fact_count=len(_merge_by_fact_id(fetched)),
             derived_fact_count=len(portfolio_facts) + len(derived),

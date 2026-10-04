@@ -1,4 +1,4 @@
-"""截图所示的 19 题问卷、平台评分和适当性分类。
+"""原19题风险评分，加8题财务规划补充问卷及适当性分类。
 
 题目来自用户提供的方正证券截图。官网只核实了分类阈值及匹配规则，
 未公开本版逐选项分值；下面的分值为本平台规则，不是方正官方评分。
@@ -10,8 +10,9 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
-QUESTIONNAIRE_VERSION = "fangzheng-19-platform-v1"
-SCORING_NOTICE = "题目依据所提供的方正证券界面；评分采用本平台规则，非方正证券官方测评。"
+LEGACY_QUESTIONNAIRE_VERSION = "fangzheng-19-platform-v1"
+QUESTIONNAIRE_VERSION = "platform-27-v2"
+SCORING_NOTICE = "前19题依据所提供的方正证券界面，后8题为本平台财务规划补充题；评分和配置约束采用本平台规则，非方正证券官方测评。"
 CLASSIFICATION_URL = "https://www.foundersc.com/invEduSuitMagMethodSolve/55722_3.jhtml"
 MATCHING_URL = "https://www.foundersc.com/fzhtml/sdxgl/6/E/D/26WH5HP.html"
 RISK_NAMES = ("保守型", "谨慎型", "稳健型", "积极型", "激进型")
@@ -29,7 +30,7 @@ class Question:
         return {chr(65 + i): f"{chr(65 + i)}. {text}" for i, text in enumerate(self.options)}
 
 
-QUESTIONS = (
+BASE_QUESTIONS = (
     Question("q01", "您的主要收入来源是：", (
         "工资、劳务报酬", "生产经营所得", "利息、股息、转让证券等金融性资产收入",
         "出租、出售房地产等非金融性资产收入", "无固定收入"), (5, 4, 3, 3, 0)),
@@ -73,6 +74,25 @@ QUESTIONS = (
         "我不符合以上任何一项描述"), (5, 5, 5, 0)),
     Question("q19", "您的家庭年收入：", ("大于100万", "51–100万", "21–50万", "5–20万", "小于5万"), (5, 4, 3, 1, 0)),
 )
+SUPPLEMENTARY_QUESTIONS = (
+    Question("q20", "您本次计划投入的投资资金总额（不含日常生活资金及已有应急储备）为：", (
+        "不足5万元", "5万元至不足20万元", "20万元至不足50万元", "50万元至不足100万元", "100万元及以上"), (0, 0, 0, 0, 0)),
+    Question("q21", "未来12个月必须用于生活、大额支出或到期偿债的资金，占上述投资资金的比例为：", (
+        "没有此类支出", "不超过10%", "超过10%但不超过30%", "超过30%但不超过50%", "超过50%"), (0, 0, 0, 0, 0)),
+    Question("q22", "在上述投资资金之外，您已有的可随时动用的应急储备能覆盖家庭必要支出的时间为：", (
+        "不足1个月", "1个月至不足3个月", "3个月至不足6个月", "6个月及以上"), (0, 0, 0, 0)),
+    Question("q23", "您家庭每月必须偿还的债务，占稳定月收入的比例为：", (
+        "没有还款负担", "不超过20%", "超过20%但不超过40%", "超过40%但不超过60%", "超过60%，或稳定收入不足以覆盖还款"), (0, 0, 0, 0, 0)),
+    Question("q24", "上述投资资金的首要用途或规划目标是：", (
+        "日常备用或短期支出", "购房或其他大额消费", "教育支出", "养老安排", "长期财富积累"), (0, 0, 0, 0, 0)),
+    Question("q25", "为实现上述目标，您最早需要动用这笔投资资金的时间为：", (
+        "1年以内", "超过1年但不超过3年", "超过3年但不超过5年", "5年以上", "暂未明确"), (0, 0, 0, 0, 0)),
+    Question("q26", "您能接受投资组合从阶段高点回落的最大幅度（回撤）为：", (
+        "不能接受回撤", "不超过5%", "不超过10%", "不超过20%", "可接受20%以上的回撤，暂不设明确上限"), (0, 0, 0, 0, 0)),
+    Question("q27", "您的期望年化收益范围为（仅记录目标，不代表能够实现）：", (
+        "本金安全优先，没有固定收益目标", "不超过5%", "超过5%但不超过10%", "超过10%但不超过20%", "超过20%"), (0, 0, 0, 0, 0)),
+)
+QUESTIONS = BASE_QUESTIONS + SUPPLEMENTARY_QUESTIONS
 QUESTION_BY_ID = {q.id: q for q in QUESTIONS}
 PRODUCT_GROUPS = ("固定收益类", "权益类", "混合类", "融资及衍生品类", "复杂或高风险类")
 
@@ -92,6 +112,8 @@ def answer_issues(answers: dict[str, str]) -> list[str]:
         issues.append("第9题选择没有经验，与第10题交易额不一致，请核对。")
     if answers.get("q10") == "E" and answers.get("q09") not in (None, "E"):
         issues.append("第10题选择从未投资，与第9题投资年限不一致，请核对。")
+    if answers.get("q03") == "A" and answers.get("q23") not in (None, "A"):
+        issues.append("第3题选择没有债务，与第23题存在还款负担不一致，请核对。")
     return issues
 
 
@@ -106,13 +128,13 @@ def risk_band(score: float) -> int:
 def evaluate_answers(answers: dict[str, str], *, today: date | None = None) -> dict:
     validate_answers(answers)
     if len(answers) != len(QUESTIONS):
-        raise ValueError("请完成全部19道题后再提交。")
+        raise ValueError(f"请完成全部{len(QUESTIONS)}道题后再提交。")
     issues = answer_issues(answers)
     if issues:
         raise ValueError("；".join(issues))
     score = round(sum(q.points[ord(answers[q.id]) - 65] for q in QUESTIONS), 2)
     # 明确偏向本金安全时采用保守档；不把定性损失转换成虚构的百分比。
-    band = 1 if answers["q15"] == "A" else risk_band(score)
+    band = 1 if answers["q15"] == "A" or answers["q26"] == "A" else risk_band(score)
     assessed = today or local_today()
     try:
         expires = assessed.replace(year=assessed.year + 2)
@@ -120,7 +142,7 @@ def evaluate_answers(answers: dict[str, str], *, today: date | None = None) -> d
         expires = assessed.replace(year=assessed.year + 2, day=28)
     groups = PRODUCT_GROUPS[:(1, 3, 4, 5)[ord(answers["q12"]) - 65]]
     horizon_label, horizon_min, horizon_max = (("0到1年", 0, 12), ("1到5年", 12, 60), ("无特别要求", None, None))[ord(answers["q11"]) - 65]
-    return {
+    values = {
         "questionnaire_version": QUESTIONNAIRE_VERSION, "risk_answers": dict(answers),
         "questionnaire_details": {q.title: q.options[ord(answers[q.id]) - 65] for q in QUESTIONS},
         "risk_score": score, "risk_level": f"R{band}", "investor_category": f"C{band}",
@@ -133,6 +155,21 @@ def evaluate_answers(answers: dict[str, str], *, today: date | None = None) -> d
         "assessed_on": assessed, "valid_until": expires,
         "scoring_method": "platform-19-v1", "scoring_notice": SCORING_NOTICE,
     }
+    score_groups = (
+        ("财务基础", ("q01", "q02", "q03", "q04", "q19")),
+        ("知识与经验", ("q05", "q06", "q09", "q18")),
+        ("交易行为", ("q07", "q08", "q10")),
+        ("收益与损失偏好", ("q13", "q14", "q15")),
+        ("资金用途与年龄", ("q16", "q17")),
+    )
+    values["scoring_breakdown"] = [{
+        "dimension": name, "question_ids": list(qids),
+        "points": sum(QUESTION_BY_ID[qid].points[ord(answers[qid]) - 65] for qid in qids),
+        "maximum": sum(max(QUESTION_BY_ID[qid].points) for qid in qids),
+    } for name, qids in score_groups]
+    from backend.app.profile_guidance import build_profile_guidance
+    values.update(build_profile_guidance(answers, values))
+    return values
 
 
 def assessment_is_current(profile, *, today: date | None = None) -> bool:

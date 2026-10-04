@@ -6,11 +6,12 @@ import hashlib
 import json
 import math
 import re
+from datetime import date, datetime
 from time import perf_counter
 from uuid import uuid4
 
 from backend.app.agents.coordinator import RISK_NOTICE, CoordinatorAgent, cross_validate_results
-from backend.app.fact_taxonomy import fact_is_current
+from backend.app.fact_taxonomy import NEWS_FIELDS, fact_is_current
 from backend.app.models import (
     AgentResult, ComplianceStatus, DataAcquisitionResult, FactRecord,
     Intent, OrchestrationRequest, StockRecommendationCandidate, StockRecommendationResult,
@@ -22,9 +23,14 @@ from backend.app.semantic import RequestUnderstanding
 from backend.app.services.evidence_coverage import missing_fields_by_agent
 from backend.app.services.provider_errors import failure_summary
 from backend.app.services.research import AutomatedResearchPipeline, DataCall
+from backend.app.services.research_recovery import recover_research
+from backend.app.services.agent_data_requirements import agent_requirements
 from backend.app.services.scoring_dimensions import QUALITATIVE_RUBRICS
+from backend.app.services.recommendation_recovery import derive_explicit_state, derive_history_metrics, history_window
+from backend.app.services.disclosure_reader import allowed_disclosure_url, read_disclosure
+from backend.app.services.disclosure_evidence import derive_disclosure_assessments
 
-DOCUMENT_FIELDS = {"news", "announcement", "event", "research_report"}
+DOCUMENT_FIELDS = {*NEWS_FIELDS, "event"}
 CRITERIA = {"policy": ("policy",), "event": ("event",),
             "governance": ("audit_opinion", "regulatory_status", "disclosure_status")}
 LIQUIDITY_FLOORS = {"高": 50_000_000, "中": 20_000_000, "低": 10_000_000}
@@ -98,10 +104,12 @@ class StockRecommendationService:
             "investment_target": profile.target,
             "screen_pe_upper_bound": pe_limit,
             "screen_roe_lower_bound_percent": roe_floor,
+            "min_listed_history_months": 12,
         }
         # No account identifier, questionnaire answers or investment history goes
         # to the public provider/cache. Profile limits are server-owned criteria.
         query = f"非ST，非停牌，市盈率大于0且小于{pe_limit}，净资产收益率大于{roe_floor}%"
+        query += "，上市时间超过1年"
         if profile.horizon_months is not None and profile.horizon_months >= 12:
             query += "，最近三年归母净利润均为正"
         for condition in [*profile.constraints, *understanding.stock_preferences]:
@@ -174,13 +182,27 @@ class StockRecommendationService:
                         self._call("macro_policy", "get_news", "中国宏观经济")]
         shared, shared_audit = await self._prepare(seed, shared_calls)
         audits.append(shared_audit)
+        shared_errors = dict(shared_audit.capability_errors)
+        if self._latest(shared.facts, "中国宏观经济", "liquidity_score") is None:
+            monetary = self._call("macro_liquidity", "get_macro_data", "中国最新M2同比增长率")
+            shared_calls.append(monetary)
+            shared, monetary_audit = await self._prepare(shared, [monetary])
+            audits.append(monetary_audit)
+            shared_errors.update(monetary_audit.capability_errors)
         shared = await self._assess(shared, [{"entity": "中国宏观经济", "dimension": "policy"}], [])
-        # A bounded refresh is attempted before any candidate analysis.
+        # Use focused evidence recovery rather than repeating the same broad query.
         if "market" in missing_fields_by_agent(shared.facts, Intent.SECURITY_RESEARCH, now=self.pipeline.now()):
-            retry = [call for call in shared_calls if shared_audit.capability_errors.get(call.label, {}).get("retryable", True)]
+            retry = []
+            if not self._latest(shared.facts, '中国宏观经济', 'policy_score') and hasattr(self.pipeline.provider, 'get_macro_policy'):
+                retry.append(self._call('macro_policy_recovery', 'get_macro_policy', '中国宏观经济'))
+            if not self._latest(shared.facts, '中国宏观经济', 'risk_appetite_score') and hasattr(self.pipeline.provider, 'get_market_breadth'):
+                retry.append(self._call('market_breadth', 'get_market_breadth', '中国宏观经济'))
+            retry = retry or [call for call in shared_calls if shared_errors.get(call.label, {}).get("retryable", True)]
             if retry:
                 shared, repair = await self._prepare(shared, retry, refresh=True)
                 audits.append(self._repair_audit(repair))
+                state = derive_explicit_state(shared.facts, now=self.pipeline.now())
+                shared = shared.model_copy(update={'facts': _merge(shared.facts, state, self.pipeline._derive(_merge(shared.facts, state)))})
                 shared = await self._assess(shared, [{"entity": "中国宏观经济", "dimension": "policy"}], [])
         semaphore = asyncio.Semaphore(self.concurrency)
         outputs = {}
@@ -243,6 +265,8 @@ class StockRecommendationService:
                 entry.reasons.append("已完成研究，本次排序未进入推荐名额。")
         if not chosen:
             reason = "已按投资画像查询同花顺并核验候选，暂无通过画像匹配与完整核验的股票。"
+            if any(error.get("code") == "PROVIDER_QUOTA_EXHAUSTED" for error in acquisition.capability_errors.values()):
+                reason = "已查询同花顺候选股票，但部分查询额度已用完，风险及必要证据核验未完成，暂未生成推荐。"
             return prepared, acquisition, self._empty(prepared, report, reason)
         # Final output uses the existing verifier and semantic/compliance gates,
         # including all selected stocks rather than borrowing one stock's PASS.
@@ -290,6 +314,12 @@ class StockRecommendationService:
         req, audit = await self._prepare(req, [basic_call])
         audits.append(audit)
         own = self._own_facts(req.facts, code, name)
+        early_fit, early_reason, early_evidence = self._fit(req.model_copy(update={'facts':own}), name, [])
+        if early_fit == 'no':
+            entry.status = 'excluded'
+            entry.reasons = [early_reason]
+            entry.evidence = sorted(set(entry.evidence + early_evidence))
+            return entry, None, own, audits
         industry_fact = next((f for f in own if f.field == "industry" and isinstance(f.value, str)
                               and fact_is_current(f, self.pipeline.now())), None)
         if industry_fact is None:
@@ -297,13 +327,16 @@ class StockRecommendationService:
             code_status = audit.capability_errors.get(basic_call.label, {}).get("code")
             entry.reasons = ["同花顺基本资料接口未获授权，所属行业尚未核实。" if code_status in
                              {"AUTHENTICATION_REJECTED", "CAPABILITY_FORBIDDEN"} else
+                             "同花顺基本资料查询额度已用完，所属行业尚未核实。" if code_status == "PROVIDER_QUOTA_EXHAUSTED" else
                              "所属行业资料未核实，无法完成行业与个股联合研究。"]
             return entry, None, own, audits
         industry = industry_fact.value.strip()
         calls = [self._call(f"{label}:{code}", method, code) for label, method in (
             ("quote", "get_quote"), ("financial", "get_financial_metrics"),
-            ("event", "get_event_data"), ("governance", "get_announcements"),
+            ("event", "get_event_data"), ("governance", "get_governance_disclosures"),
             ("risk_metrics", "get_stock_risk_metrics"))]
+        if hasattr(self.pipeline.provider, 'get_structured_events'):
+            calls.append(self._call(f'structured_events:{code}', 'get_structured_events', code))
         calls += [self._call(f"industry:{industry}", "get_industry_rank", industry),
                   self._call(f"industry_policy:{industry}", "get_news", industry)]
         req = req.model_copy(update={"facts": _merge(own, shared_facts)})
@@ -327,22 +360,69 @@ class StockRecommendationService:
         metrics_missing = any(self._latest(req.facts, name, f) is None for f in
                               ("max_drawdown_1y", "avg_turnover_20d", "is_st", "trading_status"))
         if gaps.get("security") or gaps.get("industry") or metrics_missing:
-            retry = [call for call in calls if audit.capability_errors.get(call.label, {}).get("retryable", True)]
+            retry = self._recovery_calls(req, code, name, industry, audit)
+            if not retry:
+                retry = [call for call in calls if audit.capability_errors.get(call.label, {}).get("retryable", True)
+                         and not call.label.startswith(('quote:', 'risk_metrics:'))]
             if retry:
-                req, repaired = await self._prepare(req, retry, refresh=True)
+                req, repaired = await self._prepare(req, retry)
                 audits.append(self._repair_audit(repaired))
                 req = self._scope_candidate(req, code, name, industry, shared_facts)
-                req = await self._assess(req, targets, conditions)
+                start, end = history_window(self.pipeline.now())
+                recovered = derive_history_metrics(req.facts, code=code, name=name, industry=industry,
+                    now=self.pipeline.now(), start=start, end=end)
+                recovered.extend(derive_explicit_state(req.facts, now=self.pipeline.now()))
+                # Do not overwrite an explicit metric supplied by the provider.
+                recovered = [f for f in recovered if not self._latest(req.facts, f.entity, f.field)]
+                req = req.model_copy(update={'facts': _merge(req.facts, recovered, self.pipeline._derive(_merge(req.facts, recovered)))})
+                known_exclusion = self._fit(req, name, conditions)[0] == 'no'
+                if not known_exclusion and any(t['dimension'] in {'event', 'governance'} and
+                       not self._latest(req.facts, t['entity'], t['dimension'] + '_score') for t in targets):
+                    req, document_audit = await self._read_documents(req, code, name)
+                    audits.append(document_audit)
+                    explicit = derive_disclosure_assessments(req.facts, entity=name, code=code, now=self.pipeline.now())
+                    roots = _merge(req.facts, explicit)
+                    req = req.model_copy(update={'facts':_merge(roots,self.pipeline._derive(roots))})
+                if not known_exclusion:
+                    req = await self._assess(req, targets, conditions)
         entry.missing_fields = missing_fields_by_agent(req.facts, Intent.SECURITY_RESEARCH, now=self.pipeline.now())
+        missing_risk = [field for field in ("max_drawdown_1y", "avg_turnover_20d", "is_st", "trading_status")
+                        if self._latest(req.facts, name, field) is None]
+        if missing_risk:
+            entry.missing_fields["profile_fit"] = missing_risk
         fit, fit_reason, fit_ids = self._fit(req, name, conditions)
         entry.evidence = sorted(set(entry.evidence + fit_ids))
         if fit != "yes":
             entry.status = "excluded" if fit == "no" else "review"
             entry.reasons = [fit_reason]
+            if fit == 'unknown' and missing_risk and any(local.capability_errors.get(f'{label}:{code}', {}).get('code') ==
+                                    'PROVIDER_QUOTA_EXHAUSTED' for local in audits
+                                    for label in ('risk_metrics', 'stock_history', 'trading_status')):
+                entry.reasons = ["同花顺风险查询额度已用完，历史回撤、流动性及交易状态尚未核实。"]
             return entry, None, req.facts, audits
         candidate_understanding = understanding.model_copy(update={"action": "analyze", "target": code,
                                                                   "data_requirements": []})
         advice = await self.coordinator.run(req, understanding=candidate_understanding)
+        if agent_requirements(advice.agent_results):
+            recovered, repair = await recover_research(
+                self.pipeline, req, Intent.SECURITY_RESEARCH, advice, self._audit(audits, req.facts),
+                target=code, semantic=self.coordinator.semantic,
+            )
+            repair = repair.model_copy(update={"recovery_attempts": [
+                {**attempt, "scope": code} for attempt in repair.recovery_attempts]})
+            if recovered is not req:
+                req = recovered
+                advice = await self.coordinator.run(req, understanding=candidate_understanding)
+                repair = repair.model_copy(update={"recovery_reanalyzed": True})
+                entry.missing_fields = missing_fields_by_agent(req.facts, Intent.SECURITY_RESEARCH,
+                                                               now=self.pipeline.now())
+                fit, fit_reason, fit_ids = self._fit(req, name, conditions)
+                if fit != "yes":
+                    entry.status = "excluded" if fit == "no" else "review"
+                    entry.reasons = [fit_reason]
+                    audits.append(repair)
+                    return entry, advice, req.facts, audits
+            audits.append(repair)
         security = next((r for r in advice.agent_results if r.agent_id == "security"), None)
         if security is not None:
             security.facts_used = sorted(set(security.facts_used + fit_ids + entry.evidence))
@@ -378,13 +458,115 @@ class StockRecommendationService:
 
     def _scope_candidate(self, req, code, name, industry, shared):
         own = self._own_facts(req.facts, code, name)
-        sector = [f for f in req.facts if f.entity == industry and not f.entity_code]
-        roots = [f for f in _merge(own, sector, shared) if not f.source_id.startswith("DERIVED_RULE_")]
+        sector = [f for f in req.facts if f.entity == industry and
+                  (not f.entity_code or f.entity_code.upper().endswith('.TI'))]
+        calendar = [f for f in req.facts if f.entity == '中国A股交易日历' and f.field in
+                    {'market_session', 'market_session_count', 'exchange_calendar_notice'}]
+        inventories = [f for f in req.facts if f.entity == '沪深风险警示板' and f.field == 'risk_warning_inventory']
+        roots = [f for f in _merge(own, sector, shared, calendar, inventories) if not f.source_id.startswith("DERIVED_RULE_")]
+        # Industry aggregates depend on constituent-company records, which are
+        # proof inputs rather than additional recommendation targets.
+        by_id = {f.fact_id:f for f in req.facts}
+        parents, seen = list(roots), {f.fact_id for f in roots}
+        for fact in parents:
+            for parent_id in fact.derived_from:
+                if parent_id in by_id and parent_id not in seen:
+                    seen.add(parent_id)
+                    parents.append(by_id[parent_id])
+        roots = parents
         return req.model_copy(update={"facts": _merge(roots, self.pipeline._derive(roots))})
+
+    def _recovery_calls(self, req, code, name, industry, audit):
+        calls = []
+        start, end = history_window(self.pipeline.now())
+        provider = self.pipeline.provider
+        def add(label, method, *args):
+            if hasattr(provider, method):
+                calls.append(DataCall(label, method, args, f'{method}@' + '|'.join(args)))
+        no_market = any(audit.capability_errors.get(f'{label}:{code}', {}).get('code') in
+            {'PROVIDER_QUOTA_EXHAUSTED', 'AUTHENTICATION_REJECTED', 'CAPABILITY_FORBIDDEN'}
+            for label in ('risk_metrics', 'quote'))
+        no_industry = audit.capability_errors.get(f'industry:{industry}', {}).get('code') in {
+            'PROVIDER_QUOTA_EXHAUSTED', 'AUTHENTICATION_REJECTED', 'CAPABILITY_FORBIDDEN'}
+        history_missing = any(not self._latest(req.facts, name, f) for f in ('max_drawdown_1y', 'avg_turnover_20d'))
+        crowding_missing = not self._latest(req.facts, industry, 'crowding_score')
+        if not no_market:
+            if history_missing:
+                add(f'stock_history:{code}', 'get_stock_daily_history', code, start, end)
+                if getattr(provider, 'public_recovery', None) and not self._latest(req.facts, name, 'max_drawdown_1y'):
+                    add(f'adjusted_history:{code}', 'get_adjusted_stock_history', code, start, end)
+            if history_missing or (crowding_missing and not no_industry):
+                method = 'get_exchange_calendar' if getattr(provider, 'public_recovery', None) else 'get_market_calendar'
+                add('trading_calendar', method, start, end)
+            if any(not self._latest(req.facts, name, f) for f in ('is_st', 'trading_status')):
+                add(f'trading_status:{code}', 'get_stock_trading_status', code)
+            if getattr(provider, 'public_recovery', None) and not self._latest(req.facts, name, 'is_st'):
+                add(f'risk_warning_state:{code}', 'get_stock_risk_state', code)
+        if not no_industry:
+            if not self._latest(req.facts, industry, 'prosperity_score'):
+                add(f'industry_fundamentals:{industry}', 'get_industry_fundamentals', industry)
+            if not self._latest(req.facts, industry, 'capital_flow_score'):
+                add(f'industry_flow:{industry}', 'get_industry_flow', industry)
+            if crowding_missing and not no_market:
+                add(f'industry_history:{industry}', 'get_industry_turnover_history', industry, start, end)
+        if not self._latest(req.facts, industry, 'policy_score'):
+            add(f'industry_policy_recovery:{industry}', 'get_industry_policy', industry)
+        blocked_documents = any(audit.capability_errors.get(f'{label}:{code}', {}).get('code') in
+            {'PROVIDER_QUOTA_EXHAUSTED', 'AUTHENTICATION_REJECTED', 'CAPABILITY_FORBIDDEN'} for label in ('event', 'governance'))
+        if not blocked_documents and any(not self._latest(req.facts, name, f) for f in ('event_score', 'governance_score')):
+            add(f'disclosure_details:{code}', 'get_stock_disclosure_details', code)
+        return calls
+
+    async def _read_documents(self, req, code, name):
+        # At most three distinct official PDFs per candidate, prioritizing annual
+        # and audit reports. Opening pages must identify the same security.
+        sources = sorted((f for f in req.facts if f.entity == name and
+            (not f.entity_code or symbol_code(f.entity_code) == code) and f.field in DOCUMENT_FIELDS and f.source_url and f.period
+            and fact_is_current(f, self.pipeline.now()) and allowed_disclosure_url(f.source_url)),
+            key=lambda f: (any(word in _text(f) for word in ('年度报告', '审计', '监管', '处罚')), f.snapshot_time), reverse=True)
+        urls, calls = set(), []
+        for fact in sources:
+            if fact.source_url not in urls:
+                urls.add(fact.source_url)
+                calls.append(fact)
+            if len(calls) == 3:
+                break
+        results = await asyncio.gather(*(read_disclosure(f, code=code, name=name) for f in calls), return_exceptions=True)
+        audit = DataAcquisitionResult(mode='live', requested_capabilities=[f'disclosure_pdf:{code}:{i}' for i in range(len(calls))])
+        facts = []
+        for label, result in zip(audit.requested_capabilities, results):
+            if isinstance(result, BaseException):
+                audit.failed_capabilities.append(label)
+                audit.capability_errors[label] = failure_summary(result)
+            elif result:
+                audit.successful_capabilities.append(label)
+                facts.extend(result)
+            else:
+                audit.empty_capabilities.append(label)
+        audit.fetched_fact_count = len(facts)
+        return req.model_copy(update={'facts': _merge(req.facts, facts)}), audit
 
     def _latest(self, facts, entity, field):
         return max((f for f in facts if f.entity == entity and f.field == field
-                    and fact_is_current(f, self.pipeline.now())), key=lambda f: f.snapshot_time, default=None)
+                    and fact_is_current(f, self.pipeline.now()) and self._usable_risk(f)),
+                   key=lambda f: f.snapshot_time, default=None)
+
+    @staticmethod
+    def _usable_risk(fact):
+        if fact.field == 'max_drawdown_1y':
+            return fact.normalized_value is not None and math.isfinite(fact.normalized_value) and -100 <= fact.normalized_value <= 100
+        if fact.field == 'avg_turnover_20d':
+            try:
+                return (not isinstance(fact.value, bool) and fact.unit in {'CNY', '元', '万元', '亿元'}
+                        and math.isfinite(float(fact.value)) and float(fact.value) >= 0)
+            except (ValueError, TypeError):
+                return False
+        if fact.field == 'is_st':
+            return str(fact.value).strip().casefold() in {'true', 'false', '1', '0', '是', '否', 'st', '*st', '非st'}
+        if fact.field == 'trading_status':
+            return str(fact.value).strip() in {'正常', '正常交易', '交易', '交易中', '交易状态正常',
+                                             '停牌', '退市', '终止上市', '暂停上市'}
+        return True
 
     async def _assess(self, req, targets, conditions):
         roots = [f for f in req.facts if not f.source_id.startswith("DERIVED_RULE_")]
@@ -396,8 +578,15 @@ class StockRecommendationService:
         # Keep document coverage for every requested entity within a fixed budget.
         selected = []
         for entity in dict.fromkeys(t["entity"] for t in targets):
-            selected.extend(sorted((f for f in docs if f.entity == entity), key=lambda f: f.snapshot_time, reverse=True)[:8])
-        selected = _merge(selected, [f for f in current if f.field not in DOCUMENT_FIELDS][:60])
+            selected.extend(sorted((f for f in docs if f.entity == entity),
+                                   key=lambda f: (f.field == 'announcement_excerpt', f.snapshot_time,
+                                                  f.field.endswith('_summary')), reverse=True)[:12])
+        numeric = [f for f in current if f.field not in DOCUMENT_FIELDS and f.field not in {
+            'constituent_revenue', 'industry_constituent_inventory', 'price_adjustment_contract',
+            'risk_warning_inventory', 'exchange_calendar_notice', 'market_session', 'market_session_count', 'adjusted_close_history', 'daily_turnover_history', 'industry_turnover_history'}
+            and self._usable_risk(f)]
+        numeric.sort(key=lambda f: f.field in {'max_drawdown_1y', 'avg_turnover_20d', 'is_st', 'trading_status'}, reverse=True)
+        selected = _merge(selected, numeric[:60])
         candidate = next((t["entity"] for t in targets if t["dimension"] == "governance"), None)
         review = await self.coordinator.semantic.assess_stock_evidence(
             req, selected, needed or targets, conditions, candidate_entity=candidate)
@@ -455,8 +644,33 @@ class StockRecommendationService:
 
     def _fit(self, req, name, conditions):
         evidence = []
+        listing = self._latest(req.facts, name, 'listing_date')
+        if listing and re.fullmatch(r'\d{4}-\d{2}-\d{2}|\d{8}', str(listing.value).strip()):
+            try:
+                text = str(listing.value).strip()
+                listed_day = datetime.strptime(text,'%Y%m%d').date() if len(text)==8 else date.fromisoformat(text)
+                first, _ = history_window(self.pipeline.now())
+                if listed_day > date.fromisoformat(first):
+                    return 'no', '候选上市不足一年，无法满足本次完整一年历史风险核验要求。', [listing.fact_id]
+            except ValueError:
+                pass
         metrics = {field: self._latest(req.facts, name, field) for field in
                    ("max_drawdown_1y", "avg_turnover_20d", "is_st", "trading_status")}
+        # A verified hard rejection remains decisive when a different field is
+        # missing. Missing ST evidence cannot hide an excessive drawdown.
+        warning, status = metrics['is_st'], metrics['trading_status']
+        if warning and str(warning.value).strip().casefold() in {'true', '1', '是', 'st', '*st'}:
+            return 'no', '候选存在风险警示，不符合本次筛选条件。', [warning.fact_id]
+        if status and str(status.value).strip() in {'停牌', '退市', '终止上市', '暂停上市'}:
+            return 'no', '候选未处于正常交易状态，不符合本次筛选条件。', [status.fact_id]
+        loss = metrics['max_drawdown_1y']
+        if loss and req.profile.max_drawdown is not None and abs(loss.normalized_value) > req.profile.max_drawdown * 100:
+            return 'no', '候选历史回撤超过已确认的承受范围。', [loss.fact_id]
+        amount = metrics['avg_turnover_20d']
+        if amount:
+            turnover = float(amount.value) * {'CNY': 1, '元': 1, '万元': 10000, '亿元': 100000000}[amount.unit]
+            if turnover < LIQUIDITY_FLOORS.get(req.profile.liquidity_need, 10000000):
+                return 'no', '候选成交活跃度未达到本次流动性筛选条件。', [amount.fact_id]
         if any(f is None for f in metrics.values()):
             return "unknown", "历史回撤、流动性或交易状态资料不完整，画像匹配尚未核实。", []
         for fact in metrics.values():
@@ -519,6 +733,18 @@ class StockRecommendationService:
             values[field] = list(dict.fromkeys(item for a in audits for item in getattr(a, field)))
         for field in ("capability_errors", "capability_timings_ms", "recovery_errors"):
             values[field] = {key: value for a in audits for key, value in getattr(a, field).items()}
+        phases = list(dict.fromkeys(phase for a in audits
+            for phase in (a.recovery_phases or ([a.recovery_phase] if a.recovery_phase else []))))
+        values["recovery_phases"] = phases
+        values["recovery_rounds"] = len(phases) or values["recovery_rounds"]
+        values["recovery_reanalyzed"] = any(a.recovery_reanalyzed for a in audits)
+        values["recovery_agent_requirements"] = {agent: list(dict.fromkeys(
+            cap for a in audits for cap in a.recovery_agent_requirements.get(agent, ())))
+            for agent in {agent for a in audits for agent in a.recovery_agent_requirements}}
+        # Candidate fanout can have multiple repairs in a phase; retain each scope.
+        values["recovery_attempts"] = [{"phase": phase, "candidate_attempts": [attempt
+            for a in audits for attempt in a.recovery_attempts if attempt.get("phase") == phase]}
+            for phase in phases]
         if values["recovery_rounds"]:
-            values["recovery_phase"] = "before_analysis"
+            values["recovery_phase"] = phases[-1] if phases else "before_analysis"
         return DataAcquisitionResult(**values)

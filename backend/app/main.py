@@ -86,6 +86,8 @@ from backend.app.services import (
 from backend.app.models.schemas import DataOverviewRequest, DataOverviewResponse, ComparisonRequest, ComparisonResponse, SnapshotOptions
 from backend.app.services.comparison import fetch_snapshots
 from backend.app.risk_questionnaire import assessment_is_current
+from backend.app.models.trade_history import TradeHistoryUpload
+from backend.app.services.trade_history import inspect_trade_workbook, analyze_trade_history
 from backend.app.services.overview_cache import OverviewCache
 overview_cache = OverviewCache()
 from backend.app.services.admin import consultation_metadata
@@ -728,6 +730,50 @@ async def assess_user_profile(request: ProfileAssessmentRequest, user: dict[str,
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+async def _trade_file_task(user, function, *args):
+    """文件解析在账号工作线程执行，避免占用 API 事件循环。"""
+    try:
+        future = session_thread_pool.submit(str(user["_session_id"]), function, *args)
+        return await asyncio.wrap_future(future)
+    except ProfileVersionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except DatabaseUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/profile/trades/inspect", tags=["profile"])
+async def inspect_user_trades(request: TradeHistoryUpload, user: dict[str, object] = Depends(customer_user)):
+    return await _trade_file_task(user, inspect_trade_workbook, request)
+
+
+@app.post("/api/v1/profile/trades/analyze", tags=["profile"])
+async def analyze_user_trades(request: TradeHistoryUpload, user: dict[str, object] = Depends(customer_user)):
+    """只预览交易行为，不改动账号画像或确认状态。"""
+    return await _trade_file_task(user, analyze_trade_history, request)
+
+
+def _save_trade_analysis(request: TradeHistoryUpload, user_id: int) -> UserProfile:
+    # 保存时重新从文件计算，客户端不能提交或篡改画像结论。
+    analysis = analyze_trade_history(request)
+    stored = database.get_profile(user_id)
+    profile = UserProfile.model_validate({**(stored["payload"] if stored else {}), "user_id": str(user_id)})
+    if profile.version != request.expected_version:
+        raise ProfileVersionConflict("用户画像已在其他页面更新，请刷新后重新核对并保存。")
+    analysis.pop("preview", None)
+    analysis["confirmed"] = True
+    saved = profile.model_copy(update={"trading_analysis": analysis, "version": profile.version + 1})
+    database.save_profile(user_id, saved.model_dump(mode="json"), saved.version, request.expected_version)
+    return saved
+
+
+@app.post("/api/v1/profile/trades/confirm", response_model=UserProfile, tags=["profile"])
+async def confirm_user_trades(request: TradeHistoryUpload, user: dict[str, object] = Depends(customer_user)):
+    """确认交易行为补充画像，保留原风险测评及其有效期。"""
+    return await _trade_file_task(user, _save_trade_analysis, request, int(user["id"]))
+
+
 @app.post("/api/v1/profile/confirm", response_model=UserProfile, tags=["profile"])
 async def confirm_user_profile(
     request: ProfileConfirmRequest,
@@ -740,7 +786,7 @@ async def confirm_user_profile(
     """
 
     if not request.profile.questionnaire_version:
-        raise HTTPException(status_code=422, detail="请完成全部19道题后再确认风险测评。")
+        raise HTTPException(status_code=422, detail="请完成当前版本的全部题目后再确认风险测评。")
     if user is not None:
         # 画像归属以鉴权上下文为准，不接受前端声明的 user_id。
         request = request.model_copy(
@@ -750,6 +796,14 @@ async def confirm_user_profile(
         confirmed = confirm_profile(request.profile)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    # 交易分析由专用上传接口生成；问卷确认不信任客户端提供的分析，且保留
+    # 当前账号已确认的历史交易摘要，防止重新测评清掉交易画像。
+    trading_analysis = {}
+    if user is not None:
+        stored = await _trade_file_task(user, database.get_profile, int(user["id"]))
+        if stored:
+            trading_analysis = stored["payload"].get("trading_analysis") or {}
+    confirmed = confirmed.model_copy(update={"trading_analysis": trading_analysis})
     if user is not None:
         future = session_thread_pool.submit(
             str(user["_session_id"]),
@@ -860,7 +914,7 @@ async def analyze_portfolio(
             prepared_request, acquisition = await recover_research(
                 research_pipeline, prepared_request, fetch_intent, None, acquisition,
                 target=understanding.target, data_requirements=understanding.data_requirements,
-                progress_sink=report,
+                progress_sink=report, semantic=coordinator.semantic,
             )
             advice = await coordinator.run(
                 prepared_request, understanding=understanding, metrics_sink=model_slice,
@@ -869,7 +923,7 @@ async def analyze_portfolio(
             recovered_request, acquisition = await recover_research(
                 research_pipeline, prepared_request, fetch_intent, advice, acquisition,
                 target=understanding.target, data_requirements=understanding.data_requirements,
-                progress_sink=report,
+                progress_sink=report, semantic=coordinator.semantic,
             )
             if recovered_request is not prepared_request:
                 prepared_request = recovered_request

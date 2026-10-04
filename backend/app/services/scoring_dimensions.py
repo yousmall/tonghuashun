@@ -1,5 +1,5 @@
 """Versioned evidence-backed proxies, with explicit inputs and no document counts."""
-from backend.app.fact_taxonomy import fact_is_current
+from backend.app.fact_taxonomy import NEWS_FIELDS, fact_is_current
 
 QUALITATIVE_RUBRICS = {
     "policy": {"supportive": 75, "neutral": 50, "restrictive": 25},
@@ -32,7 +32,7 @@ def additional_dimensions(by_field, *, now, numeric, emit):
              "CAPITAL_FLOW_V1: clip(50+50*net_flow/turnover); same_currency_period")
 
     documents = {fact.fact_id: fact for records in by_field.values() for fact in records
-                 if fact.field in {"announcement", "news", "event", "research_report"}
+                 if fact.field in {*NEWS_FIELDS, "event"}
                  and fact.source_url and fact.period and fact_is_current(fact, now)}
     for dimension, criteria in (("policy", ("policy",)), ("event", ("event",)),
                                 ("governance", ("audit_opinion", "regulatory_status", "disclosure_status"))):

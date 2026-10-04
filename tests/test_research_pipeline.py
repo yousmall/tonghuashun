@@ -222,7 +222,9 @@ def test_analyze_endpoint_returns_fetched_and_derived_facts(monkeypatch) -> None
     assert body["data_acquisition"]["mode"] == "live"
     # Repair known event/governance gaps before the first analysis; the complete
     # verifier/compliance chain still checks the final evidence.
-    assert body["data_acquisition"]["fetched_fact_count"] == 19
+    # 缺少可核验收益情景时，额外补取一份行情和机构观点，保留明确缺项。
+    assert body["data_acquisition"]["fetched_fact_count"] == 22
+    assert {"return_quote:0", "return_targets:0"} <= set(body["data_acquisition"]["recovery_capabilities"])
     assert body["data_acquisition"]["recovery_rounds"] == 1
     assert not body["data_acquisition"]["recovery_reanalyzed"]
     assert body["data_acquisition"]["recovery_phase"] == "before_analysis"

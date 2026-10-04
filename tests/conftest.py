@@ -56,5 +56,5 @@ def risk_questionnaire_payload():
     from backend.app.risk_questionnaire import QUESTIONNAIRE_VERSION, QUESTIONS
     return {
         "questionnaire_version": QUESTIONNAIRE_VERSION,
-        "risk_answers": dict(zip((q.id for q in QUESTIONS), "ACABDC CACCB BCCBC CDB".replace(" ", ""), strict=True)),
+        "risk_answers": dict(zip((q.id for q in QUESTIONS), "ACABDC CACCB BCCBC CDB CADAECDC".replace(" ", ""), strict=True)),
     }

@@ -24,7 +24,9 @@ from backend.app.semantic import RequestUnderstanding, SemanticService, UNAVAILA
 from backend.app.research_routing import DIRECTION_FOR_INTENT
 from backend.app import fact_taxonomy as _TAXONOMY
 from backend.app.services.model_input import slice_facts_for_model
+from backend.app.services.return_expectation import build_return_expectation
 from backend.app.risk_questionnaire import assessment_is_current
+from backend.app.profile_guidance import allocation_for_profile
 
 from backend.app.models import (
     AdvicePackage,
@@ -252,6 +254,16 @@ class CoordinatorAgent:
         if progress_sink is not None:
             progress_sink("分项研判")
         results = await self._run_parallel(model_view, specialist_nodes)
+        # 收益面板计算使用的价格和目标价也必须进入同一个引用核验闸门。
+        scenarios = build_return_expectation(request.facts, [f.fact_id for f in request.facts],
+                                              request.profile, ComplianceStatus.PASS).scenarios
+        by_id = {f.fact_id: f for f in request.facts}
+        for result in results:
+            if result.agent_id != "security" or result.status in {TaskStatus.FAILED, TaskStatus.UNKNOWN}:
+                continue
+            entities = {by_id[fid].entity for fid in result.facts_used if fid in by_id}
+            extra_refs = [fid for scenario in scenarios if scenario.entity in entities for fid in scenario.evidence]
+            result.facts_used = list(dict.fromkeys([*result.facts_used, *extra_refs]))
         # 专业节点的最终状态必须回写到 DAG，前端才能区分完成、失败与降级。
         for node, result in zip(specialist_nodes, results, strict=True):
             node.status = result.status
@@ -366,6 +378,7 @@ class CoordinatorAgent:
                 risks=[compliance.reason or "触发合规拦截"],
                 risk_conclusion=build_risk_conclusion(compliance, cross_validation, results),
                 user_fit="不适配：请求未通过合规或适当性审核。",
+                return_expectation=build_return_expectation([], [], request.profile, compliance.status),
                 next_steps=["调整问题表述或补充已确认画像后重试"],
                 compliance=compliance,
                 task_plan=plan,
@@ -401,6 +414,7 @@ class CoordinatorAgent:
             risk_conclusion=build_risk_conclusion(compliance, cross_validation, results),
             user_fit=user_fit,
             allocation=allocation,
+            return_expectation=build_return_expectation(request.facts, evidence, request.profile, compliance.status),
             next_steps=next_steps,
             compliance=compliance,
             task_plan=plan,
@@ -544,6 +558,14 @@ class CoordinatorAgent:
             parts.append(f"投资经验 {profile.investment_experience_years:g} 年")
         if profile.expected_annual_return is not None:
             parts.append(f"期望年化收益 {profile.expected_annual_return:.1%}")
+        if profile.financial_capacity_label:
+            parts.append(f"财务承受能力 {profile.financial_capacity_label}")
+        if profile.financial_plan:
+            parts.append(f"规划目标 {profile.financial_plan.get('goal_label', '未提供')}")
+            parts.append(f"最早用款 {profile.financial_plan.get('goal_horizon_label', '未提供')}")
+            parts.append(f"近期必要支出 {profile.financial_plan.get('near_term_spending_label', '未提供')}")
+        if profile.financial_warnings:
+            parts.append("资金约束：" + "；".join(profile.financial_warnings))
         return "；".join(parts)
 
     @staticmethod
@@ -552,31 +574,13 @@ class CoordinatorAgent:
     ) -> list[dict[str, object]]:
         """按已确认风险等级输出资产类别区间，不生成具体交易指令。"""
 
-        ranges = {
-            "R1": ((0, 20), (60, 90), (10, 30)),
-            "R2": ((20, 40), (40, 70), (10, 25)),
-            "R3": ((40, 60), (25, 50), (5, 20)),
-            "R4": ((60, 80), (10, 30), (5, 15)),
-            "R5": ((75, 95), (0, 20), (0, 10)),
-        }
+        if not request.profile.confirmed:
+            return []
         for result in results:
-            if result.agent_id == "portfolio" and result.details:
-                profile_ranges = ranges.get(request.profile.risk_level or "", ranges["R3"])
-                if request.profile.preferred_product_types == ["固定收益类"]:
-                    profile_ranges = ((0, 0), (60, 90), (10, 40))
-                return [
-                    {
-                        "asset_class": name,
-                        "min_weight": lower / 100,
-                        "max_weight": upper / 100,
-                        "basis": f"已确认画像 {request.profile.risk_level or '未量化'}；仅作目标区间",
-                    }
-                    for name, (lower, upper) in zip(
-                        ("权益类", "固收类", "现金及低波动类"),
-                        profile_ranges,
-                        strict=True,
-                    )
-                ]
+            if (result.agent_id == "portfolio" and result.details and result.facts_used
+                    and result.status in {TaskStatus.COMPLETED, TaskStatus.DEGRADED}):
+                return [dict(row, evidence=list(result.facts_used))
+                        for row in allocation_for_profile(request.profile)]
         return []
 
     @staticmethod
@@ -770,6 +774,12 @@ def cross_validate_results(results: list[AgentResult], facts: list[FactRecord]) 
     labels = {"market": "市场", "industry": "行业", "security": "个股",
               "fund": "基金", "portfolio": "持仓"}
     for result in results:
+        if result.data_requirements:
+            issues.append(CrossValidationIssue(
+                code="AGENT_DATA_REQUIRED", severity="warning",
+                message=f"{labels.get(result.agent_id, '相关')}分析仍需补取必要资料并重新核验。",
+                agent_ids=[result.agent_id],
+            ))
         # 有引用只说明这些资料可核对，不代表缺失维度已经补齐。
         # 完全无引用的辅助节点不额外影响已有可用结论；其余证据闸门仍生效。
         if result.facts_used and result.status in {TaskStatus.DEGRADED, TaskStatus.UNKNOWN}:

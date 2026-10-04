@@ -130,6 +130,9 @@ class Provider:
         self.calls.append(("announcement", code))
         return await self.get_event_data(code)
 
+    async def get_governance_disclosures(self, code):
+        return await self.get_announcements(code)
+
     async def get_stock_risk_metrics(self, code):
         self.calls.append(("risk", code))
         return [self.fact("示例" + code, field, value, code=code, unit=unit) for field, value, unit in (
@@ -241,6 +244,44 @@ def test_risk_adapter_normalizes_percent_currency_and_industry_fields():
     assert by_field["avg_turnover_20d"].unit == "万元"
     assert by_field["industry"].value == "制造业"
     assert all(f.entity_code == "600001.SH" for f in facts)
+
+
+@pytest.mark.asyncio
+async def test_official_basic_information_retains_returned_industry_and_stock_scope():
+    def handler(req):
+        assert req.headers['x-claw-skill-id'] == 'hithink-basicinfo-query'
+        assert '所属同花顺三级行业' in req.content.decode()
+        return httpx.Response(200, json={'datas': [{'股票代码': '000429.SZ', '股票简称': '粤高速A',
+            '所属同花顺三级行业': '高速公路'}]})
+    provider = IwencaiSkillHubProvider('test-only', transport=httpx.MockTransport(handler))
+    try:
+        facts = await provider.get_basic_info('000429')
+        assert [(f.field, f.value, f.entity_code) for f in facts] == [('industry', '高速公路', '000429.SZ')]
+    finally:
+        await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_new_official_skill_auth_uses_configured_key_without_changing_other_skills(monkeypatch):
+    monkeypatch.setenv('IWENCAI_API_KEY', 'global-test-only')
+    monkeypatch.setenv('IWENCAI_BASICINFO_API_KEY', 'basic-test-only')
+    monkeypatch.setenv('IWENCAI_INDUSTRY_API_KEY', 'industry-test-only')
+    provider = IwencaiSkillHubProvider.from_env()
+    await provider._client.aclose()
+    captured = {}
+    def handler(req):
+        captured[req.headers['x-claw-skill-id']] = req.headers['authorization']
+        return httpx.Response(200, json={'datas': []})
+    provider._client = httpx.AsyncClient(base_url=provider.base_url, transport=httpx.MockTransport(handler))
+    try:
+        await provider.get_basic_info('000429')
+        await provider.get_industry_rank('高速公路')
+        await provider.get_financial_metrics('000429')
+        assert captured == {'hithink-basicinfo-query': 'Bearer basic-test-only',
+            'hithink-industry-query': 'Bearer industry-test-only',
+            'hithink-finance-query': 'Bearer global-test-only'}
+    finally:
+        await provider.aclose()
 
 
 @pytest.mark.asyncio
