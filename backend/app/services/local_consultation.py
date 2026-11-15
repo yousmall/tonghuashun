@@ -24,6 +24,7 @@ from backend.app.research_routing import DIRECTION_FOR_INTENT, user_question
 from backend.app.risk_questionnaire import assessment_is_current
 from backend.app.semantic import RequestUnderstanding
 from backend.app.services.research import AutomatedResearchPipeline
+from backend.app.services.context_link import carry_context_entity
 from backend.app.services.evidence_coverage import AGENT_FIELDS
 
 OMITTED = ["实时取数与资料补取", "复杂筛选与股票推荐", "收益预测", "多轮模型解读"]
@@ -197,11 +198,17 @@ class LocalConsultationService:
         valid_facts = [fact for fact in prepared.facts if fact.fact_id in allowed]
         # Scope asset and industry pages to the explicitly selected/requested entity.
         # Generic requests require one unambiguous entity.
+        carried: str | None = None
         if intent in {Intent.SECURITY_RESEARCH, Intent.CONVERTIBLE_BOND_ANALYSIS, Intent.FUND_SCREENING, Intent.INDUSTRY_ANALYSIS}:
             question = user_question(request.query)
             generic = question.strip(" 。？?！!") in {"概览", "资料概览", "已有资料概览", "行业概览", "查看已有资料", "分析当前标的", "分析当前股票", "分析这只股票", "分析当前基金", "分析当前转债", "分析当前行业"}
             lookup = request.research_target if generic and request.research_target else question
             matching = {f.entity for f in valid_facts if entity_mentioned(f, lookup)}
+            if not matching and not generic:
+                # 追问里省略了标的（例如「它的市净率呢」）时，沿用上一轮提到的标的。
+                carried = carry_context_entity(request, valid_facts)
+                if carried:
+                    matching = {carried}
             if generic:
                 relevant_fields = RAW_FIELDS[ROLES[intent][0]] | set(AGENT_FIELDS.get(ROLES[intent][0], ()))
                 candidates = matching if request.research_target else {f.entity for f in valid_facts if f.field in relevant_fields}
@@ -276,6 +283,8 @@ class LocalConsultationService:
         advice = self.coordinator._aggregate(prepared, plan, results, cross, compliance)
         conclusion = ("精简资料概要：\n\n" + "\n\n".join(result.opinion for result in results)
                       if results else "当前没有通过核验的相关资料，无法形成数据概要。请先加载资料，或选择深入研究。")
+        if results and carried:
+            conclusion = f"结合上一轮对话，本轮沿用标的：{carried}。\n\n{conclusion}"
         if compliance.status is ComplianceStatus.BLOCK:
             return simple("请求未通过风险检查，未生成投资建议。", compliance=compliance)
         # Return only cited evidence and its lineage/conflict records, not the full page cache.

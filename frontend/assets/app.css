@@ -234,6 +234,19 @@ hr, [data-testid="stDivider"] hr { border-color: var(--wence-line-soft); }
     border-color: #e6d4d6;
     box-shadow: 0 1px 2px rgba(120, 40, 55, .06), 0 6px 20px rgba(120, 40, 55, .05);
 }
+/* 热门板块：与上方资讯卡片同款白底、同款描边与阴影。 */
+.st-key-hot-sectors-box {
+    background: #ffffff !important;
+    border: 1px solid #e6d4d6 !important;
+    border-radius: 14px;
+    box-shadow: 0 1px 2px rgba(120, 40, 55, .06), 0 6px 20px rgba(120, 40, 55, .05);
+    padding: 18px 20px 10px !important;
+}
+.st-key-hot-sectors-box [data-testid="stVerticalBlockBorderWrapper"] > div {
+    background: #ffffff;
+    border: 0;
+    box-shadow: none;
+}
 [data-testid="stForm"] { padding: 1.35rem 1.45rem; }
 [data-testid="stChatMessage"] { padding: 1.2rem 1.3rem; border: 1px solid #e6d4d6; }
 [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {
@@ -335,6 +348,28 @@ button:focus-visible, input:focus-visible, textarea:focus-visible,
 }
 @media (max-width: 640px) {
     [data-testid="stChatInput"] { max-width: calc(100% - 1.5rem); }
+}
+/* 预设问题：与提问框同宽、同左边界对齐，并整体收小一号。 */
+[data-testid="stBottom"] [class*="st-key-preset_question_"] {
+    width: 100%;
+    max-width: min(calc(1180px - 7.3rem), calc(100% - 2.5rem));
+    margin: 0 auto .3rem;
+}
+[data-testid="stBottom"] [class*="st-key-preset_question_"] [data-testid="stWidgetLabel"] p {
+    font-size: .78rem;
+    color: var(--wence-faint);
+}
+[data-testid="stBottom"] [class*="st-key-preset_question_"] button {
+    min-height: 1.85rem;
+    padding: 0 .68rem;
+    font-size: .79rem;
+    border-radius: 999px;
+}
+@media (max-width: 900px) {
+    [data-testid="stBottom"] [class*="st-key-preset_question_"] { max-width: calc(100% - 2.9rem); }
+}
+@media (max-width: 640px) {
+    [data-testid="stBottom"] [class*="st-key-preset_question_"] { max-width: calc(100% - 1.5rem); }
 }
 
 /* 提示与徽标 */
@@ -697,7 +732,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible,
 }
 /* 投资偏好：所有问题和翻页操作放在同一边框内。 */
 .st-key-risk-assessment-box {
-    max-width: 860px; margin: 0 auto 24px; background: #fff;
+    max-width: 940px; margin: 0 auto 24px; background: #fff;
     border: 1px solid #d9dfe4 !important; border-radius: 14px; overflow: hidden;
     padding: 24px 30px !important;
 }
@@ -732,6 +767,18 @@ button:focus-visible, input:focus-visible, textarea:focus-visible,
 .risk-result-card dl > div { display:flex; flex-wrap:wrap; margin-bottom:16px; gap:6px; line-height:1.8; }
 .risk-result-card dt { color:#79838b; }
 .risk-result-card dd { margin:0; }
+.risk-result-body { display:flex; align-items:flex-start; gap:26px; }
+.risk-result-body .risk-result-main { flex:1 1 auto; min-width:0; }
+.risk-persona {
+    flex:0 0 340px; width:340px; aspect-ratio:1/1; margin:4px 26px 6px 0; border-radius:18px;
+    background-image:var(--persona-image); background-size:cover; background-position:center;
+    background-repeat:no-repeat; background-color:#fff;
+    border:1px solid #e3e6eb; box-shadow:0 12px 28px rgba(24,33,40,.14);
+}
+@media (max-width:900px) {
+    .risk-result-body { flex-direction:column; gap:16px; }
+    .risk-persona { flex:0 0 auto; width:min(100%, 380px); margin:0 0 8px; }
+}
 .st-key-risk_matching_rules button { color:#fa743b !important; text-align:left; border:0; background:transparent !important; }
 @media (max-width:640px) {
     .st-key-risk-assessment-box { padding:16px 14px !important; }

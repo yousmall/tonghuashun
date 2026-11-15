@@ -142,6 +142,8 @@ def test_login_form_prefetches_before_user_opens_investment_questions(monkeypatc
             return httpx.Response(200, json={"profile": {"confirmed": False}} if request.url.path.endswith("/profile") else [])
         data = json.loads(request.content)
         requests.append(data)
+        if data.get("kind") == "sector_screen":
+            return httpx.Response(200,json={"status":"empty","facts":[]})
         return httpx.Response(200, json=result(data["direction"], data["target"]))
 
     script = """
@@ -172,5 +174,10 @@ with patch.object(ui, 'api_request', side_effect=fake_api), patch.object(ui, 're
         assert len(requests) == 5
         next(button for button in app.button if button.label == "投资问答").click().run(timeout=15)
         assert not app.exception
-        assert len(requests) == 5
+        if "snapshot_hot_sectors_task" in app.session_state:
+            app.session_state["snapshot_hot_sectors_task"].result(timeout=5)
+        assert len([item for item in requests if "direction" in item]) == 5
+        assert len([item for item in requests if item.get("kind") == "sector_screen"]) == 1
+        app.run(timeout=15)
+        assert not app.exception and len(requests) == 6
         assert app.session_state["facts"] == []

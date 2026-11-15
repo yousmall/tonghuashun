@@ -1,15 +1,53 @@
 """单框、逐题的风险测评及证券式结果展示。"""
 from __future__ import annotations
 
+import base64
 from html import escape
+from pathlib import Path
 from typing import Callable
 
 import streamlit as st
+from streamlit.runtime import get_instance
 
 from backend.app.risk_questionnaire import (
     QUESTIONNAIRE_VERSION, QUESTIONS, RISK_NAMES, SCORING_NOTICE,
     answer_issues, assessment_is_current,
 )
+
+PERSONA_DIR = Path(__file__).resolve().parent / "assets" / "personas"
+PERSONA_FILES = {
+    1: "c1_conservative.jpg",
+    2: "c2_cautious.jpg",
+    3: "c3_steady.jpg",
+    4: "c4_active.jpg",
+    5: "c5_aggressive.jpg",
+}
+
+
+@st.cache_data(show_spinner=False, max_entries=5)
+def _persona_bytes(file_name: str) -> bytes:
+    """按文件名缓存画像原图，避免每轮重复读盘。"""
+
+    return (PERSONA_DIR / file_name).read_bytes()
+
+
+def _persona_uri(band: int) -> str:
+    """返回当前等级画像的图片地址；没有运行时环境时退回内联数据。"""
+
+    file_name = PERSONA_FILES.get(band)
+    if not file_name:
+        return ""
+    try:
+        data = _persona_bytes(file_name)
+    except OSError:
+        return ""
+    try:
+        runtime = get_instance()
+    except RuntimeError:
+        return "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")
+    uri = runtime.media_file_mgr.add(data, "image/jpeg", f"wence-persona-c{band}")
+    base_path = st.get_option("server.baseUrlPath").strip("/")
+    return f"/{base_path}{uri}" if base_path else uri
 
 
 def _remember_answer(question_id: str) -> None:
@@ -45,19 +83,30 @@ def _matching_rules() -> None:
 
 def result_html(profile: dict) -> str:
     band = int((profile.get("investor_category") or "C1")[1])
+    name = profile.get("risk_description") or RISK_NAMES[band - 1]
     steps = "<span class='risk-step-line'></span>".join(
         f"<span class='risk-step{' active' if i == band else ''}'>{i}</span>" for i in range(1, 6)
     )
     product_levels = "R1" if band == 1 else f"R1–R{band}"
+    persona_uri = _persona_uri(band)
+    persona = (
+        f"""<figure class="risk-persona" role="img" aria-label="{escape(name)}画像"
+        title="{escape(name)}画像" style='--persona-image: url("{persona_uri}")'></figure>"""
+    ) if persona_uri else ""
     return f"""<section class="risk-result-card">
-      <div class="risk-result-caption">您当前风险等级为</div>
-      <h2>{escape(profile.get('risk_description') or RISK_NAMES[band - 1])}</h2>
-      <div class="risk-result-category">{escape(profile.get('investor_category') or '')}</div>
-      <div class="risk-result-steps">{steps}</div>
-      <div class="risk-result-validity">有效期至 {escape(str(profile.get('valid_until') or '待确认'))}</div>
-      <dl><div><dt>适合投资风险等级为：</dt><dd>{product_levels}的产品或服务</dd></div>
-      <div><dt>拟投资的品种为：</dt><dd>{escape('，'.join(profile.get('preferred_product_types') or []))}</dd></div>
-      <div><dt>拟投资的期限为：</dt><dd>{escape(profile.get('investment_horizon_label') or '待填写')}</dd></div></dl>
+      <div class="risk-result-body">
+        <div class="risk-result-main">
+          <div class="risk-result-caption">您当前风险等级为</div>
+          <h2>{escape(name)}</h2>
+          <div class="risk-result-category">{escape(profile.get('investor_category') or '')}</div>
+          <div class="risk-result-steps">{steps}</div>
+          <div class="risk-result-validity">有效期至 {escape(str(profile.get('valid_until') or '待确认'))}</div>
+          <dl><div><dt>适合投资风险等级为：</dt><dd>{product_levels}的产品或服务</dd></div>
+          <div><dt>拟投资的品种为：</dt><dd>{escape('，'.join(profile.get('preferred_product_types') or []))}</dd></div>
+          <div><dt>拟投资的期限为：</dt><dd>{escape(profile.get('investment_horizon_label') or '待填写')}</dd></div></dl>
+        </div>
+        {persona}
+      </div>
     </section>"""
 
 

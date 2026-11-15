@@ -1047,6 +1047,111 @@ RESEARCH_GUIDES = {
 }
 
 
+PRESET_QUESTIONS = {
+    "市场解读": (
+        "今天主要指数的涨跌和量能怎么样",
+        "哪些板块在走强、哪些在走弱",
+        "当前市场的主要风险点是什么",
+    ),
+    "行业分析": (
+        "{target}行业的景气度和资金流向如何",
+        "行业内哪些公司更抗跌、估值更合理",
+        "这个行业当前的主要风险是什么",
+    ),
+    "个股研究": (
+        "{target}的估值和主要风险",
+        "最近的财报和经营数据有什么变化",
+        "主力资金和机构观点怎么样",
+    ),
+    "基金筛选": (
+        "低费率的宽基 ETF 有哪些值得关注",
+        "近一年收益靠前的基金有哪些",
+        "怎么比较和筛选这几只基金",
+    ),
+    "可转债分析": (
+        "这只可转债的转股溢价率算高吗",
+        "到期收益率和纯债溢价率是多少",
+        "正股走势对这只转债影响多大",
+    ),
+}
+
+
+def _asked_presets(direction: str) -> set[str]:
+    """已经问过的预设问题：既看当前会话的用户消息，也看本次点击记录。
+
+    以会话内容为准，刷新页面后只要对话还在，问过的问题依旧不会再出现。
+    """
+
+    prefix = RESEARCH_PREFIX.get(direction, "")
+    asked = {
+        str(turn.get("content") or "").removeprefix(prefix).strip()
+        for turn in (st.session_state.get("conversation") or [])
+        if turn.get("role") == "user"
+    }
+    scope = (direction, st.session_state.get("conversation_id"))
+    asked.update((st.session_state.get("preset_asked") or {}).get(scope) or [])
+    asked.discard("")
+    return asked
+
+
+def _remember_preset(direction: str, text: str) -> None:
+    """只有确实属于预设列表的问题才记录，避免把自由提问也当成“问过”。"""
+
+    if not text or text not in preset_questions(direction):
+        return
+    asked = dict(st.session_state.get("preset_asked") or {})
+    scope = (direction, st.session_state.get("conversation_id"))
+    current = list(asked.get(scope) or [])
+    if text not in current:
+        current.append(text)
+    asked[scope] = current
+    while len(asked) > 50:
+        asked.pop(next(iter(asked)))
+    st.session_state.preset_asked = asked
+
+
+def preset_questions(direction: str) -> list[str]:
+    """按本页方向与已选标的生成 2–3 个还没问过的预设问题。"""
+
+    target = selected_research_target(direction)
+    asked = _asked_presets(direction)
+    questions: list[str] = []
+    for template in PRESET_QUESTIONS.get(direction, ()):
+        if "{target}" in template:
+            if not target:
+                continue
+            text = template.format(target=target)
+        else:
+            text = template
+        if text not in asked:
+            questions.append(text)
+    return questions[:3]
+
+
+def _send_preset(api_base: str, direction: str, widget_key: str) -> None:
+    """点击预设问题后标记为已问过并清空选中状态，按正常提问流程提交。"""
+
+    text = st.session_state.get(widget_key)
+    if not text:
+        return
+    st.session_state[widget_key] = None
+    _remember_preset(direction, str(text))
+    submit_chat_analysis(api_base, direction, RESEARCH_PREFIX[direction] + str(text))
+
+
+def render_preset_questions(api_base: str, direction: str) -> None:
+    """提问框上方给几个与本页相关的预设问题，点一下直接发送。"""
+
+    if not profile_ready() or direction in st.session_state.get("analysis_jobs", {}):
+        return
+    questions = preset_questions(direction)
+    if not questions:
+        return
+    widget_key = f"preset_question_{direction}"
+    st.pills("试试这样问", questions, key=widget_key, on_change=_send_preset,
+             args=(api_base, direction, widget_key), width="stretch")
+
+
 def render_research_guide(direction: str) -> None:
     data_step, example = RESEARCH_GUIDES[direction]
     with st.expander(f"操作指南 · {direction}", icon=":material/help_outline:"):
@@ -1087,6 +1192,11 @@ def render_research_page(api_base: str, direction: str) -> None:
     if direction == "行业分析":
         from frontend.industry_collaboration import render_industry_collaboration
         render_industry_collaboration(api_base, ready=profile_ready(), submit=submit_chat_analysis)
+    # 市场解读在「相关资讯」之后补一块热门板块观察，位置在页底「研究模式」之上。
+    if direction == "市场解读":
+        from frontend.hot_sectors import render_hot_sectors
+        render_hot_sectors(api_base, api_request,
+            factory=snapshot_fetch_factory(backend_http_client(api_base), st.session_state.get("auth_token")))
     if not profile_ready():
         st.info("请先确认投资偏好，再开始分析。", icon=":material/person_edit:")
         st.button("进行风险评估", type="primary", on_click=go_to, args=("风险评估",))
@@ -1151,10 +1261,17 @@ def render_research_page(api_base: str, direction: str) -> None:
         st.caption("使用已加载资料，3秒内给出证据概要；需要补查资料和完整核验请选择深度思考。")
     else:
         st.caption("在线补查资料并完成分析与审核；不设整次研究的总时限，进度会持续显示。")
+    # 预设问题放进底部容器，紧贴在提问框上方，不随内容滚动。
+    if hasattr(st, "bottom"):
+        with st.bottom:
+            render_preset_questions(api_base, direction)
+    else:
+        render_preset_questions(api_base, direction)
     query = st.chat_input(QUICK_ASK_PROMPTS[direction], key=f"research_chat_{direction}",
                           disabled=not profile_ready() or direction in st.session_state.get("analysis_jobs", {}),
                           width="stretch")
     if query and query.strip():
+        _remember_preset(direction, query.strip())
         submit_chat_analysis(api_base, direction, RESEARCH_PREFIX[direction] + query.strip())
         st.rerun()
     if direction in st.session_state.get("analysis_jobs", {}):
@@ -1748,11 +1865,11 @@ def reset_user_session() -> None:
         "research_results", "market_query_result", "data_selected", "auth_notice",
         "recent_conversations", "recent_conversations_loaded_at", "history_detail_cache",
         "history_before_id", "history_offset", "history_last_search", "history_search",
-        "analysis_jobs", "analysis_notice", "industry_trend_cache", "fund_analytics_results",
+        "analysis_jobs", "analysis_notice", "industry_trend_cache", "fund_analytics_results", "preset_asked", "hot_sector_cache",
     ):
         st.session_state.pop(key, None)
     for key in list(st.session_state):
-        if key.startswith(("manual_review_", "trade_profile_", "risk_score_", "risk_answer_", "automatic_plan_", "research_chat_", "industry_collaboration_", "board_target_", "board_refresh_", "board_poll_", "board_favorite_", "board_saved_", "fund_analytics_", "admin_")) or key == "profile_narrative":
+        if key.startswith(("manual_review_", "trade_profile_", "risk_score_", "risk_answer_", "automatic_plan_", "research_chat_", "preset_question_", "industry_collaboration_", "board_target_", "board_refresh_", "board_poll_", "board_favorite_", "board_saved_", "fund_analytics_", "admin_")) or key == "profile_narrative":
             st.session_state.pop(key, None)
     st.session_state.conversation_id = str(uuid.uuid4())
     # 账号标识只来自服务端令牌，浏览器状态里不保存用户 id。
@@ -2055,6 +2172,7 @@ def new_conversation() -> None:
     st.session_state.conversation_id = str(uuid.uuid4())
     st.session_state.history_before_id = None
     st.session_state.history_view = False
+    # 预设记录以conversation_id分隔，新对话自然恢复预设，不影响其他方向。
     st.session_state.navigation = "投资问答"
     save_research_session()
 

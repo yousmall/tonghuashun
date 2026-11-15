@@ -26,6 +26,18 @@ BENCHMARK = "沪深300"
 HISTORY_LIMIT = 30
 
 
+def _public_error(error: BaseException) -> str:
+    """保留额度/鉴权/超时原因，不把原始异常里的请求详情带到页面。"""
+    messages = {
+        "PROVIDER_QUOTA_EXHAUSTED":"问财当前技能的查询额度已用完，额度恢复后可继续查询。",
+        "AUTHENTICATION_REJECTED":"问财密钥无效或已失效，请检查数据源配置。",
+        "CAPABILITY_FORBIDDEN":"当前数据源未开通所需查询权限。",
+    }
+    if getattr(error,"code",None) in messages:
+        return messages[error.code]
+    return "指数数据查询超时，请稍后刷新。" if isinstance(error,TimeoutError) else "指数数据源暂不可用，请稍后刷新。"
+
+
 def _number(value: Any) -> float | None:
     if isinstance(value, bool):
         return None
@@ -79,19 +91,25 @@ async def fetch_index_board(provider: Any, *, limit: int = HISTORY_LIMIT) -> Ind
                                   message="数据源尚未配置") for name, code in INDEXES],
         )
     names = "、".join(name for name, _ in INDEXES)
+    # 失败原因要如实回传给页面：额度用完、密钥无效和“真的没有数据”不是一回事。
+    quote_error: str | None = None
     try:
         quotes = await asyncio.wait_for(provider.query(
             f"{names}的指数简称、指数代码、最新价、涨跌幅、成交额", limit=len(INDEXES)), timeout=26)
-    except (RuntimeError, TimeoutError, ValueError):
+    except (RuntimeError, TimeoutError, ValueError) as exc:
         quotes = []
+        quote_error = _public_error(exc)
     semaphore = asyncio.Semaphore(4)
     results = await asyncio.gather(
         *(_load_history(provider, name, semaphore) for name, _ in INDEXES),
         return_exceptions=True,
     )
     series: dict[str, Any] = {}
+    history_errors = {}
     for (name, _code), result in zip(INDEXES, results):
         if isinstance(result, BaseException) or not result:
+            if isinstance(result, BaseException):
+                history_errors[name] = _public_error(result)
             continue
         cleaned = close_series([(getattr(fact, "period", None), getattr(fact, "value", None))
                                 for fact in result])
@@ -130,11 +148,13 @@ async def fetch_index_board(provider: Any, *, limit: int = HISTORY_LIMIT) -> Ind
             analysis=analysis,
             points=[round(value, 4) for _, value in cleaned.points] if cleaned else [],
             dates=[day for day, _ in cleaned.points] if cleaned else [],
-            message=None if available else "问财本次未返回带日期的历史点位。",
+            message=None if available else (history_errors.get(name) or "问财本次未返回带日期的历史点位。"),
         )
         items.append(item)
         if not available:
-            notes.append(f"{name}的历史点位暂未取得，未给出走势判断。")
+            notes.append(f"{name}的历史点位暂未取得，未给出走势判断。" + history_errors.get(name,""))
+    if quote_error:
+        notes.append(f"本次指数行情未取得：{quote_error}")
     ok = sum(item.status == "ok" for item in items)
     status = "ok" if ok == len(items) else "partial" if ok or quotes or series else "unavailable"
     if series and not quotes:
