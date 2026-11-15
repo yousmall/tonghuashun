@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from contextvars import ContextVar
 from collections.abc import Callable
@@ -30,6 +31,7 @@ from backend.app.services.trend_analytics import analyze_trend
 from backend.app.services.research_recovery import recover_research
 from backend.app.services.stock_recommendation import STOCK_RECOMMENDATION_TIMEOUT_SECONDS, StockRecommendationService
 from backend.app.services.automatic_consultation import run_automatic, source_item
+from backend.app.services.automatic_planning import AutomaticPlanningRequest, build_automatic_planning
 from backend.app.services.prepared_research import (PreparedResearchCache, PreparedResearchRequest, board_signature, report_is_ready, task_query)
 from backend.app.services.research_admission import ResearchAdmission
 from backend.app.services.research_cache import ResearchFactCache
@@ -96,12 +98,14 @@ from backend.app.models.schemas import (
     ComparisonRequest,
     ComparisonResponse,
     SnapshotOptions,
+    WatchlistQuotesRequest,
     GroundingCheckRequest,
     PortfolioPlanRequest,
 )
 from backend.app.services.comparison import fetch_snapshots
 from backend.app.models.index_board import IndexBoardResponse
-from backend.app.services.security_names import resolve_security_name
+from backend.app.services.security_names import resolve_security_identity
+from backend.app.services.fund_analytics import FundAnalyticsRequest, fetch_fund_analytics
 from backend.app.services.research_report import research_report_markdown
 from backend.app.risk_questionnaire import assessment_is_current
 from backend.app.models.trade_history import TradeHistoryUpload
@@ -662,17 +666,26 @@ async def add_watchlist_item(
 ) -> WatchlistItem:
     """新增自选标的，并尽力把代码补全为数据源核实的证券简称。"""
 
+    existing = await asyncio.to_thread(database.list_watchlist, int(user["id"]))
+    if any(item["asset_type"] == request.asset_type and
+           str(item["target"]).upper() == request.target.upper() for item in existing):
+        raise HTTPException(status_code=409, detail="该标的已在自选中")
+    identity = await resolve_security_identity(data_provider, request.target, request.asset_type)
+    target = request.target
+    name = identity[0] if identity else None
+    if identity and not re.fullmatch(r"\d{5,6}(?:\.[A-Za-z]{2})?", target):
+        target = identity[1]
+    # 同代码的名称输入与代码输入共用一个自选项。
+    if any(item["asset_type"] == request.asset_type and
+           str(item["target"]).upper().split(".")[0] == target.upper().split(".")[0] for item in existing):
+        raise HTTPException(status_code=409, detail="该标的已在自选中")
     try:
         row = await asyncio.to_thread(
-            database.add_watchlist_item, int(user["id"]), request.target, request.asset_type)
+            database.add_watchlist_item, int(user["id"]), target, request.asset_type, name)
     except WatchlistItemExists as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except WatchlistCapacityExceeded as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    name = await resolve_security_name(data_provider, request.target, request.asset_type)
-    if name and await asyncio.to_thread(
-            database.set_watchlist_name, int(user["id"]), int(row["id"]), name):
-        row = {**row, "name": name}
     return WatchlistItem.model_validate(row)
 
 
@@ -777,6 +790,12 @@ async def research_data_overview(
     return result
 
 
+@app.post("/api/v1/data/fund-analytics", tags=["data"])
+async def fund_analytics(request: FundAnalyticsRequest, user: dict[str, object] = Depends(customer_user)):
+    """统一窗口与参数的长期复利观察，不生成个性化投资建议。"""
+    return await fetch_fund_analytics(overview_cache, data_provider, request)
+
+
 @app.post("/api/v1/data/compare", response_model=ComparisonResponse, tags=["data"])
 async def compare_data(request: ComparisonRequest, user: dict[str, object] = Depends(customer_user)):
     return await fetch_snapshots(overview_cache, data_provider,
@@ -785,8 +804,15 @@ async def compare_data(request: ComparisonRequest, user: dict[str, object] = Dep
 
 
 @app.post("/api/v1/data/watchlist-quotes", response_model=ComparisonResponse, tags=["data"])
-async def watchlist_quotes(request: SnapshotOptions, user: dict[str, object] = Depends(customer_user)):
-    items = database.list_watchlist(int(user["id"]))[:20]
+async def watchlist_quotes(request: WatchlistQuotesRequest, user: dict[str, object] = Depends(customer_user)):
+    items = await asyncio.to_thread(database.list_watchlist, int(user["id"]))
+    if request.ids is None:
+        items = items[:20]  # 兼容旧客户端；分页客户端显式提交当前页ID。
+    else:
+        owned = {int(item["id"]): item for item in items}
+        if not set(request.ids) <= owned.keys():
+            raise HTTPException(status_code=404, detail="部分自选标的已移除，请刷新自选列表。")
+        items = [owned[item_id] for item_id in request.ids]
     result = await fetch_snapshots(overview_cache, data_provider,
         [(item["target"], item["asset_type"], item["id"]) for item in items], wait=request.wait, refresh=request.refresh)
     # 界面优先显示数据源核实名称；取不到时用添加自选时保存的名称。
@@ -966,6 +992,27 @@ async def _trade_file_task(user, function, *args):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+@app.post("/api/v1/profile/auto-plan", tags=["profile"])
+async def automatically_plan_profile(request: AutomaticPlanningRequest, user: dict[str, object] = Depends(customer_user)):
+    """只读规划预览；画像归属由账号决定，不生成未答题的答案或修改确认状态。"""
+    from backend.app.risk_questionnaire import QUESTIONNAIRE_VERSION, QUESTIONS, answer_issues, evaluate_answers
+    stored = await _trade_file_task(user, database.get_profile, int(user["id"]))
+    profile = dict(stored["payload"]) if stored else {}
+    if request.risk_answers is not None:
+        if request.questionnaire_version != QUESTIONNAIRE_VERSION:
+            raise HTTPException(status_code=422, detail="问卷版本已更新，请刷新后重新识别。")
+        issues = answer_issues(request.risk_answers)
+        if issues:
+            raise HTTPException(status_code=422, detail="；".join(issues))
+        # 编辑中的问卷不继承旧结果的风险等级或确认状态。
+        profile = {}
+        if len(request.risk_answers) == len(QUESTIONS):
+            profile = evaluate_answers(request.risk_answers)
+    elif request.questionnaire_version is not None:
+        raise HTTPException(status_code=422, detail="请同时提交问卷答案。")
+    return build_automatic_planning(profile, narrative=request.narrative, risk_answers=request.risk_answers)
+
+
 @app.post("/api/v1/profile/trades/inspect", tags=["profile"])
 async def inspect_user_trades(request: TradeHistoryUpload, user: dict[str, object] = Depends(customer_user)):
     return await _trade_file_task(user, inspect_trade_workbook, request)
@@ -1054,6 +1101,7 @@ def read_user_profile(user: dict[str, object] = Depends(customer_user)) -> Profi
     if not stored:
         return ProfileAssessment(profile=UserProfile(user_id=str(user["id"])), evidence=[])
     profile = UserProfile.model_validate({**stored["payload"], "user_id": str(user["id"])})
+    profile = profile.model_copy(update={"automatic_planning": build_automatic_planning(profile.model_dump(mode="json"))})
     return ProfileAssessment(
         profile=profile,
         evidence=["已从上次保存的投资偏好恢复，如情况有变化请重新评估。"],

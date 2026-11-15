@@ -5,10 +5,11 @@ import re
 from backend.app.models.schemas import DataOverviewRequest, ComparisonItem, ComparisonResponse
 from backend.app.services.investment_decision import build_decision
 
-DIRECTIONS = {"股票": "stock", "基金": "fund", "可转债": "convertible", "行业": "industry"}
+DIRECTIONS = {"股票": "stock", "基金": "fund", "可转债": "convertible", "行业": "industry", "指数": "market"}
 FIELDS = {
+    "指数": "指数简称、指数代码、最新价、涨跌幅、成交额",
     "股票": "股票简称、股票代码、最新价、涨跌幅、市盈率TTM、市净率、所属行业、净资产收益率、营收同比增长、净利润同比增长",
-    "基金": "基金简称、基金代码、单位净值、净值涨跌幅、基金规模、管理费率、基金经理、跟踪误差",
+    "基金": "基金简称、基金代码、单位净值、净值涨跌幅、七日年化收益率、每万份收益、基金规模、管理费率、基金经理、跟踪误差",
     "可转债": "可转债简称、可转债代码、最新价、涨跌幅、转股溢价率、纯债溢价率、到期收益率、剩余规模、债券评级",
     "行业": "板块简称、板块代码、涨跌幅、市盈率、成交额、主力资金净流入",
 }
@@ -50,7 +51,13 @@ async def fetch_snapshots(cache, provider, targets, *, wait=True, refresh=False,
             entity=facts[0].entity if facts else None, entity_code=next(iter(codes)) if len(codes) == 1 and facts else None,
             display_name=facts[0].entity if facts else None,
             facts=facts[:80], fetched_at=result.fetched_at, message=message)
-    items = await asyncio.gather(*(load(*target) for target in targets))
+    # 50条自选行情可能触发100个行情/财务栏目任务。分批等待，避免单页
+    # 请求瞬间占满公共缓存的待处理上限，导致后半页永远没有数据。
+    slots = asyncio.Semaphore(8)
+    async def bounded_load(target):
+        async with slots:
+            return await load(*target)
+    items = await asyncio.gather(*(bounded_load(target) for target in targets))
     identities = set()
     for item in items:
         if item.entity_code and item.entity_code in identities:

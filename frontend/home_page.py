@@ -5,6 +5,11 @@ from frontend.research_board import load_board, section_facts, entity_rows, form
 from streamlit.runtime.scriptrunner import get_script_run_ctx
 
 
+def watchlist_count_label(count: int) -> str:
+    """关注数量按真实条数分档；准确总数另在指标提示和自选列表展示。"""
+    return "50+" if count >= 50 else "30+" if count >= 30 else str(count)
+
+
 def render_guide():
     steps = [
         ("01 · 完成风险评估", "打开左侧“风险评估”，填写资金用途、投资期限、可接受亏损、资金使用需求和投资经历。"),
@@ -68,7 +73,10 @@ def render_home(api_base, *, ready, header, go_to, recent, fetch, resume):
             st.button("查看我的自选", icon=":material/star:", on_click=go_to, args=("自选研究",))
             st.button("检查持仓风险", icon=":material/pie_chart:", on_click=go_to, args=("持仓分析",))
         with st.container(horizontal=True):
-            st.metric("关注标的", str(len(st.session_state.get("watchlist", []))) if st.session_state.get("watchlist_loaded") or st.session_state.get("watchlist") else "未取得", border=True)
+            count = len(st.session_state.get("watchlist", []))
+            loaded = st.session_state.get("watchlist_loaded") or count > 0
+            st.metric("关注标的", watchlist_count_label(count) if loaded else "未取得", border=True,
+                      help=f"实际关注{count}个标的，可在自选研究中分页查看。" if loaded else "正在读取当前账号的自选列表。")
             st.metric("研究方向", st.session_state.get("active_research_direction", QUICK_ASKS[0]), border=True)
             st.metric("投资风格", display_value("risk_level", st.session_state.profile.get("risk_level")), border=True)
         advice = st.session_state.get("advice") or {}

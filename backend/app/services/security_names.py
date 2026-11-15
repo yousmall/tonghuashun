@@ -11,6 +11,7 @@ import re
 from typing import Any
 
 QUERY_FIELDS = {
+    "指数": ("hithink-market-query", "指数简称、指数代码"),
     "股票": ("hithink-market-query", "股票简称、股票代码"),
     "基金": ("hithink-fund-query", "基金简称、基金代码"),
     "可转债": ("hithink-market-query", "可转债简称、可转债代码"),
@@ -55,6 +56,12 @@ def security_name(facts: list[Any], target: str) -> str | None:
 async def resolve_security_name(provider: Any, target: str, asset_type: str) -> str | None:
     """尽力解析名称；数据源未配置、超时或身份不符时返回 ``None``。"""
 
+    identity = await resolve_security_identity(provider, target, asset_type)
+    return identity[0] if identity else None
+
+
+async def resolve_security_identity(provider: Any, target: str, asset_type: str) -> tuple[str, str] | None:
+    """仅接受唯一的名称和代码组合；名称查询保存代码，便于跨页面再次打开。"""
     if provider is None or asset_type not in QUERY_FIELDS:
         return None
     skill, fields = QUERY_FIELDS[asset_type]
@@ -66,6 +73,7 @@ async def resolve_security_name(provider: Any, target: str, asset_type: str) -> 
     except (RuntimeError, TimeoutError, ValueError):
         # 名称只是展示优化：数据源不可用时保留原始输入，不阻断添加自选。
         return None
-    names = [security_name([fact], target) for fact in facts]
-    unique = list(dict.fromkeys(name for name in names if name))
+    identities = [(security_name([fact], target), str(fact.entity_code or "").upper()) for fact in facts]
+    unique = list(dict.fromkeys((name, code) for name, code in identities
+                               if name and re.fullmatch(r"\d{5,6}(?:\.[A-Z]{2})?", code)))
     return unique[0] if len(unique) == 1 else None

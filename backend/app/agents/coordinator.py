@@ -151,6 +151,9 @@ class CoordinatorAgent:
 
         # 根据意图只选择必要专业能力，避免无关调用增加时延、成本和信息噪声。
         specialist_ids = self._specialists_for(intent)
+        if request.industry_collaboration and intent is Intent.INDUSTRY_ANALYSIS:
+            # 证券节点同时覆盖个股与可转债，保留已有职责与事实核验约束。
+            specialist_ids = ("market", "industry", "security", "fund")
         nodes = [
             TaskNode(
                 # task_id 是 DAG 的依赖键；agent_id 是注册表中真正的执行器名称。

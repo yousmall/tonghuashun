@@ -13,6 +13,7 @@ from frontend.presentation import WATCHLIST_RESEARCH_PREFIX, RESEARCH_PREFIX, fa
 from frontend.research_board import entity_rows, format_fact, data_period
 from frontend.snapshots import poll_snapshot, clear_snapshot
 from frontend.result_views import render_advice, render_answer_charts
+from backend.app.watchlist_policy import WATCHLIST_CAPACITY, WATCHLIST_PAGE_SIZES
 
 
 def quote_rows(items, snapshot):
@@ -24,13 +25,18 @@ def quote_rows(items, snapshot):
         entities = entity_rows(facts)
         fields = entities[0]["fields"] if entities else {}
         primary = fields.get("fund_nav") if item.get("asset_type") == "基金" else fields.get("close_price")
+        money_quote = fields.get("yield_7d") or fields.get("income_per_10000")
         # 名称优先用数据源核实结果，其次用添加自选时保存的名称，最后才回退到用户输入。
         name = quote.get("display_name") or item.get("name") or (entities[0]["name"] if entities else None) or item["target"]
         code = quote.get("entity_code") or (
             item["target"] if re.fullmatch(r"\d{5,6}(\.\w{2})?", str(item["target"]).strip()) else "未提供")
         row = {"名称": name, "代码": code, "类型": item.get("asset_type", "股票"), "标的": item["target"],
             "价格 / 净值": format_fact(primary), "涨跌幅": format_fact(fields.get("change") or fields.get("nav_change")),
-            "数据日期": data_period(primary), "状态": "更新中" if quote.get("status") == "loading" else "可查看" if primary else "暂无行情"}
+            "数据日期": data_period(primary or money_quote), "状态": "更新中" if quote.get("status") == "loading" else "可查看" if primary or money_quote else "暂无行情"}
+        if money_quote:
+            row.update({"七日年化":format_fact(fields.get("yield_7d")),
+                        "每万份收益":format_fact(fields.get("income_per_10000")),
+                        "万份收益日期":data_period(fields.get("income_per_10000"))})
         rows.append(row)
     return rows
 
@@ -57,9 +63,9 @@ def _item_label(item: dict) -> str:
 
 
 def quote_table(api_base, items, factory):
-    signature = tuple((item["id"], item["target"], item.get("asset_type")) for item in st.session_state.get("watchlist", items))
+    signature = tuple((item["id"], item["target"], item.get("asset_type")) for item in items)
     refresh = st.button("刷新自选行情", icon=":material/refresh:", key="watchlist_quote_refresh")
-    fetch = factory(api_base, "/data/watchlist-quotes", {"wait": True})
+    fetch = factory(api_base, "/data/watchlist-quotes", {"wait": True, "ids": [int(item["id"]) for item in items]})
     result = poll_snapshot("watchlist_quotes", signature, fetch, refresh=refresh)
     if result.get("status") == "loading" or result.get("refreshing"):
         st.caption("行情正在后台更新，可先选择标的或发起研究。刷新期间显示的数据请以标注日期为准。")
@@ -67,8 +73,34 @@ def quote_table(api_base, items, factory):
     st.caption("同花顺问财 · 点击列标题可排序 · 日期未提供的数据不能视为最新行情。")
     if result.get("status") == "loading" or result.get("refreshing"):
         _wait_quotes(signature, fetch)
-    if len(items) > 20:
-        st.caption("当前自动更新最近加入的 20 个标的，其余标的可在详情中单独研究。")
+
+
+def _reset_watchlist_page():
+    st.session_state.watchlist_page_number = 1
+
+
+def _move_watchlist_page(offset):
+    st.session_state.watchlist_page_number += offset
+
+
+def watchlist_page(items):
+    """搜索后的列表分页；筛选/页长变化回首页，删除末页时自动回到有效页。"""
+    page_size = st.selectbox("每页显示", WATCHLIST_PAGE_SIZES, index=1,
+        format_func=lambda value: f"{value}条", key="watchlist_page_size",
+        on_change=_reset_watchlist_page, persist_state="session")
+    page_count = max(1, (len(items)+page_size-1)//page_size)
+    current = min(page_count, max(1, st.session_state.get("watchlist_page_number", 1)))
+    st.session_state.watchlist_page_number = current
+    with st.container(horizontal=True, vertical_alignment="bottom"):
+        st.button("上一页", key="watchlist_page_previous", disabled=current == 1,
+                  on_click=_move_watchlist_page, args=(-1,))
+        st.selectbox("跳转页码", range(1, page_count+1), key="watchlist_page_number",
+                     format_func=lambda value: f"第{value}页", persist_state="session")
+        st.button("下一页", key="watchlist_page_next", disabled=current == page_count,
+                  on_click=_move_watchlist_page, args=(1,))
+    start = (current-1)*page_size
+    st.caption(f"共{len(items)}个标的 · 第{current}/{page_count}页 · 显示第{start+1}–{min(start+page_size,len(items))}个")
+    return items[start:start+page_size]
 
 
 def comparison_result(api_base, actions):
@@ -155,6 +187,7 @@ def render_watchlist(api_base, actions):
     st.title("自选研究")
     actions["header"]("自选 · 关注与对比研究")
     st.caption("查看关注标的的行情、走势与风险，或选择同类型标的进行对比。")
+    st.caption(f"自选最多保存{WATCHLIST_CAPACITY}个标的，支持30、50及更多标的分页查看。")
     items = st.session_state.get("watchlist", [])
     with st.expander("添加自选标的", expanded=not items, icon=":material/star:"):
         with st.form("watchlist_add", border=False):
@@ -164,11 +197,12 @@ def render_watchlist(api_base, actions):
                 submitted = st.form_submit_button("加入自选", type="primary", icon=":material/star:")
         if submitted:
             if not target.strip():
-                st.warning("请输入股票、基金、行业或可转债的名称或代码。")
+                st.warning("请输入股票、基金、行业、可转债或指数的名称或代码。")
             else:
                 result = actions["api"](api_base, "POST", "/watchlist", {"target": target.strip(), "asset_type": asset_type})
                 if isinstance(result, dict) and result.get("id") is not None:
                     st.session_state.watchlist = [result, *[item for item in items if item.get("id") != result["id"]]]
+                    _reset_watchlist_page()
                     st.toast("已加入自选", icon=":material/check_circle:")
                     items = st.session_state.watchlist
     if not items:
@@ -176,12 +210,17 @@ def render_watchlist(api_base, actions):
         return
     st.subheader(f"我的自选 · {len(items)}")
     with st.container(horizontal=True):
-        search = st.text_input("搜索自选", placeholder="按名称或代码查找", icon=":material/search:")
-        asset_filter = st.selectbox("筛选类型", ["全部", *dict.fromkeys(item.get("asset_type", "股票") for item in items)])
-    visible = [item for item in items if search.strip().casefold() in str(item.get("target", "")).casefold() and (asset_filter == "全部" or item.get("asset_type", "股票") == asset_filter)]
+        search = st.text_input("搜索自选", placeholder="按名称或代码查找", icon=":material/search:",
+                               key="watchlist_search", on_change=_reset_watchlist_page)
+        asset_filter = st.selectbox("筛选类型", ["全部", *dict.fromkeys(item.get("asset_type", "股票") for item in items)],
+                                    key="watchlist_filter", on_change=_reset_watchlist_page)
+    visible = [item for item in items if search.strip().casefold() in
+               (str(item.get("target", "")) + " " + str(item.get("name") or "")).casefold()
+               and (asset_filter == "全部" or item.get("asset_type", "股票") == asset_filter)]
     if not visible:
         st.info("没有找到匹配的自选标的，可以调整搜索词或类型。")
     else:
+        visible = watchlist_page(visible)
         quote_table(api_base, visible, actions["factory"])
         lookup = {int(item["id"]): item for item in visible}
         previous = st.session_state.get("watchlist_focus")
@@ -227,7 +266,7 @@ def render_watchlist(api_base, actions):
             if not 2 <= len(selected) <= 4:
                 st.warning("请选择 2–4 个标的进行比较。")
             elif len({item.get("asset_type", "股票") for item in selected}) != 1:
-                st.warning("横向比较需选择相同类型的标的，请分别比较股票、基金或可转债。")
+                st.warning("横向比较需选择相同类型的标的，请按股票、基金、行业、可转债或指数分别比较。")
             else:
                 clear_snapshot("comparison")
                 st.session_state.pop("watchlist_comparison_advice", None)

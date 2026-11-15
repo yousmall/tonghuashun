@@ -50,6 +50,7 @@ class CaptureExecutor:
         st.session_state.sent_payload = args[5]
         return Future()
 with patch.object(ui, 'analysis_executor', return_value=CaptureExecutor()), \\
+     patch.object(ui, 'preview_executor', return_value=CaptureExecutor()), \\
      patch.object(ui, 'backend_http_client', return_value=object()):
     ui.submit_chat_analysis('http://localhost', '基金筛选', '基金筛选：筛选沪深A股')
 """).run(timeout=15)

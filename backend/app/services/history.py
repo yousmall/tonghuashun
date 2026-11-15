@@ -140,12 +140,16 @@ def _compact_acquisition(acquisition: Any) -> dict[str, Any] | None:
 def _compact_cross_validation(cross_validation: Any) -> dict[str, Any] | None:
     if not isinstance(cross_validation, dict):
         return None
+    issues = [issue for issue in cross_validation.get("issues") or [] if isinstance(issue, dict)]
+    recorded_count = cross_validation.get("issue_count")
     return {
         "status": cross_validation.get("status"),
+        **{key: cross_validation[key] for key in (
+            "consensus_score", "confidence", "supporting_agents", "dissenting_agents") if key in cross_validation},
+        "issue_count": max(recorded_count, len(issues)) if type(recorded_count) is int else len(issues),
         "issues": [
-            {key: issue.get(key) for key in ("code", "message", "fact_ids")}
-            for issue in (cross_validation.get("issues") or [])
-            if isinstance(issue, dict)
+            {key: issue[key] for key in ("code", "message", "fact_ids", "severity", "agent_ids") if key in issue}
+            for issue in issues
         ][:20],
     }
 

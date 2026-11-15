@@ -80,7 +80,8 @@ def test_navigation_and_profile_call_to_action():
     assert app.title[0].value == '风险评估'
     assert app.session_state['navigation'] == '风险评估'
     assert '用户标识' not in [field.label for field in app.text_input]
-    assert not app.text_area and not app.number_input
+    assert [field.key for field in app.text_area] == ['automatic_plan_narrative']
+    assert not app.number_input
     assert len(app.radio) == 1 and app.radio[0].value is None
     assert next(button for button in app.button if button.label == '下一题').disabled
 
@@ -1113,7 +1114,8 @@ with patch.object(ui, 'api_request', side_effect=fake_api):
     app = AppTest.from_string(script).run(timeout=15)
     assert not app.exception
     assert len(app.radio) == 1 and app.radio[0].value is None
-    assert not app.text_area and not app.number_input and not app.slider
+    assert [field.key for field in app.text_area] == ['automatic_plan_narrative']
+    assert not app.number_input and not app.slider
     assert next(b for b in app.button if b.label == '上一题').disabled
     assert next(b for b in app.button if b.label == '下一题').disabled
     app.radio[0].set_value('A').run(timeout=15)

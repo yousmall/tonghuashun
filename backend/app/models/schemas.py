@@ -20,6 +20,7 @@ from .trend import MovingAveragePoint, TrendAnalysis
 from .decision import ComparisonDecision
 
 from backend.app.risk_questionnaire import validate_answers
+from backend.app.watchlist_policy import WATCHLIST_QUOTE_BATCH_SIZE
 
 
 class Intent(StrEnum):
@@ -134,6 +135,7 @@ class UserProfile(BaseModel):
     scoring_notice: str | None = None
     # 补充题原始区间与平台解释；确认时由服务端从答案重算。
     financial_plan: dict[str, Any] = Field(default_factory=dict)
+    automatic_planning: dict[str, Any] = Field(default_factory=dict)
     financial_capacity_label: str | None = None
     effective_horizon_max_months: int | None = Field(default=None, ge=0)
     assessment_reasons: list[dict[str, Any]] = Field(default_factory=list)
@@ -388,6 +390,15 @@ class ComplianceResult(BaseModel):
     required_disclosures: list[str] = Field(default_factory=list)
 
 
+class ResearchMaterial(BaseModel):
+    """既有研究的参考摘要；不属于授权事实，不可直接作为证据引用。"""
+
+    source: Literal["市场解读", "行业分析", "个股研究", "基金筛选", "可转债分析", "行业走势"]
+    target: str | None = Field(default=None, max_length=60)
+    summary: str = Field(min_length=1, max_length=2000)
+    as_of: str | None = Field(default=None, max_length=64)
+
+
 class OrchestrationRequest(BaseModel):
     """进入主协调智能体的单次请求输入。"""
 
@@ -397,6 +408,9 @@ class OrchestrationRequest(BaseModel):
     research_direction: Literal["市场解读", "行业分析", "个股研究", "基金筛选", "可转债分析"] | None = None
     # 页面选择只用于解析“当前标的”；明确提到的证券仍以本次问题为准。
     research_target: str | None = Field(default=None, max_length=60)
+    # 行业页显式发起的跨方向协同，沿用深度研究的核验、合规与历史记录。
+    industry_collaboration: bool = False
+    research_materials: list[ResearchMaterial] = Field(default_factory=list, max_length=10)
     # 当前已加载的用户画像版本。
     profile: UserProfile
     # 数据层在本次请求中已授权的事实集合。
@@ -425,6 +439,10 @@ class OrchestrationRequest(BaseModel):
 
     @model_validator(mode="after")
     def local_input_budget(self):
+        if self.industry_collaboration and (self.research_direction != "行业分析" or self.research_mode != "deep"):
+            raise ValueError("行业协同分析须从行业分析入口使用深度研究模式")
+        if self.research_materials and not self.industry_collaboration:
+            raise ValueError("跨方向研究摘要仅用于行业协同分析")
         if self.research_mode in {"lite", "instant", "auto"} and len(self.query) > 2000:
             raise ValueError("3秒咨询的问题请控制在2000字以内")
         return self
@@ -803,8 +821,20 @@ class SnapshotOptions(BaseModel):
     refresh: bool = False
 
 
+class WatchlistQuotesRequest(SnapshotOptions):
+    # 标的身份只能由账号内的自选ID决定，不接受任意代码替代。
+    ids: list[int] | None = Field(default=None, min_length=1, max_length=WATCHLIST_QUOTE_BATCH_SIZE)
+
+    @field_validator("ids")
+    @classmethod
+    def valid_ids(cls, values):
+        if values is not None and (any(value <= 0 for value in values) or len(set(values)) != len(values)):
+            raise ValueError("自选ID必须为不重复的正整数")
+        return values
+
+
 class ComparisonRequest(BaseModel):
-    asset_type: Literal["股票", "基金", "可转债", "行业"]
+    asset_type: Literal["股票", "基金", "可转债", "行业", "指数"]
     targets: list[str] = Field(min_length=2, max_length=4)
     refresh: bool = False
 

@@ -212,7 +212,7 @@ async def test_prefetched_financial_batch_avoids_second_provider_call():
     assert acquisition.reused_capabilities == ["financial"]
 
 
-def test_page_defaults_to_automatic_and_delivers_one_final_answer():
+def test_page_defaults_to_instant_and_delivers_one_final_answer():
     from streamlit.testing.v1 import AppTest
     script = """
 from concurrent.futures import Future
@@ -229,21 +229,21 @@ class Executor:
         self.future = future
     def submit(self, *args):
         return self.future
-with patch.object(ui, 'preview_executor', return_value=Executor(preview)), patch.object(ui, 'analysis_executor', return_value=Executor(deep)), patch.object(ui, 'backend_http_client', return_value=object()), patch.object(ui, 'render_research_board'), patch.object(ui, 'invalidate_recent_conversations'):
+with patch.object(ui, 'profile_ready', return_value=True), patch.object(ui, 'preview_executor', return_value=Executor(preview)), patch.object(ui, 'analysis_executor', return_value=Executor(deep)), patch.object(ui, 'backend_http_client', return_value=object()), patch.object(ui, 'render_research_board'), patch.object(ui, 'invalidate_recent_conversations'):
     ui.finish_chat_analyses()
     ui.page_questions('http://test')
 """
     app = AppTest.from_string(script).run(timeout=15)
     assert not app.exception
-    assert next(item for item in app.selectbox if item.label == "研究模式").value == "auto"
+    assert next(item for item in app.segmented_control if item.label == "研究模式").value == "instant"
     app.chat_input[0].set_value("分析市场").run(timeout=15)
     assert not app.exception
-    app.session_state['deep_test_future'].set_result(answer("已核验证据研判"))
+    app.session_state['preview_test_future'].set_result(answer("已核验证据研判"))
     app.run(timeout=15)
     assert not app.exception
     assert len(app.session_state['conversation']) == 2
     assert app.session_state['conversation'][-1]['content'] == "已核验证据研判"
     assert app.session_state['conversation'][-1]['phase'] == "final"
     assert not app.session_state['analysis_jobs']
-    assert not app.session_state['preview_test_future'].done()
+    assert not app.session_state['deep_test_future'].done()
     assert not any("详细报告正在后台分析" in item.value for item in app.caption)

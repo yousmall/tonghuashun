@@ -16,7 +16,8 @@ def payload(direction, target=None):
         for field, value in {"close_price": 10+index, "change": 1+index, "market_cap": 1e9, "pe_ttm": 20,
                              "fund_nav": 1.2, "fund_size": 1e9*(index+1), "fee_rate": .5,
                              "conversion_premium_rate": 5+index, "roe": 7.5, "industry": "银行"}.items():
-            rows.append(fact(name, "60000"+str(index+1), field, value))
+            code = ("600519" if index == 0 else "600036") if direction == "stock" else "60000"+str(index+1)
+            rows.append(fact(name, code, field, value))
     sections = [{"key": "overview", "title": "概览", "status": "ok", "facts": rows}]
     if direction == "stock":
         sections.append({"key": "detail", "title": "财务指标", "status": "ok", "facts": rows[:10]})

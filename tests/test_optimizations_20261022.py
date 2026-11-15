@@ -277,7 +277,7 @@ def test_speculation_key_requires_direction_and_target() -> None:
 
     direction = main_module.DIRECTION_FOR_INTENT[main_module.Intent.SECURITY_RESEARCH]
     deep = OrchestrationRequest(query="分析示例科技", research_direction=direction,
-                                research_target="示例科技", research_mode="deep")
+                                research_target="示例科技", research_mode="deep", profile={"confirmed": True})
     assert main_module._speculation_key(deep) == (main_module.Intent.SECURITY_RESEARCH, "示例科技")
 
     no_target = deep.model_copy(update={"research_target": None})

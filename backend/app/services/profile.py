@@ -117,4 +117,6 @@ def confirm_profile(profile: UserProfile) -> UserProfile:
                       investment_experience_years=None, expected_annual_return=None,
                       investment_history=[], holding_history=[], behavioral_notes=[])
         profile = profile.model_copy(update=values)
-    return profile.model_copy(update={"confirmed": True, "version": profile.version + 1})
+    confirmed = profile.model_copy(update={"confirmed": True, "version": profile.version + 1})
+    from backend.app.services.automatic_planning import build_automatic_planning
+    return confirmed.model_copy(update={"automatic_planning": build_automatic_planning(confirmed.model_dump(mode="json"))})

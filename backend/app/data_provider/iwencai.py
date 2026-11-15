@@ -28,6 +28,7 @@ from backend.app.http_clients import verified_ssl_context
 from backend.app.fact_taxonomy import METADATA_FIELD_NAMES
 from backend.app.models import FactRecord
 from backend.app.fact_units import PERCENT_FIELDS
+from backend.app.fund_fields import FUND_RETURNS, FUND_PROFILE, FUND_FEES, FUND_RISK, FUND_ALLOCATION, FUND_MONEY
 
 SKILL_KEY_ENV = {
     "hithink-market-query": "IWENCAI_MARKET_API_KEY",
@@ -48,7 +49,7 @@ SKILL_KEY_ENV = {
 }
 
 # Invalidate persistent facts after changing official skill routes or field contracts.
-SKILL_CONTRACT_REVISION = "2026-11-02.1"
+SKILL_CONTRACT_REVISION = "2026-11-15.fund.5"
 
 
 # 实体名由 _entity_from_record 从这些字段提取并写入 FactRecord.entity，
@@ -62,6 +63,20 @@ SKIPPED_RECORD_FIELDS: frozenset[str] = frozenset(
 # 别名表：值为内部规范化字段名。匹配时按别名长度倒序（见 _alias_index），
 # 因此长别名优先命中，避免 "市盈率" 把 "静态市盈率" 一并吞掉这类子串误合并。
 FIELD_ALIASES = {
+    "累计单位净值增长率": "accumulated_nav_change", "累计净值增长率": "accumulated_nav_change",
+    "投资类型一级分类": "fund_type", "投资类型二级分类": "fund_subtype",
+    **{label: field for group in (FUND_RETURNS, FUND_PROFILE, FUND_FEES, FUND_RISK, FUND_ALLOCATION, FUND_MONEY)
+       for field, label in group.items()},
+    "累计净值": "accumulated_nav", "累计单位净值": "accumulated_nav", "基金净资产": "fund_size",
+    "净值涨跌幅": "nav_change",
+    "七日年化": "yield_7d", "7日年化收益率": "yield_7d", "7日年化": "yield_7d", "万份收益": "income_per_10000",
+    "万份基金单位收益": "income_per_10000",
+    "近一年年化波动率": "volatility_1y", "近一年夏普比率": "sharpe_ratio_1y",
+    "近1年夏普率": "sharpe_ratio_1y", "近一年夏普率": "sharpe_ratio_1y",
+    "etf类型一级分类": "fund_type", "etf类型二级分类": "fund_subtype", "托管人": "fund_custodian",
+    "基金管理公司": "fund_company", "基金公司": "fund_company",
+    "业绩基准": "performance_benchmark", "跟踪指数": "tracking_index",
+    "重仓股": "top_holdings", "股票投资占比": "stock_position", "债券投资占比": "bond_position",
     "上涨家数": "advancing_count",
     "A股总家数": "market_total_count",
     # A name LIKE predicate is not an exchange risk-warning declaration.
@@ -392,6 +407,33 @@ class IwencaiSkillHubProvider:
 
     async def get_exchange_calendar(self, start: str, end: str):
         return await self.public_recovery.get_exchange_calendar(start, end) if self.public_recovery else []
+
+    async def get_fund_reference(self, target: str):
+        if not self.public_recovery:
+            return []
+        from backend.app.data_provider.fund_reference import fetch_fund_reference
+        if not re.fullmatch(r"\d{6}(?:\.(?:SH|SZ|OF))?", target, re.I):
+            from backend.app.services.security_names import resolve_security_identity
+            identity = await resolve_security_identity(self, target, "基金")
+            if not identity:
+                return []
+            target = identity[1]
+        return await fetch_fund_reference(self.public_recovery, target)
+
+    async def get_fund_return_series(self, target: str):
+        if not self.public_recovery:
+            return []
+        if not re.fullmatch(r"\d{6}(?:\.(?:SH|SZ|OF))?", target, re.I):
+            from backend.app.services.security_names import resolve_security_identity
+            identity = await resolve_security_identity(self, target, "基金")
+            if not identity:
+                return []
+            target = identity[1]
+        from backend.app.services.fund_analytics import parse_daily_returns
+        code = target.split(".")[0]
+        content = await self.public_recovery._get(f"https://fund.eastmoney.com/pingzhongdata/{code}.js")
+        facts = parse_daily_returns(content, code, now=self.public_recovery.now())
+        return [fact.model_copy(update={"entity_code": target.upper()}) for fact in facts]
 
     async def get_stock_risk_state(self, code: str):
         return await self.public_recovery.get_stock_risk_state(code) if self.public_recovery else []
@@ -973,7 +1015,9 @@ class IwencaiSkillHubProvider:
                     continue
                 if raw_field in SKIPPED_RECORD_FIELDS:
                     continue
-                if isinstance(value, (dict, list)) or value is None:
+                if value is None:
+                    continue
+                if isinstance(value, (dict, list)) and _canonical_field(str(raw_field)) not in {"top_holdings", "industry_allocation"}:
                     continue
                 raw_key = str(raw_field).strip().casefold()
                 if raw_key in ROW_METADATA_FIELDS or raw_key in METADATA_FIELD_NAMES:
@@ -1576,7 +1620,7 @@ def _record_scope(record: dict[str, Any]) -> str:
 
 def _entity_from_record(record: dict[str, Any], fallback: str) -> str:
     for key in ("证券简称", "名称", "股票简称", "基金简称", "基金名称", "指数简称", "指数名称",
-                "可转债简称", "债券简称", "转债简称", "行业名称", "板块名称",
+                "可转债简称", "债券简称", "转债简称", "板块简称", "行业名称", "板块名称",
                 "代码", "证券代码", "股票代码", "基金代码", "指数代码", "转债代码"):
         value = record.get(key)
         if value not in (None, ""):
@@ -1585,7 +1629,7 @@ def _entity_from_record(record: dict[str, Any], fallback: str) -> str:
 
 
 def _entity_code_from_record(record: dict[str, Any]) -> str | None:
-    for key in ("证券代码", "股票代码", "基金代码", "指数代码", "可转债代码", "转债代码", "代码"):
+    for key in ("证券代码", "股票代码", "基金代码", "指数代码", "可转债代码", "转债代码", "板块代码", "行业代码", "代码"):
         value = record.get(key)
         if value not in (None, ""):
             return str(value)
@@ -1622,6 +1666,35 @@ def _period_from_record(record: dict[str, Any]) -> str | None:
 def _canonical_field(raw: str, *, channel: str | None = None) -> str:
     normalized = re.sub(r"\[[^]]*]", "", raw).strip()
     key = normalized.casefold().replace(" ", "")
+    # 基金接口按日期区间返回阶段涨幅。只对明确的基金列识别窗口，
+    # 保留原始起止日期；股票区间涨跌幅仍沿用 interval_change。
+    interval = re.search(r"\[(\d{8})-(\d{8})\]$", raw)
+    if interval and (key.startswith("基金@") or key in {"单位净值增长率", "净值增长率"}):
+        try:
+            start, end = (datetime.strptime(value, "%Y%m%d").date() for value in interval.groups())
+            days = (end - start).days
+            if "区间涨跌幅" in key or key in {"单位净值增长率", "净值增长率"}:
+                for low, high, field in ((25, 35, "return_1m"), (80, 100, "return_3m"),
+                                         (170, 190, "return_6m"), (350, 380, "return_1y"),
+                                         (1080, 1110, "return_3y")):
+                    if low <= days <= high:
+                        return field
+            if "最大回撤率" in key and 350 <= days <= 380:
+                return "max_drawdown_1y"
+        except ValueError:
+            pass
+        if key in {"单位净值增长率", "净值增长率"}:
+            return "interval_change"
+    # 阶段净值增长率独立于单日涨跌幅，不把不同观察窗口混成同一指标。
+    for tokens, field in ((("近1月", "近一个月", "近一月"), "return_1m"),
+                          (("近3月", "近3个月", "近三个月", "近三月"), "return_3m"),
+                          (("近6月", "近6个月", "近六个月", "近六月"), "return_6m"),
+                          (("近1年", "近一年"), "return_1y"),
+                          (("近3年", "近三年"), "return_3y"),
+                          (("今年以来", "本年以来"), "return_ytd")):
+        if any(token in key for token in tokens) and any(token in key for token in ("收益率", "增长率", "涨幅")):
+            if not any(token in key for token in ("年化", "同类", "排名", "基准")):
+                return field
     if key == "停牌":
         return "is_suspended"
     # A date-range return must not conflict with the latest daily price change.

@@ -719,7 +719,8 @@ def prepared_delivery_executor() -> ThreadPoolExecutor:
     return ThreadPoolExecutor(max_workers=8, thread_name_prefix="wence-prepared-delivery")
 
 
-def submit_chat_analysis(api_base: str, direction: str, query: str, *, recommend_stocks: bool = False) -> None:
+def submit_chat_analysis(api_base: str, direction: str, query: str, *, recommend_stocks: bool = False,
+                         collaboration: dict[str, Any] | None = None) -> None:
     """立即显示问题，后台完成分析，避免等待期间锁住整页交互。"""
     if not profile_ready():
         st.warning("请先确认投资偏好，再开始分析。")
@@ -748,6 +749,14 @@ def submit_chat_analysis(api_base: str, direction: str, query: str, *, recommend
         ],
     }
     token = st.session_state.auth_token
+    if collaboration is not None:
+        payload.update({"industry_collaboration": True, "research_mode": "deep", "auto_fetch": False,
+                        "research_target": str(selected_research_target(direction) or "").strip() or None,
+                        "facts": collaboration["facts"],
+                        "research_materials": collaboration["research_materials"],
+                        # The fixed industry task owns intent; other pages' dialogue
+                        # stays in reference_materials, separate from this conversation.
+                        "context_messages": []})
     client = backend_http_client(api_base)
     progress = AnalysisProgress()
     preview = None
@@ -1026,8 +1035,8 @@ RESEARCH_GUIDES = {
         "请分析 600519 的估值和主要风险。",
     ),
     "基金筛选": (
-        "在「基金数据」的「查看基金」选择「全部概览」浏览已加载的基金，"
-        "或选定基金名称或代码查看单只基金。比较时先确认各基金都在已加载的资料中。",
+        "在「查看基金」输入名称或代码，查看净值、阶段收益、风险、概况费率和持仓配置，并可直接加入自选。"
+        "各项数据以标注日期为准；不同份额类别请按具体代码区分。",
         "请分析基金 510300 的管理费率和单位净值。",
     ),
     "可转债分析": (
@@ -1075,6 +1084,9 @@ def render_research_page(api_base: str, direction: str) -> None:
                 render_research_board(api_base, direction, create_board_fetch(api_base), api_request=api_request)
     else:
         render_research_board(api_base, direction, create_board_fetch(api_base), api_request=api_request)
+    if direction == "行业分析":
+        from frontend.industry_collaboration import render_industry_collaboration
+        render_industry_collaboration(api_base, ready=profile_ready(), submit=submit_chat_analysis)
     if not profile_ready():
         st.info("请先确认投资偏好，再开始分析。", icon=":material/person_edit:")
         st.button("进行风险评估", type="primary", on_click=go_to, args=("风险评估",))
@@ -1264,9 +1276,11 @@ def render_materials_body(api_base: str) -> None:
 def page_profile(api_base: str) -> None:
     """保留风险问卷，支持从股票交易记录补充行为画像。"""
     from frontend.trade_profile import render_trade_profile
+    from frontend.automatic_planning import render_automatic_planning
     render_page_header("风险评估")
     st.title("风险评估")
     render_risk_assessment(api_base, api_request=api_request)
+    render_automatic_planning(api_base, api_request=api_request)
     render_trade_profile(api_base, api_request=api_request)
 
 
@@ -1449,7 +1463,7 @@ def render_price_history_panel(api_base: str, items: list[dict[str, Any]]) -> No
 
     from frontend.trend_view import render_trend_panel
 
-    eligible = [item for item in items if item.get("asset_type", "股票") in {"股票", "基金", "可转债"}]
+    eligible = [item for item in items if item.get("asset_type", "股票") in {"股票", "基金", "可转债", "指数", "行业"}]
     st.subheader("历史走势 · 五日均线与中和判断")
     if not eligible:
         st.info("当前自选中没有可展示收盘价或单位净值走势的标的。")
@@ -1459,7 +1473,7 @@ def render_price_history_panel(api_base: str, items: list[dict[str, Any]]) -> No
         selected_id = st.selectbox(
             "查看标的", list(options),
             format_func=lambda item_id: f"{options[item_id].get('name') or options[item_id].get('target', '—')}"
-                                        f" · {options[item_id].get('asset_type', '股票')}",
+                                        f" · {options[item_id].get('target', '—')} · {options[item_id].get('asset_type', '股票')}",
             key="price_history_target",
         )
         selected = options[selected_id]
@@ -1727,18 +1741,18 @@ def reset_user_session() -> None:
     for key in (
         "service_unavailable", "last_error", "watchlist_compare_ids", "session_status_checked_at", "profile_restored",
         "auth_token", "session_beacon_token", "auth_user", "conversation", "advice", "facts", "portfolio",
-        "watchlist", "watchlist_loaded", "watchlist_retry_at", "price_history", "watchlist_focus", "watchlist_comparison_request", "watchlist_comparison_advice", "comparison_chart_choice", "comparison_polling",
+        "watchlist", "watchlist_loaded", "watchlist_retry_at", "watchlist_search", "watchlist_filter", "watchlist_page_size", "watchlist_page_number", "price_history", "watchlist_focus", "watchlist_comparison_request", "watchlist_comparison_advice", "comparison_chart_choice", "comparison_polling",
         "risk_assessment_index", "risk_assessment_answers", "risk_assessment_editing", "risk_assessment_view",
         "profile", "profile_draft", "profile_plan", "questionnaire", "portfolio_advice", "navigation", "preference_navigation_open", "pending_navigation",
         "history_view", "research_sessions", "active_research_direction", "research_direction", "conversation_directions", "research_board_cache",
         "research_results", "market_query_result", "data_selected", "auth_notice",
         "recent_conversations", "recent_conversations_loaded_at", "history_detail_cache",
         "history_before_id", "history_offset", "history_last_search", "history_search",
-        "analysis_jobs", "analysis_notice",
+        "analysis_jobs", "analysis_notice", "industry_trend_cache", "fund_analytics_results",
     ):
         st.session_state.pop(key, None)
     for key in list(st.session_state):
-        if key.startswith(("manual_review_", "trade_profile_", "risk_score_", "risk_answer_", "research_chat_", "board_target_", "board_refresh_", "board_poll_", "admin_")) or key == "profile_narrative":
+        if key.startswith(("manual_review_", "trade_profile_", "risk_score_", "risk_answer_", "automatic_plan_", "research_chat_", "industry_collaboration_", "board_target_", "board_refresh_", "board_poll_", "board_favorite_", "board_saved_", "fund_analytics_", "admin_")) or key == "profile_narrative":
             st.session_state.pop(key, None)
     st.session_state.conversation_id = str(uuid.uuid4())
     # 账号标识只来自服务端令牌，浏览器状态里不保存用户 id。
@@ -2003,7 +2017,7 @@ def main() -> None:
         st.session_state.navigation = "投资问答"
         st.session_state.history_view = True
     page = render_sidebar(api_base, full=True)
-    if page in {"主页", "自选研究"}:
+    if page in {"主页", "自选研究", "投资问答"}:
         ensure_watchlist_loaded(api_base, nonblocking=True)
     if not st.session_state.get("profile_restored") and (api_base, "/profile") in st.session_state.get("account_prefetch_results", {}):
         st.session_state.profile_restored = _restore_profile(api_base, nonblocking=True)

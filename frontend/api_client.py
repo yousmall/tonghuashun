@@ -93,7 +93,7 @@ def _request_analysis_once(client, base, method, path, payload, token, progress)
 
 def request_json(client, base, method, path, payload, token):
     timeout = (httpx.Timeout(None, connect=10) if path == "/portfolio/analyze" and payload.get("research_mode") == "deep"
-               else httpx.Timeout(240 if path == "/portfolio/analyze" else 65 if path in {"/profile/assess", "/data/compare"} else 30, connect=10))
+               else httpx.Timeout(240 if path in {"/portfolio/analyze", "/data/watchlist-quotes"} else 65 if path in {"/profile/assess", "/data/compare"} else 30, connect=10))
     try:
         response = client.request(method, f"{base}{path}", json=payload,
             headers={"Authorization": f"Bearer {token}"} if token else {},

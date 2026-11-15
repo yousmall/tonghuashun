@@ -17,6 +17,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, rela
 from sqlalchemy.pool import StaticPool
 
 from backend.app.auth import hash_password
+from backend.app.watchlist_policy import WATCHLIST_CAPACITY
 
 
 class DatabaseUnavailable(RuntimeError):
@@ -385,7 +386,7 @@ class Database:
 
     def add_watchlist_item(self, user_id: int, target: str, asset_type: str,
                            name: str | None = None) -> dict[str, Any]:
-        """新增账号自选；最多 50 条，并把并发重复写转换成可读业务错误。"""
+        """新增账号自选；按共用容量限制，并把并发重复写转换成可读业务错误。"""
 
         self.require_ready()
         assert self.session_factory is not None
@@ -403,8 +404,8 @@ class Database:
                 count = session.scalar(
                     select(func.count(WatchlistRow.id)).where(WatchlistRow.user_id == user_id)
                 )
-                if int(count or 0) >= 50:
-                    raise WatchlistCapacityExceeded("自选标的最多保存 50 个，请先移除不再关注的标的")
+                if int(count or 0) >= WATCHLIST_CAPACITY:
+                    raise WatchlistCapacityExceeded(f"自选标的最多保存 {WATCHLIST_CAPACITY} 个，请先移除不再关注的标的")
                 row = WatchlistRow(user_id=user_id, target=target, asset_type=asset_type,
                                    name=(name or "").strip()[:60] or None)
                 session.add(row)

@@ -4,9 +4,10 @@ from datetime import date
 import math
 import re
 from backend.app.fact_units import percentage_points
+from backend.app.fund_fields import FUND_PERCENT_FIELDS
 
 
-PERCENT_FIELDS = {"change", "nav_change", "turnover_rate", "roe", "roe_weighted", "revenue_growth", "net_profit_growth", "fee_rate", "tracking_error", "conversion_premium_rate", "pure_bond_premium_rate", "yield_to_maturity"}
+PERCENT_FIELDS = {"change", "nav_change", "turnover_rate", "roe", "roe_weighted", "revenue_growth", "net_profit_growth", "fee_rate", "tracking_error", "conversion_premium_rate", "pure_bond_premium_rate", "yield_to_maturity"} | FUND_PERCENT_FIELDS
 MONEY_FIELDS = {"market_cap", "float_market_cap", "turnover_value", "fund_size", "capital_flow", "remaining_size"}
 
 

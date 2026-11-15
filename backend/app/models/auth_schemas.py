@@ -74,7 +74,7 @@ class ConversationDetail(BaseModel):
     next_before_id: int | None = None
 
 
-AssetType = Literal["股票", "基金", "行业", "可转债"]
+AssetType = Literal["股票", "基金", "行业", "可转债", "指数"]
 
 
 class WatchlistItemCreate(BaseModel):

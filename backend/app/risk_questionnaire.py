@@ -169,6 +169,8 @@ def evaluate_answers(answers: dict[str, str], *, today: date | None = None) -> d
     } for name, qids in score_groups]
     from backend.app.profile_guidance import build_profile_guidance
     values.update(build_profile_guidance(answers, values))
+    from backend.app.services.automatic_planning import build_automatic_planning
+    values["automatic_planning"] = build_automatic_planning(values, today=assessed)
     return values
 
 

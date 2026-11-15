@@ -81,6 +81,7 @@ WATCHLIST_RESEARCH_PREFIX = {
     "基金": "基金筛选：",
     "行业": "行业分析：",
     "可转债": "可转债分析：",
+    "指数": "市场解读：",
 }
 TOPIC_LABELS = {"market": "市场环境", "macro": "市场环境", "industry": "行业分析", "security": "个股研究",
                 "stock": "个股研究", "fund": "基金筛选", "portfolio": "持仓分析", "fact_verifier": "资料核对", "compliance": "风险检查"}
@@ -546,7 +547,7 @@ def render_logic_chain(advice: dict[str, Any]) -> None:
             for item in cross_validation.get("dissenting_agents", [])
         ]
         if supporting:
-            st.caption(f"一致支持的分析维度：{'、'.join(dict.fromkeys(supporting))}")
+            st.caption(f"评分接近综合参考值的分析维度：{'、'.join(dict.fromkeys(supporting))}；不表示共同看多。")
         if dissenting:
             st.warning(f"需要重点复核的分析维度：{'、'.join(dict.fromkeys(dissenting))}")
         if compliance.get("reason"):

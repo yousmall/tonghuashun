@@ -10,12 +10,18 @@ from typing import Any, Callable
 
 import streamlit as st
 from frontend.financial_view import fact_unit, fact_numeric_value
+from backend.app.fund_fields import FUND_RETURNS, FUND_PROFILE, FUND_FEES, FUND_RISK, FUND_ALLOCATION, FUND_PERCENT_FIELDS, FUND_MONEY
 from streamlit.runtime.scriptrunner import get_script_run_ctx
 
 DIRECTIONS = {"市场解读": "market", "行业分析": "industry", "个股研究": "stock", "基金筛选": "fund", "可转债分析": "convertible"}
 STOCKS = {"600519": "贵州茅台", "300750": "宁德时代", "600036": "招商银行", "601318": "中国平安", "000333": "美的集团", "600900": "长江电力"}
 FUNDS = {"510300": "沪深300ETF", "510500": "中证500ETF", "588000": "科创50ETF", "159915": "创业板ETF"}
+INDEXES = {"000001.SH": "上证指数", "399001.SZ": "深证成指", "399006.SZ": "创业板指", "000300.SH": "沪深300"}
+ASSET_TYPES = {"market": "指数", "industry": "行业", "stock": "股票", "fund": "基金", "convertible": "可转债"}
 LABELS = {
+    **FUND_RETURNS, **FUND_PROFILE, **FUND_FEES, **FUND_RISK, **FUND_ALLOCATION, **FUND_MONEY,
+    "accumulated_nav": "累计净值",
+    "reported_fund_size": "净资产规模（披露）", "reported_inception_date": "原始成立日期（档案）",
     "close_price": "最新价", "change": "涨跌幅", "turnover_rate": "换手率", "turnover_value": "成交额",
     "volume": "成交量", "market_cap": "总市值", "float_market_cap": "流通市值", "pe_ttm": "市盈率 TTM",
     "pb": "市净率", "roe": "净资产收益率", "roe_weighted": "加权净资产收益率", "revenue_growth": "营收同比增长",
@@ -26,14 +32,14 @@ LABELS = {
     "yield_to_maturity": "到期收益率", "remaining_size": "剩余规模", "bond_rating": "债券评级", "conversion_price": "转股价",
     "gdp": "GDP 同比增长", "cpi": "CPI", "ppi": "PPI", "pmi": "制造业 PMI", "social_financing": "社会融资", "interest_rate": "利率",
 }
-PERCENT_FIELDS = {"change", "nav_change", "turnover_rate", "roe", "roe_weighted", "revenue_growth", "net_profit_growth",
+PERCENT_FIELDS = FUND_PERCENT_FIELDS | {"change", "nav_change", "turnover_rate", "roe", "roe_weighted", "revenue_growth", "net_profit_growth",
                   "fee_rate", "tracking_error", "conversion_premium_rate", "pure_bond_premium_rate", "yield_to_maturity"}
-MONEY_FIELDS = {"market_cap", "float_market_cap", "turnover_value", "fund_size", "capital_flow", "remaining_size", "social_financing"}
+MONEY_FIELDS = {"market_cap", "float_market_cap", "turnover_value", "fund_size", "reported_fund_size", "capital_flow", "remaining_size", "social_financing"}
 TABLE_FIELDS = {
     "market": ["close_price", "change", "turnover_value"],
     "industry": ["change", "capital_flow", "turnover_value", "pe_ttm", "pb"],
     "stock": ["close_price", "change", "market_cap", "pe_ttm", "pb", "industry"],
-    "fund": ["fund_nav", "nav_change", "fund_size", "fee_rate", "fund_manager"],
+    "fund": ["fund_nav", "nav_change", "accumulated_nav", "fund_type", "fund_size", "fee_rate", "fund_manager"],
     "convertible": ["close_price", "change", "conversion_premium_rate", "yield_to_maturity", "remaining_size", "bond_rating"],
 }
 
@@ -54,7 +60,7 @@ def format_fact(fact: dict | None, *, index: bool = False) -> str:
     value = fact.get("value")
     field = fact.get("field")
     numeric = number(value)
-    if field in {"listing_date", "inception_date"}:
+    if field in {"listing_date", "inception_date", "reported_inception_date"}:
         return data_period({"period": value})
     if numeric is None:
         return str(value) if value not in (None, "") else "—"
@@ -62,6 +68,8 @@ def format_fact(fact: dict | None, *, index: bool = False) -> str:
         numeric = fact_numeric_value(fact)
         if numeric is None:
             return f"{value}（单位待确认）"
+        if field == "yield_7d":
+            return f"{numeric:.4f}%"
         return f"{numeric:+.2f}%" if field in {"change", "nav_change", "revenue_growth", "net_profit_growth"} else f"{numeric:.2f}%"
     if field in MONEY_FIELDS:
         raw = str(fact.get("source_field") or "")
@@ -78,8 +86,11 @@ def format_fact(fact: dict | None, *, index: bool = False) -> str:
         if abs(numeric) >= 1e4:
             return f"{numeric / 1e4:,.2f} 万元"
         return f"{numeric:,.2f} 元"
-    if field in {"fund_nav"}:
+    if field in {"fund_nav", "accumulated_nav", "reference_fund_nav", "reference_accumulated_nav"}:
         return f"{numeric:.4f}"
+    if field == "income_per_10000":
+        currency = {"CNY":"元", "USD":"美元", "HKD":"港元"}.get(fact.get("unit"))
+        return f"{numeric:.4f}" + (" " + currency if currency else "")
     if field in {"close_price", "conversion_price"}:
         return f"{numeric:,.2f}" + (" 点" if index else " " + fact_unit(fact))
     if field in {"pe_ttm", "pb"}:
@@ -229,18 +240,133 @@ def section_facts(result: dict, key: str) -> list[dict]:
 
 
 def known_entities(api_base: str, direction: str) -> dict[str, str]:
-    names = dict(STOCKS if direction == "stock" else FUNDS if direction == "fund" else {})
+    names = dict(STOCKS if direction == "stock" else FUNDS if direction == "fund" else INDEXES if direction == "market" else {})
     for key, entry in st.session_state.get("research_board_cache", {}).items():
         if key[:2] != (api_base, direction):
             continue
         for row in entity_rows(section_facts(entry["result"], "overview")):
             if row["code"]:
-                names[row["code"].split(".")[0]] = row["name"]
-    if direction == "stock":
-        for item in st.session_state.get("watchlist", []):
-            if item.get("asset_type") == "股票":
-                names[str(item["target"])] = str(item["target"])
+                code = str(row["code"])
+                names[code if direction == "market" else code.split(".")[0]] = row["name"]
+    for item in st.session_state.get("watchlist", []):
+        if item.get("asset_type") == ASSET_TYPES[direction]:
+            names.setdefault(str(item["target"]), item.get("name") or str(item["target"]))
     return names
+
+
+def entity_label(row: dict) -> str:
+    name, code = str(row.get("name") or "名称未取得"), str(row.get("code") or "代码未取得")
+    return f"{name} · {code}" if name != code else f"名称未取得 · {code}"
+
+
+def option_label(value, names):
+    if value is None:
+        return "全部概览"
+    if value in names and names[value] != value:
+        return f"{names[value]} · {value}"
+    matches = [code for code, name in names.items() if name == value and code != value]
+    return f"{value} · {matches[0]}" if len(matches) == 1 else str(value)
+
+
+def target_rows(rows, target):
+    if target and re.fullmatch(r"\d{5,6}(?:\.[A-Za-z]{2})?", target):
+        return [row for row in rows if str(row["code"] or "").upper() == target.upper() or
+                ("." not in target and str(row["code"] or "").split(".")[0] == target)]
+    return rows
+
+
+def _open_saved_target(direction, target):
+    st.session_state[f"board_target_{direction}"] = target
+
+
+def render_saved_watchlist(api_base, direction, api_request):
+    """每个方向只列出本类型自选；查看、移除均不依赖当前行情是否可用。"""
+    if api_request is None:
+        return
+    items = {int(item["id"]): item for item in st.session_state.get("watchlist", [])
+             if item.get("asset_type") == ASSET_TYPES[direction]}
+    with st.expander(f"本页自选 · {len(items)}", expanded=bool(items), icon=":material/star:"):
+        if not st.session_state.get("watchlist_loaded", True):
+            pending = (api_base, "/watchlist") in st.session_state.get("account_prefetch", {})
+            st.caption("正在加载账号自选。" if pending else "账号自选暂未加载，可重试；查询标的信息不受影响。")
+            if not pending and st.button("重试加载自选", key=f"board_saved_retry_{direction}", icon=":material/refresh:"):
+                saved = api_request(api_base, "GET", "/watchlist")
+                if isinstance(saved, list):
+                    from frontend.account_prefetch import discard_account_result
+                    discard_account_result(api_base, "/watchlist")
+                    st.session_state.watchlist = saved
+                    st.session_state.watchlist_loaded = True
+                    st.session_state.pop("watchlist_retry_at", None)
+                    st.rerun()
+        if not items:
+            st.caption("查询名称或代码后点击“加入自选”，关注的标的会保存在当前账号。")
+            return
+        selected_key = f"board_saved_{direction}"
+        if st.session_state.get(selected_key) not in items:
+            st.session_state[selected_key] = next(iter(items))
+        selected_id = st.selectbox(
+            "选择本页自选", list(items), key=selected_key, persist_state="session",
+            format_func=lambda item_id: option_label(items[item_id]["target"],
+                {items[item_id]["target"]: items[item_id].get("name") or items[item_id]["target"]}))
+        selected = items[selected_id]
+        with st.container(horizontal=True):
+            st.button("查看自选信息", key=f"board_saved_open_{direction}",
+                      icon=":material/visibility:", on_click=_open_saved_target,
+                      args=(direction, selected["target"]))
+            if st.button("移除自选", key=f"board_saved_remove_{direction}", icon=":material/star_border:",
+                         disabled=not st.session_state.get("watchlist_loaded", True)):
+                removed = api_request(api_base, "DELETE", f"/watchlist/{selected_id}")
+                if removed is not None:
+                    from frontend.account_prefetch import discard_account_result
+                    from frontend.snapshots import clear_snapshot
+                    discard_account_result(api_base, "/watchlist")
+                    st.session_state.watchlist = [item for item in st.session_state.get("watchlist", [])
+                                                  if int(item["id"]) != selected_id]
+                    clear_snapshot("comparison")
+                    st.session_state.pop("watchlist_comparison_request", None)
+                    st.session_state.pop("watchlist_comparison_advice", None)
+                    st.toast("已移除自选", icon=":material/check_circle:")
+                    st.rerun()
+
+
+def render_board_watchlist(api_base, direction, target, rows, api_request):
+    """当前查询直接收藏；概览可选单项，按类型隔离并复用账号自选。"""
+    if api_request is None:
+        return
+    ready = st.session_state.get("watchlist_loaded", True)
+    if not ready:
+        st.caption("正在加载账号自选，完成后即可添加或移除。")
+    candidates = {str(row["code"]): row for row in rows if row.get("code")}
+    # 代码查询必须严格对应；名称查询可能返回多个份额，由用户明确选择。
+    if target and re.fullmatch(r"\d{5,6}(?:\.[A-Za-z]{2})?", target):
+        candidates = {code: row for code, row in candidates.items()
+                      if code.upper() == target.upper() or ("." not in target and code.split(".")[0] == target)}
+    with st.container(horizontal=True, vertical_alignment="bottom"):
+        chosen = None
+        if len(candidates) == 1:
+            chosen = next(iter(candidates.values()))
+            st.caption("当前标的：" + entity_label(chosen))
+        elif candidates:
+            code = st.selectbox("选择要自选的标的", [None, *candidates],
+                                format_func=lambda value: "选择名称 · 代码" if value is None else entity_label(candidates[value]),
+                                key=f"board_favorite_{direction}")
+            chosen = candidates.get(code)
+        else:
+            st.caption("查询名称或代码后，可在此加入自选。")
+        kind = ASSET_TYPES[direction]
+        saved = st.session_state.get("watchlist", [])
+        existing = next((item for item in saved if chosen and item.get("asset_type") == kind and
+                         (str(item["target"]).upper().split(".")[0] == str(chosen["code"]).upper().split(".")[0]
+                          or item["target"] == chosen["name"])), None)
+        if st.button("已在自选" if existing else "加入自选", key=f"board_watchlist_add_{direction}",
+                     icon=":material/star:", disabled=not ready or chosen is None or existing is not None):
+            added = api_request(api_base, "POST", "/watchlist", {"target": chosen["code"], "asset_type": kind})
+            if isinstance(added, dict) and added.get("id"):
+                from frontend.account_prefetch import discard_account_result
+                discard_account_result(api_base, "/watchlist")
+                st.session_state.watchlist = [added, *[item for item in saved if item["id"] != added["id"]]]
+                st.toast("已加入自选：" + entity_label(chosen), icon=":material/check_circle:")
+                st.rerun()
 
 
 def render_table(rows: list[dict], direction: str) -> None:
@@ -382,17 +508,20 @@ def _render_research_board(api_base: str, page_direction: str, fetch: Callable,
             st.subheader({"market": "市场数据", "industry": "行业数据", "stock": "股票数据", "fund": "基金数据", "convertible": "可转债数据"}[direction])
             st.space("stretch")
             refresh = st.button("刷新数据", key=f"board_refresh_{direction}", icon=":material/refresh:")
+        render_saved_watchlist(api_base, direction, api_request)
         target = None
         if direction == "industry":
             target_key = "board_target_industry"
             st.session_state.setdefault(target_key, None)
             options = [None, "广告营销", "半导体", "银行", "游戏", "数字媒体", "影视院线", "电力", "医药生物"]
+            names = known_entities(api_base, direction)
+            options.extend(code for code in names if code not in options)
             current = st.session_state.get(target_key)
             if current and current not in options:
                 options.append(current)
             target = st.selectbox(
                 "查询行业", options, key=target_key, accept_new_options=True, persist_state="session",
-                format_func=lambda value: "全部行业概览" if value is None else value,
+                format_func=lambda value: "全部行业概览" if value is None else f"{names[value]} · {value}" if value in names else value,
                 placeholder="选择或输入行业名称 / 板块代码",
                 help="可输入新行业，按回车提交；修改选择后重新查询，选择全部行业概览可恢复排名列表。")
             if target is not None:
@@ -401,18 +530,24 @@ def _render_research_board(api_base: str, page_direction: str, fetch: Callable,
                     st.error("行业名称或代码最多 60 个字符。")
                     return
                 target = target or None
-            st.caption("当前查询：" + (target or "全部行业概览") + " · 行业选择仅影响数据区，咨询时请在问题中写明行业。")
-        if direction in {"stock", "fund", "convertible"}:
+            st.caption("当前查询：" + (target or "全部行业概览") + " · 行业选择用于数据区与协同分析，普通咨询时请在问题中写明行业。")
+        if direction in {"market", "stock", "fund", "convertible"}:
             names = known_entities(api_base, direction)
             options = list(names) if direction == "stock" else [None, *names]
             st.session_state.setdefault(f"board_target_{direction}", "600519" if direction == "stock" else None)
-            target = st.selectbox("查看股票" if direction == "stock" else "查看基金" if direction == "fund" else "查看可转债",
-                                  options, format_func=lambda code: "全部概览" if code is None else f"{names.get(code, code)} · {code}",
+            current = st.session_state.get(f"board_target_{direction}")
+            if current and current not in options:
+                options.append(current)
+            target = st.selectbox("查看" + ASSET_TYPES[direction],
+                                  options, format_func=lambda code: option_label(code, names),
                                   key=f"board_target_{direction}", accept_new_options=True, persist_state="session",
                                   placeholder="选择或输入名称 / 代码" if direction == "stock" else "全部概览 · 可选择或输入名称 / 代码",
                                   help="可选择标的，也可输入名称或代码；投资问题请使用页面底部输入框。")
             if target is not None:
-                target = str(target).strip()[:60]
+                target = str(target).strip()
+                if not target or len(target) > 60:
+                    st.error("名称或代码应为 1–60 个字符。")
+                    return
         result = load_board(api_base, direction, target, fetch, refresh=refresh, nonblocking=True)
         loading = result.get("status") == "loading" or result.get("refreshing")
         polling = st.session_state.get(f"board_poll_{direction}", False)
@@ -434,12 +569,17 @@ def _render_research_board(api_base: str, page_direction: str, fetch: Callable,
             except ValueError:
                 fetched = str(fetched)[:16]
         st.caption(f"同花顺问财 · 获取时间 {fetched or '未取得'} · 数据日期见各项指标 · 仅供研究参考")
-        rows = entity_rows(section_facts(result, "overview"))
-        matching_overview = [fact for fact in section_facts(result, "overview") if target and str(fact.get("entity_code") or "").split(".")[0] == target.split(".")[0]]
-        detail_rows = entity_rows(matching_overview + section_facts(result, "detail") + section_facts(result, "company"))
+        rows = target_rows(entity_rows(section_facts(result, "overview")), target)
+        matching_overview = [fact for fact in section_facts(result, "overview") if target and
+                             (str(fact.get("entity_code") or "").split(".")[0] == target.split(".")[0] or fact.get("entity") == target)]
+        detail_rows = target_rows(entity_rows(matching_overview + section_facts(result, "detail") + section_facts(result, "company")), target)
+        favorite_rows = rows or (target_rows(entity_rows([fact for section in ("profile", "performance", "allocation", "reference")
+                                                        for fact in section_facts(result, section)]), target) if direction == "fund" else detail_rows)
+        render_board_watchlist(api_base, direction, target, favorite_rows, api_request)
         macro = section_facts(result, "macro")
         news = section_facts(result, "news")
-        if not rows and not detail_rows and not macro and not news:
+        fund_facts = [fact for section in ("profile", "performance", "allocation", "reference") for fact in section_facts(result, section)] if direction == "fund" else []
+        if not rows and not detail_rows and not macro and not news and not fund_facts:
             if result.get("status") == "loading":
                 with st.container(horizontal=True):
                     for label in ["行情", "指标", "资料"]:
@@ -455,8 +595,11 @@ def _render_research_board(api_base: str, page_direction: str, fetch: Callable,
         missing = [section["title"] for section in result.get("sections", []) if section.get("status") in {"empty", "unavailable"}]
         if missing:
             st.caption("部分数据暂未取得：" + "、".join(missing))
+        if direction == "fund":
+            from frontend.fund_view import render_fund_details
+            render_fund_details(result, target, api_base=api_base, api_request=api_request)
         if direction == "stock" and detail_rows:
-            selected = next((row for row in detail_rows if target and target.split('.')[0] in str(row["code"] or "")), detail_rows[0])
+            selected = detail_rows[0]
             fields = selected["fields"]
             st.markdown(f"**{selected['name']}** · {selected['code'] or target or ''}")
             metrics = ["close_price", "change", "market_cap", "pe_ttm"]
@@ -478,7 +621,7 @@ def _render_research_board(api_base: str, page_direction: str, fetch: Callable,
                 business = fields.get("main_business") or fields.get("经营范围")
                 if business:
                     st.caption(("主营业务 · " if fields.get("main_business") else "经营范围 · ") + str(business["value"]))
-        else:
+        elif direction != "fund" or not target:
             with st.container(horizontal=True):
                 for row in rows[:4]:
                     fields = row["fields"]
@@ -487,7 +630,7 @@ def _render_research_board(api_base: str, page_direction: str, fetch: Callable,
                     secondary = fields.get("change") or fields.get("nav_change")
                     if direction == "industry":
                         secondary = fields.get("capital_flow")
-                    st.metric(row["name"], value, format_fact(secondary) if secondary else None, delta_color="inverse", border=True)
+                    st.metric(entity_label(row), value, format_fact(secondary) if secondary else None, delta_color="inverse", border=True)
             if result.get("target") and direction in {"fund", "convertible"}:
                 with st.container(border=True):
                     st.markdown("**近 30 期走势**")

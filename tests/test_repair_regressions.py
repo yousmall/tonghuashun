@@ -177,7 +177,7 @@ async def test_analysis_deadline_cancels_work_and_releases_admission(monkeypatch
             cancelled.set()
     monkeypatch.setattr(main.coordinator, "understand_request", slow_understand)
     with pytest.raises(HTTPException) as error:
-        await main.analyze_portfolio(request(), None)
+        await main.analyze_portfolio(request(research_mode="fast"), None)
     assert error.value.status_code == 504 and cancelled.is_set()
     slot = await admission.acquire()
     slot.release()

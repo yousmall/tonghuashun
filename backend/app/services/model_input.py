@@ -142,13 +142,29 @@ def slice_facts_for_model(
     return kept, summary
 
 
-def slice_facts_for_agent(facts: list[FactRecord], agent_id: str, baseline_ids: list[str], *, mode: str = "deep") -> list[FactRecord]:
+def slice_facts_for_agent(facts: list[FactRecord], agent_id: str, baseline_ids: list[str], *, mode: str = "deep",
+                         industry_collaboration: bool = False) -> list[FactRecord]:
     """Role-specific input, always retaining the baseline and its full lineage."""
     role_intent = {"market": Intent.MARKET_ANALYSIS, "industry": Intent.INDUSTRY_ANALYSIS,
                    "security": Intent.SECURITY_RESEARCH, "fund": Intent.FUND_SCREENING,
                    "portfolio": Intent.PORTFOLIO_REVIEW}[agent_id]
     by_id = {fact.fact_id: fact for fact in facts}
     required = set(baseline_ids)
+    current = datetime.now(timezone.utc)
+    supplemental = {
+        "market": {"close_price", "change", "turnover_value"},
+        "industry": {"capital_flow", "turnover_value", "pe_ttm", "pb", "industry_revenue_growth"},
+        "security": set(INTENT_FIELD_PRIORITY[Intent.CONVERTIBLE_BOND_ANALYSIS])
+                    - set(INTENT_FIELD_PRIORITY[Intent.SECURITY_RESEARCH]),
+        "fund": {"fund_nav", "fund_size", "nav_change", "fund_type", "tracking_index"},
+    }.get(agent_id, set()) if industry_collaboration else set()
+    # 协同的转债条款、基金净值等不能被普通个股切片过滤；预留一部分输入，
+    # 避免大量股票行情挤掉这些跨方向资料。派生指标仍保留完整上游引用。
+    supplement, _ = slice_facts_for_model(
+        [fact for fact in facts if fact.field.casefold() in supplemental and fact_is_current(fact, current)],
+        role_intent, limit=20,
+    )
+    required.update(fact.fact_id for fact in supplement)
     pending = list(required)
     while pending:
         fact = by_id.get(pending.pop())
@@ -157,7 +173,6 @@ def slice_facts_for_agent(facts: list[FactRecord], agent_id: str, baseline_ids: 
                 required.add(parent)
                 pending.append(parent)
     relevant = set(INTENT_FIELD_PRIORITY[role_intent])
-    current = datetime.now(timezone.utc)
     extra = [fact for fact in facts if fact.field.casefold() in relevant and fact.fact_id not in required
              and fact_is_current(fact, current)]
     budget = 40 if mode == "fast" else 80

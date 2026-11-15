@@ -8,6 +8,7 @@ from typing import Any
 
 from backend.app.models.schemas import DataOverviewRequest, DataOverviewResponse, DataOverviewSection
 from backend.app.services.provider_errors import ProviderCallError
+from backend.app.services.comparison import matching_fact
 
 STOCK_UNIVERSE = "贵州茅台、宁德时代、招商银行、中国平安、美的集团、长江电力"
 INDEX_UNIVERSE = "上证指数、深证成指、创业板指、沪深300"
@@ -21,7 +22,7 @@ def overview_jobs(provider: Any, request: DataOverviewRequest) -> list:
     if direction == "market":
         jobs = [
             ("overview", "主要指数", lambda: provider.query(
-                f"{INDEX_UNIVERSE}的指数简称、指数代码、最新价、涨跌幅、成交额", limit=4)),
+                f"{target or INDEX_UNIVERSE}的指数简称、指数代码、最新价、涨跌幅、成交额", limit=4)),
             ("macro", "宏观指标", lambda: provider.get_macro_data("中国最新公布的CPI、PPI、制造业PMI和社会融资规模，注明统计月份")),
             ("news", "市场资讯", lambda: provider.get_news("最近3天A股市场政策与宏观经济，最多6条")),
         ]
@@ -46,10 +47,21 @@ def overview_jobs(provider: Any, request: DataOverviewRequest) -> list:
         query_target = target or "沪深300ETF，中证500ETF，科创50ETF"
         jobs = [
             ("overview", "基金与ETF", lambda: provider.query(
-                f"筛选基金和ETF query={query_target}的基金代码、基金简称、单位净值、基金规模、管理费率，最多5只", limit=8, skill_id="hithink-fund-query")),
+                f"{query_target}的基金代码、基金简称、单位净值、净值增长率、累计净值、基金规模、基金类型、基金经理、管理费率，最多5只", limit=8, skill_id="hithink-fund-query")),
         ]
         if target:
-            jobs.append(("history", "近30期单位净值", lambda: provider.get_price_history(target, asset_type="基金", limit=30)))
+            jobs.extend([
+                ("profile", "基金概况与费率", lambda: fund_snapshot(provider, target,
+                    "基金类型、基金管理人、基金经理、基金托管人、成立日期、基金规模、跟踪标的、业绩比较基准、申购状态、赎回状态、管理费率、托管费率、销售服务费率、申购费率、赎回费率")),
+                ("performance", "阶段收益与风险", lambda: fund_snapshot(provider, target,
+                    "近1月收益率、近3月收益率、近6月收益率、近1年收益率、近3年收益率、今年以来收益率、基金风险等级、近1年最大回撤、近1年年化波动率、近1年夏普比率、跟踪误差")),
+                ("allocation", "持仓与配置", lambda: fund_snapshot(provider, target,
+                    "股票仓位、债券仓位、现金仓位、前十大重仓股占比、重仓证券、行业配置")),
+                ("history", "近30期单位净值", lambda: provider.get_price_history(target, asset_type="基金", limit=30)),
+                ("news", "基金资讯", lambda: provider.get_news(f"最近3天{target}基金相关资讯，最多6条")),
+            ])
+            if callable(getattr(provider, "get_fund_reference", None)):
+                jobs.append(("reference", "基金公开档案与同源核对", lambda: provider.get_fund_reference(target)))
     else:
         # 问财会把冗长的排序、状态和指标描述一起当作筛选条件，导致正常行情返回零行。
         # 条数由 API 的 limit 控制；缺失的指标在页面上明确显示为缺失。
@@ -63,6 +75,20 @@ def overview_jobs(provider: Any, request: DataOverviewRequest) -> list:
             jobs.append(("history", "近30期收盘价", lambda: provider.get_price_history(target, asset_type="可转债", limit=30)))
 
     return jobs
+
+
+async def fund_snapshot(provider, target, fields):
+    is_code = bool(re.fullmatch(r"\d{5,6}(?:\.[A-Za-z]{2})?", target))
+    facts = await provider.query(f"{target}的基金简称、基金代码、{fields}，逐项注明数据日期和单位",
+                                 limit=1 if is_code else 5, skill_id="hithink-fund-query")
+    # 配置宽表必须归属于查询基金；拒绝把重仓证券等其他实体混入基金指标。
+    if not is_code:
+        identities = {(fact.entity, fact.entity_code) for fact in facts if fact.entity_code}
+        # 简称与数据源全称可能不同；只有唯一的返回身份才接受简称解析。
+        if len(identities) == 1:
+            identity = next(iter(identities))
+            return [fact for fact in facts if (fact.entity, fact.entity_code) == identity]
+    return [fact for fact in facts if matching_fact(target, fact)]
 
 
 async def scoped_snapshot(provider, method, target):

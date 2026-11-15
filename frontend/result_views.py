@@ -7,6 +7,7 @@ from urllib.parse import urlsplit, urlunsplit
 import streamlit as st
 from frontend.research_report import render_research_report, report_sections
 from frontend.insight_panel import render_insight_panel
+from frontend.cross_validation_view import render_validation_panel
 from frontend.answer_report import answer_images, build_answer_pdf, chart_groups, cited_facts
 from frontend.presentation import (plain_language, render_conclusion_panel, render_logic_chain, render_source_trace, source_trace_rows, friendly_fact_rows, TOPIC_LABELS)
 from frontend.presentation import render_verification_records
@@ -135,6 +136,7 @@ def render_advice(advice: dict[str, Any], *, export_key: str = "answer", questio
     if (advice.get("research_mode") == "auto" and compliance.get("status") != "BLOCK"
             and (advice.get("answer_fact_ids") or advice.get("source_reference") or advice.get("response_scope") == "clarification")):
         render_automatic_answer(advice)
+        render_validation_panel(advice, key=export_key)
         render_research_report(advice, key=export_key, compact=compact, question=question)
         render_insight_panel(advice, key=export_key, compact=compact)
         if advice.get("evidence"):
@@ -164,6 +166,7 @@ def render_advice(advice: dict[str, Any], *, export_key: str = "answer", questio
             for value in risks:
                 st.write("- " + value)
         render_investment_panel(advice, key=export_key, compact=True)
+        render_validation_panel(advice, key=export_key)
         with st.expander("展开这条回答的图表与完整分析", key=f"answer_details_{export_key}", on_change="rerun") as details:
             if details.open:
                 render_investment_panel(advice, key=export_key)
@@ -173,6 +176,7 @@ def render_advice(advice: dict[str, Any], *, export_key: str = "answer", questio
         render_verification_records(advice, key=export_key)
     else:
         render_conclusion_panel(advice, key=f"analysis-conclusion-{export_key}")
+        render_validation_panel(advice, key=export_key)
         if advice.get("prepared_report"):
             with st.expander("查看完整报告图表", key=f"prepared_charts_{export_key}", on_change="rerun") as charts:
                 if charts.open:
