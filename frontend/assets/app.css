@@ -359,8 +359,14 @@ button:focus-visible, input:focus-visible, textarea:focus-visible,
     font-size: .78rem;
     color: var(--wence-faint);
 }
+/* 简短提问保持单行胶囊；窄屏时整组自动折行，避免按钮被压成竖条。 */
+[data-testid="stBottom"] [class*="st-key-preset_question_"] div:has(> button) {
+    flex-wrap: wrap;
+    row-gap: .35rem;
+}
 [data-testid="stBottom"] [class*="st-key-preset_question_"] button {
     min-height: 1.85rem;
+    max-width: 100%;
     padding: 0 .68rem;
     font-size: .79rem;
     border-radius: 999px;

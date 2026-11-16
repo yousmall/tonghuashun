@@ -393,7 +393,8 @@ def fake_api(base, method, path, payload=None, **kwargs):
 with patch.object(ui, 'api_request', side_effect=fake_api), patch.object(ui, 'register_browser_session'), patch.object(ui, 'enforce_session_timeout'):
     ui.main()
 """
-    app = AppTest.from_string(script).run()
+    # main() 会渲染完整页面，慢机器上 AppTest 默认 3 秒不够；断言不变，仅放宽等待。
+    app = AppTest.from_string(script).run(timeout=15)
     next(button for button in app.button if button.label == '恢复并继续对话').click().run(timeout=15)
     assert not app.exception
     assert app.session_state['navigation'] == '投资问答'

@@ -181,7 +181,8 @@ def inspect_trade_workbook(request: TradeHistoryUpload) -> dict:
             if len(preview) >= 5:
                 break
         return {"sheets": names, "sheet_name": name, "header_row": header,
-                "columns": columns, "suggested_columns": suggested, "preview": preview}
+                "columns": columns, "suggested_columns": suggested, "preview": preview,
+                "last_trade_date": _file_last_date(rows(name), header, columns, suggested)}
 
 
 def _number(value):
@@ -209,6 +210,26 @@ def _date(value):
         return date.fromisoformat(day)
     except ValueError:
         return datetime.strptime(day, "%Y-%m-%d").date()
+
+
+def _file_last_date(rows, header: int, headers: list[str], suggested: dict) -> str | None:
+    """文件内识别到的最后成交日，用于提示「近一年」窗口与文件期间的差异。"""
+
+    label = suggested.get("date")
+    if not label or label not in headers:
+        return None
+    index = headers.index(label)
+    latest = None
+    for n, values in enumerate(rows, 1):
+        if n <= header or index >= len(values) or values[index] in (None, ""):
+            continue
+        try:
+            day = _date(values[index])
+        except (ValueError, TypeError, OverflowError):
+            continue
+        if latest is None or day > latest:
+            latest = day
+    return latest.isoformat() if latest else None
 
 
 def _code(value):
@@ -260,6 +281,8 @@ def analyze_trade_history(request: TradeHistoryUpload, *, today: date | None = N
     trades = []
     accounts = set()
     identities = {}
+    seen_fills = set()
+    reused_identities = set()
     with _workbook(request) as (raw, names, rows):
         name = request.sheet_name
         if name is None:
@@ -333,12 +356,16 @@ def analyze_trade_history(request: TradeHistoryUpload, *, today: date | None = N
                 identity = _text(data.get("trade_id"))
                 if identity:
                     signature = (trade["date"], code, trade["side"], quantity, price, trade["time"])
-                    if identity in identities:
-                        if identities[identity] != signature:
-                            raise ValueError("同一成交编号对应不同记录，请核对原文件")
+                    fill = (identity, signature)
+                    if fill in seen_fills:
                         excluded["重复成交编号"] += 1
                         continue
-                    identities[identity] = signature
+                    seen_fills.add(fill)
+                    # 券商导出的「成交编号」常按申报/委托批次复用，并非逐笔唯一键。
+                    # 同号但成交明细不同时按明细保留，避免把整笔有效成交误判为无效行。
+                    if identity in identities and identities[identity] != signature:
+                        reused_identities.add(identity)
+                    identities.setdefault(identity, signature)
                 trades.append(trade)
             except (ValueError, TypeError, OverflowError):
                 excluded["字段无效"] += 1
@@ -416,6 +443,9 @@ def analyze_trade_history(request: TradeHistoryUpload, *, today: date | None = N
                    "交易额占比不是当前持仓权重；缺少资产余额与估值，不能计算换手率、年化收益或最大回撤。",
                    "持有时长仅计算一年窗口内可按先进先出匹配的股数；期末未卖出部分不计入平均值，盈利仅汇总完全匹配的卖出笔数。",
                    "未提供成交时间时，同日成交按原表行序匹配；没有成交编号时，相同内容仍按独立成交保留。"]
+    if reused_identities:
+        limitations.append(f"文件中 {len(reused_identities)} 个成交编号对应多笔不同成交，该列不是逐笔唯一编号；"
+                           "已按完整成交明细保留记录，仅对编号与明细都相同的重复行去重。")
     if unmatched_sell_count:
         limitations.append(f"有 {unmatched_sell_count} 笔卖出无法完整匹配期初成本，未纳入已匹配卖出毛损益。")
     if "currency" not in columns:

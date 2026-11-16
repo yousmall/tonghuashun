@@ -49,6 +49,11 @@ from streamlit.runtime.scriptrunner import get_script_run_ctx
 from frontend.presentation import (
     display_value, fact_label, fact_source, fact_time, fact_period, friendly_fact_rows, advice_facts, _status_code, analysis_chain_stages, source_trace_rows, _facts_used_by_result, render_chain_overview, render_conclusion_panel, _render_conclusion_content, render_logic_chain, render_source_trace, render_profile_summary, plain_language, profile_evidence_language, render_points, render_empty_state, RISK_LEVELS, PROFILE_LABELS, FIELD_LABELS, NAVIGATION, DATA_KINDS, QUICK_ASKS, QUICK_ASK_PROMPTS, RESEARCH_PREFIX, WATCHLIST_RESEARCH_PREFIX, TOPIC_LABELS, PROGRESS_LABELS
 )
+from frontend.logic_drilldown import (
+    has_traceable_evidence, render_logic_chain_entry, render_logic_chain_guide,
+    render_logic_drilldown,
+)
+from frontend.logic_demo import DEMO_ADVICE, DEMO_NOTICE, demo_trace_markdown
 
 DEFAULT_API_BASE = os.getenv("WENCE_API_BASE", "http://127.0.0.1:8000/api/v1")
 BRAND_LOGO = Path(__file__).resolve().parent / "assets" / "brand-logo.png"
@@ -1047,32 +1052,44 @@ RESEARCH_GUIDES = {
 }
 
 
+# 每个研究方向给出 3 个可直接点选的简短提问。问题只提供分析视角与验证路径，
+# 不预设结论、不代替用户判断；提交时沿用 RESEARCH_PREFIX 与当前已选标的上下文。
+# 带 {target} 的模板会在已选标的时填入名称/代码，未选标的时回退为方向默认称谓。
 PRESET_QUESTIONS = {
     "市场解读": (
-        "今天主要指数的涨跌和量能怎么样",
-        "哪些板块在走强、哪些在走弱",
-        "当前市场的主要风险点是什么",
+        "政策如何影响流动性与风险偏好？",
+        "资金流向哪里？哪些板块被低估？",
+        "市场情绪过热吗？有逆向信号吗？",
     ),
     "行业分析": (
-        "{target}行业的景气度和资金流向如何",
-        "行业内哪些公司更抗跌、估值更合理",
-        "这个行业当前的主要风险是什么",
+        "行业景气由什么驱动？",
+        "产业链哪段拥挤、哪段被低估？",
+        "高景气是否已充分定价？",
     ),
     "个股研究": (
-        "{target}的估值和主要风险",
-        "最近的财报和经营数据有什么变化",
-        "主力资金和机构观点怎么样",
+        "{target}的盈利质量撑得住估值吗？",
+        "哪些预期已定价，还有哪些预期差？",
+        "财报改善是经营好转还是一次性？",
     ),
     "基金筛选": (
-        "低费率的宽基 ETF 有哪些值得关注",
-        "近一年收益靠前的基金有哪些",
-        "怎么比较和筛选这几只基金",
+        "超额收益来自选股还是押注风格？",
+        "费率和跟踪误差吃掉多少收益？",
+        "高收益可持续吗？回撤能接受吗？",
     ),
     "可转债分析": (
-        "这只可转债的转股溢价率算高吗",
-        "到期收益率和纯债溢价率是多少",
-        "正股走势对这只转债影响多大",
+        "{target}当前偏股还是偏债？",
+        "正股上涨，转债能跟涨多少？",
+        "强赎、下修、债底哪个风险更大？",
     ),
+}
+
+# 未选定标的时，让带 {target} 的预设问题仍有完整措辞，避免可选问题少于 3 个。
+PRESET_TARGET_FALLBACK = {
+    "市场解读": "当前市场",
+    "行业分析": "当前行业",
+    "个股研究": "当前股票",
+    "基金筛选": "当前基金",
+    "可转债分析": "这只可转债",
 }
 
 
@@ -1111,16 +1128,15 @@ def _remember_preset(direction: str, text: str) -> None:
 
 
 def preset_questions(direction: str) -> list[str]:
-    """按本页方向与已选标的生成 2–3 个还没问过的预设问题。"""
+    """按本页方向与已选标的生成最多 3 个还没问过的预设问题。"""
 
     target = selected_research_target(direction)
     asked = _asked_presets(direction)
     questions: list[str] = []
     for template in PRESET_QUESTIONS.get(direction, ()):
         if "{target}" in template:
-            if not target:
-                continue
-            text = template.format(target=target)
+            # 没选标的时用方向默认称谓补全，保证每个方向始终有 3 个可选问题。
+            text = template.format(target=target or PRESET_TARGET_FALLBACK.get(direction, "当前标的"))
         else:
             text = template
         if text not in asked:
@@ -1200,6 +1216,11 @@ def render_research_page(api_base: str, direction: str) -> None:
     if not profile_ready():
         st.info("请先确认投资偏好，再开始分析。", icon=":material/person_edit:")
         st.button("进行风险评估", type="primary", on_click=go_to, args=("风险评估",))
+    # 逻辑链与数据溯源常驻入口：空白页也能查看机制，有回答时直接对最新回答逐级下钻。
+    latest_advice = next(
+        (turn.get("payload") for turn in reversed(st.session_state.conversation)
+         if turn.get("role") == "assistant" and isinstance(turn.get("payload"), dict)), None)
+    render_logic_chain_entry(latest_advice, key=f"logic_entry_{direction}")
     if direction == "个股研究":
         if profile_ready():
             render_prepared_stock_report(api_base)
@@ -1278,6 +1299,79 @@ def render_research_page(api_base: str, direction: str) -> None:
         st.info("正在后台核对资料与风险。您可以切换页面，完成后会自动显示结果。")
     st.html("<div class='legal-strip'>分析仅供参考，不保证收益。投资前，请结合自己的情况判断。</div>")
     restore_board_scroll(direction, has_conversation=bool(st.session_state.conversation))
+
+
+def _logic_chain_advice(api_base: str) -> dict[str, Any] | None:
+    """只取「确实能逐级下钻」的回答，且找到即返回，避免每次重跑都翻历史。
+
+    资料不足、被风险检查拦截、或没有认可引用的回答渲染出来只会是四层空态，
+    跳过它们，由顶部面板改用演示数据展示完整机制。
+    """
+
+    current = [
+        turn.get("payload") for turn in reversed(st.session_state.get("conversation") or [])
+        if turn.get("role") == "assistant" and isinstance(turn.get("payload"), dict)
+    ]
+    found = next((payload for payload in current if has_traceable_evidence(payload)), None)
+    if found:
+        return found
+    for item in (recent_conversations(api_base, nonblocking=True) or [])[:2]:
+        conversation_id = item.get("id")
+        if not conversation_id:
+            continue
+        detail = api_request(api_base, "GET", f"/history/{conversation_id}", quiet=True)
+        if isinstance(detail, dict):
+            found = next(
+                (message.get("payload") for message in reversed(detail.get("messages") or [])
+                 if message.get("role") == "assistant"
+                 and isinstance(message.get("payload"), dict)
+                 and has_traceable_evidence(message.get("payload"))), None
+            )
+            if found:
+                return found
+    return None
+
+
+def render_logic_chain_banner(api_base: str, *, expanded: bool = False) -> None:
+    """主内容区顶部的常驻折叠面板：不新增任何导航栏目，任何页面都能看到。
+
+    页面刚打开时默认收起，不遮挡主内容；点开后才加载下钻内容。Streamlit 按 key
+    记住状态，用户手动展开后不会因为切换页面又缩回去。
+    """
+
+    with st.expander("投资逻辑链 · 逐级展开与数据溯源", icon=":material/account_tree:",
+                     key="global_logic_chain", expanded=expanded, on_change="rerun") as panel:
+        if not panel.open:
+            return
+        render_logic_chain_guide()
+        advice = _logic_chain_advice(api_base)
+        if advice:
+            st.markdown("**本次 / 最近咨询的逻辑链**（真实数据，逐层点开，直到原始来源）")
+            render_logic_drilldown(advice, key="banner_logic_chain")
+            if st.checkbox("再看一份完整的演示逻辑链", key="logic_chain_demo_toggle"):
+                st.caption(DEMO_NOTICE)
+                render_logic_drilldown(DEMO_ADVICE, key="banner_logic_demo")
+        else:
+            # 没有可用真实回答时，用带数值、来源与原文链接的示例说明机制，
+            # 避免面板看起来「全是说明、没有信息」。完整四层放在折叠里按需渲染，
+            # 默认视图只渲染一张轻量表格，不拖慢每次页面刷新。
+            st.info("最近一次咨询没有通过核验的数据引用（资料不足、尚未发起分析，"
+                    "或已被风险检查拦截），暂时无法逐级下钻。请先在「研究资料」里加载该标的资料，"
+                    "或在后台预生成完整报告。", icon=":material/info:")
+            st.markdown(
+                "**演示逻辑链 · 四层一览**  \n" + DEMO_NOTICE + "  \n"
+                "**① 综合结论**：" + plain_language(DEMO_ADVICE["conclusion"]) + "  \n"
+                "**② 分项观点**：市场环境、行业分析、个股研究、持仓分析 4 个维度，"
+                "各含判断、可信度、风险条件与重新判断条件。  \n"
+                "**③ 数据点**：下表 7 条已核验数据，含数值、数据时间与报告期。  \n"
+                "**④ 原始来源**：见「来源」「原文」两列；派生指标可在下方折叠里回溯上游资料与计算规则。"
+            )
+            st.markdown(demo_trace_markdown())
+            with st.expander("逐层点开完整演示逻辑链（① 结论 → ② 分项观点 → ③ 数据点 → ④ 原始来源）",
+                             key="banner_demo_drill", on_change="rerun",
+                             icon=":material/account_tree:") as demo_panel:
+                if demo_panel.open:
+                    render_logic_drilldown(DEMO_ADVICE, key="banner_logic_demo")
 
 
 def render_materials_panel(api_base: str) -> None:
@@ -1503,7 +1597,16 @@ def render_analysis_details() -> None:
             render_chain_overview(advice)
     if chain.open:
         with chain:
-            render_logic_chain(advice)
+            by_dimension, drilldown = st.tabs(
+                ["按维度展开", "逐级下钻与溯源"],
+                key="history_logic_view", on_change="rerun",
+            )
+            if by_dimension.open:
+                with by_dimension:
+                    render_logic_chain(advice)
+            if drilldown.open:
+                with drilldown:
+                    render_logic_drilldown(advice, key="history_drill")
     if evidence.open:
         with evidence:
             render_source_trace(advice, collapsed=False)
@@ -2134,6 +2237,7 @@ def main() -> None:
         st.session_state.navigation = "投资问答"
         st.session_state.history_view = True
     page = render_sidebar(api_base, full=True)
+    render_logic_chain_banner(api_base)
     if page in {"主页", "自选研究", "投资问答"}:
         ensure_watchlist_loaded(api_base, nonblocking=True)
     if not st.session_state.get("profile_restored") and (api_base, "/profile") in st.session_state.get("account_prefetch_results", {}):
