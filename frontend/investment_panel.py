@@ -5,6 +5,7 @@ import math
 from typing import Any
 
 import streamlit as st
+from frontend.charts import render_chart
 
 
 def _number(value: Any) -> float | None:
@@ -115,7 +116,7 @@ def render_investment_panel(advice: dict, *, key: str, compact: bool = False) ->
                 color=alt.condition(alt.datum['情景空间（%）'] >= 0, alt.value("#ad384e"), alt.value("#18794e")),
                 tooltip=["标的:N", "参考价:Q", "目标价:Q", "币种:N", alt.Tooltip("情景空间（%）:Q", format="+.2f"), "目标期限:N"],
             )
-            st.altair_chart(chart.properties(height=max(130, 45 * len(returns))), width="stretch", key=f"returns_{key}")
+            render_chart(chart.properties(height=max(130, 45 * len(returns))), width="stretch", key=f"returns_{key}")
             st.dataframe(returns, hide_index=True, width="stretch", column_config={
                 "情景空间（%）": st.column_config.NumberColumn(format="%.2f"),
                 "原文": st.column_config.LinkColumn(display_text="查看原文"),
@@ -128,7 +129,7 @@ def render_investment_panel(advice: dict, *, key: str, compact: bool = False) ->
                 x2="上限（%）:Q", y=alt.Y("资产类别:N", title=None, sort=None),
                 tooltip=["资产类别:N", "下限（%）:Q", "上限（%）:Q", "依据:N"],
             )
-            st.altair_chart(chart.properties(height=max(140, 45 * len(positions))), width="stretch", key=f"allocation_{key}")
+            render_chart(chart.properties(height=max(140, 45 * len(positions))), width="stretch", key=f"allocation_{key}")
             st.dataframe(positions, hide_index=True, width="stretch")
         for text in sections[1][1]:
             st.write(text)

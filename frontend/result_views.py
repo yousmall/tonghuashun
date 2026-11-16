@@ -5,6 +5,7 @@ from typing import Any
 import re
 from urllib.parse import urlsplit, urlunsplit
 import streamlit as st
+from frontend.charts import render_chart
 from frontend.research_report import render_research_report, report_sections
 from frontend.insight_panel import render_insight_panel
 from frontend.cross_validation_view import render_validation_panel
@@ -45,7 +46,7 @@ def render_answer_charts(advice, *, key="answer"):
                 y=alt.Y("数值:Q", title=group["unit"] or "数值", scale=alt.Scale(zero=False)),
                 tooltip=[alt.Tooltip("期间:T", format="%Y-%m-%d"), alt.Tooltip("数值:Q", format=",.4f")])
         height = max(230, len(frame) * 54) if group["kind"] == "bar" else 230
-        st.altair_chart(chart.properties(height=height).interactive(), width="stretch", key=f"answer_chart_{key}_{index}")
+        render_chart(chart.properties(height=height).interactive(), width="stretch", key=f"answer_chart_{key}_{index}")
         st.caption("数据期间 " + group["period"] + " · 仅展示本回答实际引用的数据，不代表收益预测。")
 
 

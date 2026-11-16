@@ -31,6 +31,7 @@ from urllib.parse import quote, urlparse
 
 import httpx
 import streamlit as st
+from frontend.charts import render_bar, render_chart
 from frontend.risk_assessment import render_risk_assessment
 from backend.app.risk_questionnaire import assessment_is_current
 from frontend.result_views import render_advice, cached_answer_images, answer_export_payload, show_status
@@ -1683,7 +1684,7 @@ def render_portfolio_risk_dashboard(portfolio: list[dict[str, Any]]) -> None:
                 )
                 .properties(height=230)
             )
-            st.altair_chart(donut, width="stretch")
+            render_chart(donut, width="stretch")
     elif snapshot["total"] > 1.0:
         st.info("持仓占比超过 100%，请修正比例后查看构成图。")
     render_stat_cards(
@@ -1701,7 +1702,7 @@ def render_portfolio_risk_dashboard(portfolio: list[dict[str, Any]]) -> None:
             "持仓": [item["name"] for item in snapshot["holdings"]],
             "组合占比": [item["weight"] * 100 for item in snapshot["holdings"]],
         }
-        st.bar_chart(chart_data, x="持仓", y="组合占比", horizontal=True)
+        render_bar(chart_data, x="持仓", y="组合占比", horizontal=True)
     with stress, st.container(border=True):
         st.markdown("**组合压力情景**")
         shock = st.slider(

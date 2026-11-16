@@ -6,6 +6,7 @@ from typing import Any
 import altair as alt
 import pandas as pd
 import streamlit as st
+from frontend.charts import render_chart
 
 
 def _label(candidate: dict[str, Any]) -> str:
@@ -35,7 +36,7 @@ def render_decision(decision: dict[str, Any] | None, *, key: str = "comparison")
         x=alt.X("综合得分:Q", title="综合得分（0–100，仅组内相对）", scale=alt.Scale(domain=[0, 100])),
         tooltip=["标的:N", alt.Tooltip("综合得分:Q", format=".1f")],
     ).properties(height=max(150, len(frame) * 44))
-    st.altair_chart(chart.configure_view(stroke=None), width="stretch", key=f"decision_scores_{key}")
+    render_chart(chart.configure_view(stroke=None), width="stretch", key=f"decision_scores_{key}")
 
     dimensions = decision.get("dimensions") or []
     rows = []

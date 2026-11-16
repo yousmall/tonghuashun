@@ -5,6 +5,7 @@ from urllib.parse import quote
 
 import pandas as pd
 import streamlit as st
+from frontend.charts import render_line, render_bar
 
 PERIODS = {"全部时间": 0, "最近 7 天": 7, "最近 30 天": 30, "最近 90 天": 90}
 SKILL_LABELS = {
@@ -105,7 +106,7 @@ def _users(base: str, request: Callable, days: int) -> None:
 
 def _domain_chart(stats: dict) -> None:
     rows = [{"领域": item["label"], "咨询次数": item["count"]} for item in stats["domains"]]
-    st.bar_chart(pd.DataFrame(rows), x="领域", y="咨询次数", horizontal=True)
+    render_bar(pd.DataFrame(rows), x="领域", y="咨询次数", horizontal=True)
 
 
 def _consultations(base: str, request: Callable, days: int) -> None:
@@ -116,7 +117,7 @@ def _consultations(base: str, request: Callable, days: int) -> None:
     st.caption("每轮已保存的用户提问计一次；历史回看不重复计数。旧记录缺少领域信息时归入其他 / 未分类。")
     _domain_chart(stats)
     if stats["daily"]:
-        st.line_chart(pd.DataFrame([{"日期（UTC）": item["date"], "咨询次数": item["count"]}
+        render_line(pd.DataFrame([{"日期（UTC）": item["date"], "咨询次数": item["count"]}
                                    for item in stats["daily"]]), x="日期（UTC）", y="咨询次数")
     st.subheader("各领域咨询最多的 5 个标的或主题")
     st.caption("有明确研究对象时按标的统计；没有对象时按提问主题统计。次数相同时按名称排序。")
@@ -152,7 +153,7 @@ def _iwencai(base: str, request: Callable, days: int) -> None:
         "重试": row["retries"], "平均耗时（毫秒）": row["average_ms"], "资料条数": row["facts"],
     } for row in stats["by_interface"]]), hide_index=True)
     if stats["daily"]:
-        st.line_chart(pd.DataFrame([{"日期（UTC）": row["date"], "请求次数": row["count"], "失败次数": row["failed"]}
+        render_line(pd.DataFrame([{"日期（UTC）": row["date"], "请求次数": row["count"], "失败次数": row["failed"]}
                                    for row in stats["daily"]]), x="日期（UTC）", y=["请求次数", "失败次数"])
     if stats["errors"]:
         st.subheader("失败原因")

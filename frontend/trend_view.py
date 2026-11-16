@@ -10,6 +10,7 @@ from typing import Any
 import altair as alt
 import pandas as pd
 import streamlit as st
+from frontend.charts import render_chart
 
 VERDICT_COLORS = {
     "上行": "#ad384e",
@@ -117,7 +118,7 @@ def render_trend_chart(result: dict[str, Any], *, key: str, height: int = 260) -
                      alt.Tooltip("均线:Q", title="MA5", format=",.4f")],
         ))
     chart = alt.layer(*layers).resolve_scale(y="shared").properties(height=height)
-    st.altair_chart(chart.configure_view(stroke=None), width="stretch", key=f"trend_chart_{key}")
+    render_chart(chart.configure_view(stroke=None), width="stretch", key=f"trend_chart_{key}")
     caption = (f"数据区间 {str(points[0]['date'])} 至 {str(points[-1]['date'])} · {len(points)} 期"
                + (" · 虚线为五日均线" if len(ma5) >= 2 else ""))
     st.caption(caption)
@@ -138,7 +139,7 @@ def render_signal_chart(analysis: dict[str, Any], *, key: str) -> None:
         tooltip=[alt.Tooltip("信号:N"), alt.Tooltip("读数:N"),
                  alt.Tooltip("得分:Q", format=".2f"), alt.Tooltip("权重:Q", format=".2f")],
     ).properties(height=max(180, len(rows) * 34))
-    st.altair_chart(chart.configure_view(stroke=None), width="stretch", key=f"signal_chart_{key}")
+    render_chart(chart.configure_view(stroke=None), width="stretch", key=f"signal_chart_{key}")
 
 
 def render_trend_panel(result: dict[str, Any], *, key: str, unit_label: str = "",

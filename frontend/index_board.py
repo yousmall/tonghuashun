@@ -7,6 +7,7 @@ from typing import Any
 import altair as alt
 import pandas as pd
 import streamlit as st
+from frontend.charts import render_chart
 
 from frontend.trend_view import render_trend_panel
 
@@ -85,7 +86,7 @@ def render_index_board(api_base: str, api_request, *, key: str = "market") -> No
                 tooltip=[alt.Tooltip("日期:T", format="%Y-%m-%d"), alt.Tooltip("指数:N"),
                          alt.Tooltip("归一化:Q", format=".2f")],
             ).properties(height=280)
-            st.altair_chart(chart.configure_view(stroke=None), width="stretch", key=f"index_compare_{key}")
+            render_chart(chart.configure_view(stroke=None), width="stretch", key=f"index_compare_{key}")
             st.caption("归一化只用于同图比较相对强弱，不代表收益率；各指数点位量级不同。")
     options = [item for item in items if (item.get("analysis") or {}).get("available")]
     if options:

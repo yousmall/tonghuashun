@@ -4,6 +4,7 @@ from datetime import date
 import altair as alt
 import pandas as pd
 import streamlit as st
+from frontend.charts import render_chart
 from streamlit.runtime.scriptrunner import get_script_run_ctx
 from frontend.answer_report import chart_groups
 from frontend.comparison import comparison_matrix
@@ -160,7 +161,7 @@ def _comparison_result(api_base, actions):
         group = options[choice]
         frame = pd.DataFrame(group["rows"])
         color = alt.condition(alt.datum.value >= 0, alt.value("#ad384e"), alt.value("#18794e")) if "涨跌" in group["title"] else alt.value("#246b89")
-        st.altair_chart(alt.Chart(frame).mark_bar(cornerRadiusEnd=4).encode(
+        render_chart(alt.Chart(frame).mark_bar(cornerRadiusEnd=4).encode(
             color=color,
             x=alt.X("value:Q", title=group["unit"]), y=alt.Y("name:N", title=None),
             tooltip=[alt.Tooltip("name:N", title="标的"), alt.Tooltip("value:Q", title="数值", format=",.4f")]).properties(height=240), width="stretch", key="comparison_chart")

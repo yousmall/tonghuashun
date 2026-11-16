@@ -9,6 +9,7 @@ from time import monotonic
 from typing import Any, Callable
 
 import streamlit as st
+from frontend.charts import render_chart
 from frontend.financial_view import fact_unit, fact_numeric_value
 from backend.app.fund_fields import FUND_RETURNS, FUND_PROFILE, FUND_FEES, FUND_RISK, FUND_ALLOCATION, FUND_PERCENT_FIELDS, FUND_MONEY
 from streamlit.runtime.scriptrunner import get_script_run_ctx
@@ -418,7 +419,7 @@ def render_comparison(rows: list[dict], direction: str) -> None:
         color=alt.condition(alt.datum.数值 >= 0, alt.value("#ad384e"), alt.value("#18794e")),
         tooltip=[alt.Tooltip("名称:N"), alt.Tooltip("数值:Q", title=title, format=",.2f"), alt.Tooltip("日期:N")],
     ).properties(height=max(240, len(points)*56) if roomy else max(180, len(points)*35)).configure_view(stroke=None)
-    st.altair_chart(chart, width="stretch")
+    render_chart(chart, width="stretch")
 
 
 def render_history(facts: list[dict]) -> None:
@@ -453,7 +454,7 @@ def render_history(facts: list[dict]) -> None:
                                   y=alt.Y("数值:Q", title=label, scale=alt.Scale(zero=False)))
     chart = base.mark_line(color="#ad384e", strokeWidth=2.5).encode(
         tooltip=[alt.Tooltip("日期:T", format="%Y-%m-%d"), alt.Tooltip("数值:Q", title=label, format=".4f" if metric == "fund_nav" else ".2f")])
-    st.altair_chart(chart.properties(height=235).configure_view(stroke=None), width="stretch")
+    render_chart(chart.properties(height=235).configure_view(stroke=None), width="stretch")
     st.caption(f"数据区间 {records[0]['日期']} 至 {records[-1]['日期']} · {len(records)} 期 · 同花顺问财")
 
 

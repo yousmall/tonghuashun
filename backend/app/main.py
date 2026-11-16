@@ -230,7 +230,10 @@ research_pipeline = AutomatedResearchPipeline(data_provider, cache=ResearchFactC
 service_metrics = ServiceMetrics()
 local_consultation = LocalConsultationService()
 instant_research = InstantResearchService()
-local_research_admission = ResearchAdmission(limit=16, queue_seconds=0.05)
+local_research_admission = ResearchAdmission(
+    limit=int(os.getenv("WENCE_LOCAL_RESEARCH_MAX_CONCURRENCY", "16")),
+    queue_seconds=float(os.getenv("WENCE_LOCAL_RESEARCH_QUEUE_SECONDS", "0.75")),
+)
 research_admission = ResearchAdmission()
 analysis_timeout_seconds = float(os.getenv("WENCE_ANALYSIS_TIMEOUT_SECONDS", "90"))
 if not 0 < analysis_timeout_seconds <= 300:

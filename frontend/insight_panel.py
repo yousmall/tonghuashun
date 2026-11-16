@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 import streamlit as st
+from frontend.charts import render_chart
 
 from frontend.presentation import plain_language
 
@@ -59,7 +60,7 @@ def render_process_panel(advice: dict[str, Any], *, key: str) -> None:
             x=alt.X("耗时（毫秒）:Q", title="阶段耗时（毫秒）"),
             tooltip=["阶段:N", alt.Tooltip("耗时（毫秒）:Q", format=",.0f")],
         ).properties(height=max(180, len(rows) * 34))
-        st.altair_chart(chart.configure_view(stroke=None), width="stretch", key=f"insight_stages_{key}")
+        render_chart(chart.configure_view(stroke=None), width="stretch", key=f"insight_stages_{key}")
         st.caption("阶段耗时来自服务端计时；并行阶段按实际等待时间记录，总和可能小于完整耗时。")
     else:
         st.caption("本次响应没有阶段耗时记录（可能来自历史精简记录）。")
@@ -137,7 +138,7 @@ def render_conclusion_panel(advice: dict[str, Any], *, key: str) -> None:
                 xOffset="来源:N",
                 tooltip=["智能体:N", "来源:N", alt.Tooltip("分数:Q", format=".1f")],
             ).properties(height=max(180, len(frame) * 40))
-            st.altair_chart(chart.configure_view(stroke=None), width="stretch", key=f"insight_scores_{key}")
+            render_chart(chart.configure_view(stroke=None), width="stretch", key=f"insight_scores_{key}")
         st.caption("规则分由确定性规则计算，模型分只用于解释与对照；分数不代表预期收益。")
 
     sources: dict[str, int] = {}
@@ -152,7 +153,7 @@ def render_conclusion_panel(advice: dict[str, Any], *, key: str) -> None:
             x=alt.X("资料条数:Q", title="条"),
             tooltip=["来源:N", "资料条数:Q"],
         ).properties(height=max(140, len(frame) * 32))
-        st.altair_chart(chart.configure_view(stroke=None), width="stretch", key=f"insight_sources_{key}")
+        render_chart(chart.configure_view(stroke=None), width="stretch", key=f"insight_sources_{key}")
     if risks:
         st.markdown("**风险与待核实事项**")
         for risk in risks[:8]:

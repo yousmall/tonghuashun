@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import streamlit as st
+from frontend.charts import render_line
 from frontend.financial_view import period_info
 from backend.app.fund_fields import FUND_RETURNS, FUND_PROFILE, FUND_FEES, FUND_RISK, FUND_ALLOCATION, FUND_MONEY
 
@@ -144,7 +145,7 @@ def render_fund_details(result, target, *, api_base="", api_request=None):
             st.markdown("**近30期每万份收益（元）**")
             frame = pd.DataFrame(money_history["value"]).rename(columns={"date":"日期", "value":"每万份收益（元）"})
             frame["日期"] = pd.to_datetime(frame["日期"])
-            st.line_chart(frame,x="日期",y="每万份收益（元）",width="stretch")
+            render_line(frame,x="日期",y="每万份收益（元）",width="stretch")
             st.caption("来源：天天基金公开序列 · 区间 " + data_period(money_history))
             return
         st.markdown("**近 30 期单位净值走势**")

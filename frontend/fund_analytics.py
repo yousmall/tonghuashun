@@ -1,6 +1,7 @@
 """长周期基金复利表现与同口径风险对比。"""
 import pandas as pd
 import streamlit as st
+from frontend.charts import render_line
 from backend.app.services.fund_analytics import CALCULATION_VERSION
 
 
@@ -54,7 +55,7 @@ def render_fund_analytics(api_base, api_request, row):
     if records:
         frame = pd.DataFrame(records)
         frame["日期"] = pd.to_datetime(frame["日期"])
-        st.line_chart(frame, x="日期", y="复利指数", color="基金", width="stretch")
+        render_line(frame, x="日期", y="复利指数", color="基金", width="stretch")
     st.caption(f"共同区间 {result.get('start_date')} 至 {result.get('end_date')} · 年化基数 {result.get('annualization')} · 假设无风险利率 {result.get('risk_free_rate')}%")
     for note in result.get("notes", []):
         st.caption(note)

@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 import streamlit as st
+from frontend.charts import render_bar
 
 from backend.app.services.trade_history import FIELD_LABELS, REQUIRED
 
@@ -32,7 +33,7 @@ def render_trade_analysis(analysis: dict) -> None:
     for note in analysis.get("behavioral_notes", []):
         st.write(note)
     st.caption("交易行为仅作为画像补充；风险承受能力以确认的风险问卷为准。")
-    st.bar_chart([{"月份": r["month"], "买入笔数": r["buy_count"], "卖出笔数": r["sell_count"]}
+    render_bar([{"月份": r["month"], "买入笔数": r["buy_count"], "卖出笔数": r["sell_count"]}
                   for r in analysis["monthly"]], x="月份", y=["买入笔数", "卖出笔数"])
     with st.expander("交易统计与数据核验"):
         st.write(f"买入成交额：{analysis['buy_amount']:,.2f} 元；卖出成交额：{analysis['sell_amount']:,.2f} 元。")
@@ -75,7 +76,7 @@ def render_report_analysis(analysis: dict) -> None:
     for limitation in analysis["limitations"]:
         st.caption(limitation)
     if analysis.get("monthly"):
-        st.bar_chart([{"月份": row["month"], "成交笔数": row["trade_count"]} for row in analysis["monthly"]],
+        render_bar([{"月份": row["month"], "成交笔数": row["trade_count"]} for row in analysis["monthly"]],
                      x="月份", y="成交笔数")
     with st.expander("报告指标与来源", expanded=True):
         st.dataframe([{"指标": row["label"], "报告数值": row["value"], "单位或口径": row["unit"],
