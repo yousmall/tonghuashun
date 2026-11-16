@@ -159,6 +159,23 @@ def test_duplicate_trade_id_deduplicates_but_repeated_fills_without_id_remain():
     assert analyze_trade_history(upload([ROWS[0], ROWS[0]]))["trade_count"] == 2
 
 
+def test_reused_batch_trade_ids_keep_distinct_fills():
+    """券商导出的成交编号常按委托批次复用，不能把同号不同明细的成交判为无效。"""
+
+    rows = [ROWS[0] + ["batch-1"],
+            ["2026-01-02", 600000, "买入", 200, 20, "示例二"] + ["batch-1"],
+            ROWS[0] + ["batch-1"]]
+    result = analyze_trade_history(upload(rows, HEADERS + ["成交编号"]))
+    assert result["trade_count"] == 2 and result["excluded_rows"]["重复成交编号"] == 1
+    assert "字段无效" not in result["excluded_rows"]
+    assert any("不是逐笔唯一编号" in note for note in result["limitations"])
+
+
+def test_inspect_reports_file_last_trade_date():
+    result = inspect_trade_workbook(upload())
+    assert result["last_trade_date"] == "2026-02-01"
+
+
 @pytest.mark.parametrize("patch, message", [
     ({"content_base64": "%%%"}, "编码"),
     ({"content_base64": base64.b64encode(b"not excel").decode()}, "无法读取"),
@@ -250,6 +267,36 @@ with patch('frontend.trade_profile.st.file_uploader', return_value=file):
     assert not app.exception and app.session_state["did_save"]
     assert not app.session_state["profile"]["confirmed"]
     assert app.session_state["profile"]["trading_analysis"]["confirmed"]
+
+
+def test_page_can_use_file_last_trade_date_as_cutoff():
+    """旧文件最后成交日早于今天时，可一键把近一年窗口对齐到文件期间。"""
+
+    content = upload().content_base64
+    script = f'''
+import base64
+from io import BytesIO
+from unittest.mock import patch
+import streamlit as st
+from frontend import streamlit_app as ui
+from backend.app.models.trade_history import TradeHistoryUpload
+from backend.app.services.trade_history import inspect_trade_workbook, analyze_trade_history
+ui.init_session()
+file = BytesIO(base64.b64decode({content!r}))
+file.name = "交易.xlsx"
+def fake_api(base, method, path, payload=None, **kwargs):
+    data = TradeHistoryUpload(**payload)
+    return inspect_trade_workbook(data) if path.endswith('/inspect') else analyze_trade_history(data)
+with patch('frontend.trade_profile.st.file_uploader', return_value=file):
+    from frontend.trade_profile import render_trade_profile
+    render_trade_profile('http://offline', api_request=fake_api)
+'''
+    app = AppTest.from_string(script).run(timeout=15)
+    next(b for b in app.button if b.label == "读取 Excel").click().run(timeout=15)
+    assert not app.exception
+    next(b for b in app.button if b.label.startswith("按文件最后成交日")).click().run(timeout=15)
+    assert not app.exception
+    assert str(app.session_state["trade_profile_as_of"]) == "2026-02-01"
 
 
 def test_logout_clears_upload_and_analysis_state():

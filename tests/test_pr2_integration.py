@@ -178,3 +178,84 @@ async def test_index_failure_reason_is_specific_and_does_not_leak_raw_exception(
     assert '未返回' in entries['创业板指'].message
     assert 'private-example' not in result.model_dump_json()
     assert any('密钥无效' in note for note in result.notes)
+
+
+# --- 投资问答五个研究方向的简洁预设问题 ---
+
+MARKET_PRESETS = (
+    "政策如何影响流动性与风险偏好？",
+    "资金流向哪里？哪些板块被低估？",
+    "市场情绪过热吗？有逆向信号吗？",
+)
+
+
+def test_market_presets_match_requested_wording():
+    from frontend.streamlit_app import PRESET_QUESTIONS
+    assert PRESET_QUESTIONS['市场解读'] == MARKET_PRESETS
+
+
+def test_each_direction_has_three_distinct_concise_presets():
+    from frontend.presentation import QUICK_ASKS
+    from frontend.streamlit_app import PRESET_QUESTIONS
+    assert set(PRESET_QUESTIONS) == set(QUICK_ASKS)
+    all_texts = []
+    for direction in QUICK_ASKS:
+        texts = PRESET_QUESTIONS[direction]
+        assert len(texts) == 3 and len(set(texts)) == 3
+        # 保留有分析视角的完整问句，同时足够短、能在胶囊按钮里单行显示。
+        assert all(8 <= len(text) <= 24 and '？' in text for text in texts)
+        all_texts.extend(texts)
+    assert len(set(all_texts)) == 15
+
+
+def test_presets_keep_three_options_without_selected_target():
+    from frontend.presentation import QUICK_ASKS
+    script = '''
+import streamlit as st
+from frontend import streamlit_app as ui
+from frontend.presentation import QUICK_ASKS
+ui.init_session()
+ui.selected_research_target = lambda direction: None
+st.session_state['presets'] = {d: ui.preset_questions(d) for d in QUICK_ASKS}
+'''
+    app = AppTest.from_string(script).run(timeout=20)
+    assert not app.exception
+    presets = app.session_state['presets']
+    assert all(len(items) == 3 for items in presets.values())
+    assert all('{target}' not in text for items in presets.values() for text in items)
+    assert presets['个股研究'][0].startswith('当前股票')
+    assert presets['可转债分析'][0].startswith('这只可转债')
+
+
+def test_presets_use_selected_target_when_available():
+    script = '''
+import streamlit as st
+from frontend import streamlit_app as ui
+ui.init_session()
+ui.selected_research_target = lambda direction: ('示例转债' if direction == '可转债分析' else '600519')
+st.session_state['stock'] = ui.preset_questions('个股研究')
+st.session_state['bond'] = ui.preset_questions('可转债分析')
+'''
+    app = AppTest.from_string(script).run(timeout=20)
+    assert not app.exception
+    assert app.session_state['stock'][0].startswith('600519')
+    assert app.session_state['bond'][0].startswith('示例转债')
+
+
+def test_clicking_concise_preset_submits_prefixed_question():
+    script = '''
+import streamlit as st
+from frontend import streamlit_app as ui
+def submit(base, direction, query):
+    st.session_state.sent = query
+ui.submit_chat_analysis = submit
+ui.init_session()
+st.session_state.profile['confirmed'] = True
+ui.render_preset_questions('test-only', '市场解读')
+'''
+    app = AppTest.from_string(script).run(timeout=20)
+    question = app.pills[0].options[0]
+    app.pills[0].set_value(question).run(timeout=20)
+    assert not app.exception
+    assert app.session_state['sent'] == '市场解读：' + question
+    assert len(app.pills[0].options) == 2

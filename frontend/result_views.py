@@ -12,6 +12,7 @@ from frontend.cross_validation_view import render_validation_panel
 from frontend.answer_report import answer_images, build_answer_pdf, chart_groups, cited_facts
 from frontend.presentation import (plain_language, render_conclusion_panel, render_logic_chain, render_source_trace, source_trace_rows, friendly_fact_rows, TOPIC_LABELS)
 from frontend.presentation import render_verification_records
+from frontend.logic_drilldown import render_logic_drilldown
 from frontend.investment_panel import render_investment_panel, investment_summary
 from frontend.answer_visibility import coverage_notices, verification_notes, visible_risks, visible_next_steps, visible_risk_conclusion, visible_compliance_reason
 
@@ -172,7 +173,16 @@ def render_advice(advice: dict[str, Any], *, export_key: str = "answer", questio
             if details.open:
                 render_investment_panel(advice, key=export_key)
                 render_answer_charts(advice, key=export_key)
-                render_logic_chain(advice)
+                by_dimension, drilldown = st.tabs(
+                    ["按维度展开", "逐级下钻与溯源"],
+                    key=f"logic_view_compact_{export_key}", on_change="rerun",
+                )
+                if by_dimension.open:
+                    with by_dimension:
+                        render_logic_chain(advice)
+                if drilldown.open:
+                    with drilldown:
+                        render_logic_drilldown(advice, key=f"drill_compact_{export_key}")
                 render_source_trace(advice, key=f"sources_{export_key}")
         render_verification_records(advice, key=export_key)
     else:
@@ -190,7 +200,16 @@ def render_advice(advice: dict[str, Any], *, export_key: str = "answer", questio
                     render_answer_charts(advice, key=export_key)
         with st.expander("分析过程与分项依据", key=f"answer_analysis_{export_key}", on_change="rerun", icon=":material/account_tree:") as details:
             if details.open:
-                render_logic_chain(advice)
+                by_dimension, drilldown = st.tabs(
+                    ["按维度展开", "逐级下钻与溯源"],
+                    key=f"logic_view_{export_key}", on_change="rerun",
+                )
+                if by_dimension.open:
+                    with by_dimension:
+                        render_logic_chain(advice)
+                if drilldown.open:
+                    with drilldown:
+                        render_logic_drilldown(advice, key=f"drill_{export_key}")
         render_source_trace(advice, key=f"sources_{export_key}")
     render_research_report(advice, key=export_key, compact=compact, question=question)
     render_stock_recommendation(advice)
