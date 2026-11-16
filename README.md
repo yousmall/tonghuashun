@@ -276,3 +276,11 @@ python -m streamlit run frontend/streamlit_app.py
 - 研究结论下展开「交叉检验与人工复核工作单」，先查看本次待核实事项和相关事实，再核对原文、行业分类、统计期、单位及派生依据。单一来源、同源转载或多智能体引用相同材料不构成独立来源验证。缺失值不能按零处理，亏损行业的负市盈率不能解释为低估。
 - 填写复核人、原文依据与逐项说明，选择「仍待补证」「存在异议」或「人工核对无异议」，保存后可下载 JSON 记录。「无异议」要求完成全部检查并提供原文依据和可核对资料。意见只保留在当前登录会话，退出后清除，请下载留存；结果或证据变化后需重新复核。
 - 人工记录独立于系统审核，不覆盖 REVIEW/BLOCK、不解除风险拦截。补齐缺项后刷新资料，重新提交分析，由系统再次核验。该入口不提供资料上传或服务端审批功能。
+
+## 贡献者（Contributors）
+
+感谢以下开发者通过 Pull Request 参与项目，按首次提交 PR 的顺序列出：
+
+- [@zzzzzzz0210](https://github.com/zzzzzzz0210)：[PR #1](https://github.com/yousmall/tonghuashun/pull/1)，走势分析、指数看板、投资价值比较及分析过程可视化。
+- [@wai4tt](https://github.com/wai4tt)：[PR #2](https://github.com/yousmall/tonghuashun/pull/2)，风险画像插画、热门板块观察、预设问题及追问上下文。
+- [@bohetangx](https://github.com/bohetangx)：[PR #3](https://github.com/yousmall/tonghuashun/pull/3)，预设问题精简、XLS 成交明细兼容及投资逻辑链溯源。
