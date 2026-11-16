@@ -167,6 +167,7 @@ class UserProfile(BaseModel):
     behavioral_notes: list[str] = Field(default_factory=list)
     # 股票交易行为与风险问卷分开保存；写接口仅接受服务端重新计算的结果。
     trading_analysis: dict[str, Any] = Field(default_factory=dict)
+    investment_workspace: dict[str, Any] = Field(default_factory=dict)
     # 两类上限是组合/合规可执行的硬约束，不由语言模型自行决定。
     single_security_limit: float = Field(default=0.20, gt=0, le=1)
     industry_limit: float = Field(default=0.30, gt=0, le=1)
@@ -208,6 +209,8 @@ class FactRecord(BaseModel):
     period: str | None = None
     # 行情/文档的实际日期，与用于同项比对的 REC 标识分开。
     observation_date: date | None = None
+    # Only an explicit upstream intraday timestamp; never substitute capture time.
+    source_timestamp: datetime | None = None
     # 规则派生事实记录输入 fact_id；供应商原始事实保持为空。
     derived_from: list[str] = Field(default_factory=list)
     # 产出这条事实的取数调用键（方法@研究目标）。仅用于判断能否复用已有资料、
@@ -243,13 +246,13 @@ class FactRecord(BaseModel):
             raise ValueError("原文链接不能使用 IP 地址")
         return value.strip()
 
-    @field_validator("snapshot_time")
+    @field_validator("snapshot_time", "source_timestamp")
     @classmethod
-    def snapshot_time_must_include_timezone(cls, value: datetime) -> datetime:
+    def snapshot_time_must_include_timezone(cls, value: datetime | None) -> datetime | None:
         """拒绝无时区时间，防止时效核验把本地时间错误当作 UTC。"""
-        if value.tzinfo is None or value.utcoffset() is None:
+        if value is not None and (value.tzinfo is None or value.utcoffset() is None):
             raise ValueError("snapshot_time 必须包含时区，例如 2026-08-29T08:00:00Z")
-        return value.astimezone(timezone.utc)
+        return value.astimezone(timezone.utc) if value is not None else None
 
 
 class TaskNode(BaseModel):
@@ -719,6 +722,7 @@ class StockRecommendationCandidate(BaseModel):
     evidence: list[str] = Field(default_factory=list)
     snapshot_time: datetime | None = None
     missing_fields: dict[str, list[str]] = Field(default_factory=dict)
+    personal_fit: dict[str, Any] = Field(default_factory=dict)
 
 
 class StockRecommendationResult(BaseModel):

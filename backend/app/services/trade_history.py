@@ -20,7 +20,7 @@ MAX_COLS = 60
 FIELD_LABELS = {"date": "成交日期", "code": "证券代码", "side": "买卖方向",
                 "quantity": "成交数量", "price": "成交价格", "name": "证券名称",
                 "account": "账户标识", "currency": "币种", "asset_type": "证券类型",
-                "time": "成交时间", "trade_id": "成交编号"}
+                "time": "成交时间", "trade_id": "成交编号", "fee": "该笔总费用", "industry": "所属行业"}
 REQUIRED = ("date", "code", "side", "quantity", "price")
 ALIASES = {
     "date": ("成交日期", "交易日期", "发生日期", "业务日期", "日期", "date", "tradedate"),
@@ -34,6 +34,8 @@ ALIASES = {
     "asset_type": ("证券类型", "资产类型", "品种类型", "assettype"),
     "time": ("成交时间", "交易时间", "time"),
     "trade_id": ("成交编号", "成交序号", "tradeid"),
+    "fee": ("总费用", "交易费用合计", "该笔总费用", "fee", "totalfee"),
+    "industry": ("所属行业", "行业", "industry"),
 }
 BUY = {"买", "买入", "证券买入", "股票买入", "普通买入", "买入成交", "buy", "b"}
 SELL = {"卖", "卖出", "证券卖出", "股票卖出", "普通卖出", "卖出成交", "sell", "s"}
@@ -354,6 +356,10 @@ def analyze_trade_history(request: TradeHistoryUpload, *, today: date | None = N
                          "side": "buy" if side_text in BUY else "sell", "quantity": quantity,
                          "price": price, "amount": quantity * price, "row": n, "time": _time(time_value)}
                 identity = _text(data.get("trade_id"))
+                trade["fee"] = _number(data["fee"]) if data.get("fee") not in (None, "") else None
+                if trade["fee"] is not None and trade["fee"] < 0:
+                    raise ValueError("总费用不能为负")
+                trade["industry"] = _text(data.get("industry")) or "未分类"
                 if identity:
                     signature = (trade["date"], code, trade["side"], quantity, price, trade["time"])
                     fill = (identity, signature)
@@ -454,7 +460,11 @@ def analyze_trade_history(request: TradeHistoryUpload, *, today: date | None = N
         limitations.append("文件未提供证券类型，按用户上传的股票记录统计；请确认没有混入基金、债券或其他品种。")
     if excluded:
         limitations.append(f"共排除 {sum(excluded.values())} 行，具体原因可在数据核验中查看。")
-    return {"schema_version": "stock-trades-v1", "source": source, "window_start": start.isoformat(),
+    from backend.app.services.investor_workbench import ReviewRequest, review_trades
+    # 仅汇总保存；不把逐笔复盘明细追加进账号画像。
+    review = review_trades(ReviewRequest(trades=[{k:t[k] for k in ("date","code","side","quantity","price","fee","industry")} for t in trades]))
+    review.pop("closed", None)
+    return {"schema_version": "stock-trades-v1", "source": source, "window_start": start.isoformat(), "cost_review": review,
             "window_end": end.isoformat(), "first_trade_date": trades[0]["date"], "last_trade_date": trades[-1]["date"],
             "total_rows": total_rows, "trade_count": len(trades), "buy_count": buy_count,
             "sell_count": len(trades) - buy_count, "security_count": len(stocks),

@@ -29,6 +29,7 @@ from backend.app.services.scoring_dimensions import QUALITATIVE_RUBRICS
 from backend.app.services.recommendation_recovery import derive_explicit_state, derive_history_metrics, history_window
 from backend.app.services.disclosure_reader import allowed_disclosure_url, read_disclosure
 from backend.app.services.disclosure_evidence import derive_disclosure_assessments
+from backend.app.services.investor_workbench import Preferences, fit_candidate
 
 DOCUMENT_FIELDS = {*NEWS_FIELDS, "event"}
 CRITERIA = {"policy": ("policy",), "event": ("event",),
@@ -119,6 +120,17 @@ class StockRecommendationService:
         for condition in [*profile.constraints, *understanding.stock_preferences]:
             query += "，" + condition[:200]
         query += "，返回股票代码、股票简称、所属行业、市盈率、市净率、ROE、营业收入同比增长率"
+        workspace = profile.investment_workspace or {}
+        if workspace.get("confirmed"):
+            preferences = Preferences.model_validate(workspace.get("preferences", {}))
+            conditions["confirmed_personal_preferences"] = preferences.model_dump(mode="json")
+            if preferences.mode == "restrict" and preferences.industries:
+                query += "，行业范围：" + "或".join(preferences.industries)
+            if preferences.avoid_industries:
+                query += "，排除行业：" + "、".join(preferences.avoid_industries)
+            if preferences.style == "短期观察":
+                query += "，近20日日均成交额大于1亿元"
+                conditions["min_avg_turnover_20d_cny"] = max(floor, 100_000_000)
         return conditions, query
 
     async def run(self, request: OrchestrationRequest, understanding: RequestUnderstanding, *,
@@ -147,6 +159,8 @@ class StockRecommendationService:
             return request, DataAcquisitionResult(), advice
         profile = request.profile
         missing_profile = []
+        if profile.financial_plan.get("equity_cap") == 0 or profile.financial_plan.get("cash_floor") == 1:
+            return request, DataAcquisitionResult(mode="not_required"), self._empty(request, report, "当前已确认的资金约束不安排权益资金，请先复核资金用途。")
         if profile.risk_level not in {"R1", "R2", "R3", "R4", "R5"}:
             missing_profile.append("风险等级")
         if profile.horizon_months is None and not profile.investment_horizon_label:
@@ -260,7 +274,7 @@ class StockRecommendationService:
             for entry in report.candidates for agent, fields in entry.missing_fields.items()}
         if metrics_sink is not None:
             metrics_sink.update({"available": len(all_facts)})
-        eligible.sort(key=lambda pair: (-(pair[0].score or 0), -pair[0].confidence, pair[0].symbol))
+        eligible.sort(key=lambda pair: (-((pair[0].score or 0)+pair[0].personal_fit.get("bonus",0)), -pair[0].confidence, pair[0].symbol))
         chosen = eligible[:understanding.recommendation_count]
         chosen_codes = {entry.symbol for entry, _ in chosen}
         for entry, _ in eligible:
@@ -335,6 +349,12 @@ class StockRecommendationService:
                              "所属行业资料未核实，无法完成行业与个股联合研究。"]
             return entry, None, own, audits
         industry = industry_fact.value.strip()
+        if request.profile.investment_workspace.get("confirmed"):
+            entry.personal_fit = fit_candidate(request.profile, code=code, industry=industry)
+            if not entry.personal_fit["allowed"]:
+                entry.status = "excluded"
+                entry.reasons = entry.personal_fit["reasons"]
+                return entry, None, own, audits
         calls = [self._call(f"{label}:{code}", method, code) for label, method in (
             ("quote", "get_quote"), ("financial", "get_financial_metrics"),
             ("event", "get_event_data"), ("governance", "get_governance_disclosures"),
@@ -455,7 +475,10 @@ class StockRecommendationService:
             return entry, advice, req.facts, audits
         entry.status, entry.score, entry.confidence = "recommended", security.score, advice.confidence
         entry.reasons = [fit_reason, security.opinion]
+        entry.reasons.extend(entry.personal_fit.get("reasons", []))
         entry.risks = list(dict.fromkeys([*advice.risks, "历史回撤不代表未来最大亏损，短期价格仍可能波动。", RISK_NOTICE]))
+        if entry.personal_fit.get("cost_scenario"):
+            entry.risks.append("计划交易的费用情景门槛为" + format(entry.personal_fit["cost_scenario"]["break_even_return"],".2%") + "；不代表能取得对应收益。")
         entry.evidence = sorted(set(entry.evidence + advice.evidence + fit_ids))
         entry.snapshot_time = min(f.snapshot_time for f in req.facts if f.fact_id in entry.evidence)
         return entry, advice, req.facts, audits
@@ -709,7 +732,9 @@ class StockRecommendationService:
             turnover = None
         if isinstance(amount.value, bool) or turnover is None or not math.isfinite(turnover):
             return "unknown", "成交额的数值或币种单位尚未核实。", evidence
-        if turnover < LIQUIDITY_FLOORS.get(req.profile.liquidity_need, 10_000_000):
+        workspace = req.profile.investment_workspace
+        short_term = workspace.get("confirmed") and workspace.get("preferences", {}).get("style") == "短期观察"
+        if turnover < max(LIQUIDITY_FLOORS.get(req.profile.liquidity_need, 10_000_000), 100_000_000 if short_term else 0):
             return "no", "候选成交活跃度未达到本次流动性筛选条件。", evidence
         if conditions:
             matched = self._latest(req.facts, name, "stock_constraint_match")

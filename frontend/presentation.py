@@ -137,13 +137,13 @@ def fact_source(fact: dict[str, Any]) -> str:
     return "市场数据服务" if source else "来源待确认"
 
 
-def fact_time(value: Any) -> str:
+def fact_time(value: Any, *, seconds: bool = False) -> str:
     if not value:
         return "未提供"
     try:
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         if parsed.tzinfo is not None:
-            return parsed.astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
+            return parsed.astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S" if seconds else "%Y-%m-%d %H:%M")
     except ValueError:
         pass
     return str(value)
@@ -359,6 +359,9 @@ def source_trace_rows(advice: dict[str, Any]) -> list[dict[str, Any]]:
         row = friendly_fact_rows([fact])[0]
         row = {"支持分析": "、".join(supported_by.get(fact_id, [])) or "综合结论", **row}
         row["原文"] = fact.get("source_url") or None
+        from backend.app.fact_taxonomy import FAST_MARKET_FIELDS
+        row["上游行情时间（北京时间）"] = (fact_time(fact["source_timestamp"], seconds=True) if fact.get("source_timestamp") else
+            "未提供，不作为秒级时效证明" if fact.get("field") in FAST_MARKET_FIELDS else "不适用")
         rows.append(row)
     return rows
 

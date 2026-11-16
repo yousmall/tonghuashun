@@ -48,6 +48,15 @@ def test_inspect_selects_trade_sheet_and_header_and_preserves_identifier():
     assert analysis["preview"][0]["code"] == "000001"
 
 
+def test_excel_total_fee_column_is_used_for_net_realized_review():
+    headers=HEADERS+["该笔总费用"]
+    rows=[["2026-01-01","600000","买入",100,10,"示例",5],
+          ["2026-01-02","600000","卖出",100,11,"示例",5]]
+    result=analyze_trade_history(upload(rows,headers))
+    assert result["cost_review"]["matched_net"]==90
+    assert "closed" not in result["cost_review"]
+
+
 def test_real_legacy_xls_and_excel_date_cells():
     raw = (Path(__file__).parent / "fixtures" / "trade_history.xls").read_bytes()
     data = TradeHistoryUpload(file_name="交易.xls", content_base64=base64.b64encode(raw).decode(), as_of=date(2026, 10, 4))

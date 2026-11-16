@@ -645,7 +645,7 @@ class IwencaiSkillHubProvider:
         )
 
     async def get_quote(self, symbol: str) -> list[FactRecord]:
-        return await self.query(f"{symbol} 最新价、涨跌幅、成交量、换手率", entity_hint=symbol)
+        return await self.query(f"{symbol} 最新价、涨跌幅、成交量、换手率、行情更新时间（精确到秒）", entity_hint=symbol)
 
     async def get_stock_risk_metrics(self, symbol: str) -> list[FactRecord]:
         return await self.query(
@@ -1043,6 +1043,7 @@ class IwencaiSkillHubProvider:
                         entity_code=_entity_code_from_record(record),
                         source_field=(f"{record['指标名称']} ({raw_field})" if record.get("指标名称") else str(raw_field)),
                         snapshot_time=snapshot_time,
+                        source_timestamp=_source_timestamp(record),
                         source_id=self.source_id,
                         source_url=source_url,
                         quality=0.90,
@@ -1114,6 +1115,22 @@ def _root_column_metadata(payload: Any) -> dict[str, dict]:
 def _column_period(column: Mapping[str, Any]) -> str | None:
     parsed = _history_date(column.get("timestamp"))
     return parsed.isoformat() if parsed else None
+
+
+def _source_timestamp(record: Mapping[str, Any]) -> datetime | None:
+    """Keep explicit upstream quote times; a date alone has no second precision."""
+    for key in ("行情时间", "行情更新时间", "数据更新时间", "最新行情时间", "quote_timestamp", "quote_time"):
+        value = record.get(key)
+        if not isinstance(value, str) or not re.search(r"\d{2}:\d{2}:\d{2}", value):
+            continue
+        try:
+            stamp = datetime.fromisoformat(value.strip().replace("/", "-").replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone(timedelta(hours=8)))
+        return stamp.astimezone(timezone.utc)
+    return None
 
 
 def _observation_date(record: Mapping[str, Any], field: str, column_date: str | None) -> date | None:

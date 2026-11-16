@@ -26,9 +26,11 @@ async def run(output):
             try:
                 facts = await asyncio.wait_for(method("600519"), timeout=30)
                 substantive = [fact for fact in facts if fact.field != "provider_response"]
+                from backend.app.services.data_freshness import freshness_observation
                 return {"kind": kind, "status": "ok" if substantive else "empty", "fact_count": len(substantive),
                         "fields": sorted({f.field for f in substantive}), "source_ids": sorted({f.source_id for f in substantive}),
                         "original_link_count": sum(bool(f.source_url) for f in substantive),
+                        "freshness": [freshness_observation(f) for f in substantive if f.field == "close_price"],
                         "elapsed_seconds": round(perf_counter() - started, 3)}
             except Exception as exc:
                 errors = []

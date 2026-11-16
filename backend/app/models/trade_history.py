@@ -12,7 +12,7 @@ class TradeHistoryUpload(BaseModel):
     content_base64: str = Field(min_length=1, max_length=4 * ((MAX_FILE_BYTES + 2) // 3))
     sheet_name: str | None = Field(default=None, max_length=128)
     header_row: int | None = Field(default=None, ge=1, le=30)
-    columns: dict[Literal["date", "code", "side", "quantity", "price", "name", "account", "currency", "asset_type", "time", "trade_id"], str] = Field(default_factory=dict)
+    columns: dict[Literal["date", "code", "side", "quantity", "price", "name", "account", "currency", "asset_type", "time", "trade_id", "fee", "industry"], str] = Field(default_factory=dict)
     # 不允许把旧文件最后日期自动当成今天；历史报告可明确选择截止日。
     as_of: date | None = None
     expected_version: int = Field(default=1, ge=1)

@@ -58,6 +58,7 @@ def _market_glance(api_base, fetch, polling):
 
 def render_home(api_base, *, ready, header, go_to, recent, fetch, resume):
     header("主页")
+    st.button("打开投资工作台 · 新手学习、复盘与教学模拟", on_click=go_to, args=("投资工作台",))
     if not ready:
         st.title("开始使用问策智投")
         st.caption("完成投资偏好评估与确认后，选择研究方向并发起咨询。")

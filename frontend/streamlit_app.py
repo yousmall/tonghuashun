@@ -166,7 +166,7 @@ def page_navigation() -> str:
                   type="primary" if current == "风险评估" else "tertiary",
                   on_click=go_to, args=("风险评估",))
         for page, key in (("投资问答", "nav_questions"), ("自选研究", "nav_watchlist"),
-                          ("持仓分析", "nav_portfolio")):
+                          ("持仓分析", "nav_portfolio"), ("投资工作台", "nav_workbench")):
             st.button(page, key=key, width="stretch",
                       type="primary" if current == page else "tertiary",
                       on_click=go_to, args=(page,))
@@ -1485,14 +1485,21 @@ def render_materials_body(api_base: str) -> None:
                     st.rerun()
 
 
+def page_workbench(api_base: str) -> None:
+    from frontend.investor_workbench import render_workbench
+    render_workbench(api_base, api_request=api_request, go_to=go_to)
+
+
 def page_profile(api_base: str) -> None:
     """保留风险问卷，支持从股票交易记录补充行为画像。"""
     from frontend.trade_profile import render_trade_profile
     from frontend.automatic_planning import render_automatic_planning
+    from frontend.personalized_investment import render_personalized_investment
     render_page_header("风险评估")
     st.title("风险评估")
     render_risk_assessment(api_base, api_request=api_request)
     render_automatic_planning(api_base, api_request=api_request)
+    render_personalized_investment(api_base, api_request=api_request)
     render_trade_profile(api_base, api_request=api_request)
 
 
@@ -1973,7 +1980,7 @@ def reset_user_session() -> None:
     ):
         st.session_state.pop(key, None)
     for key in list(st.session_state):
-        if key.startswith(("manual_review_", "trade_profile_", "risk_score_", "risk_answer_", "automatic_plan_", "research_chat_", "preset_question_", "industry_collaboration_", "board_target_", "board_refresh_", "board_poll_", "board_favorite_", "board_saved_", "fund_analytics_", "admin_")) or key == "profile_narrative":
+        if key.startswith(("workbench_", "manual_review_", "trade_profile_", "risk_score_", "risk_answer_", "automatic_plan_", "research_chat_", "preset_question_", "industry_collaboration_", "board_target_", "board_refresh_", "board_poll_", "board_favorite_", "board_saved_", "fund_analytics_", "admin_")) or key == "profile_narrative":
             st.session_state.pop(key, None)
     st.session_state.conversation_id = str(uuid.uuid4())
     # 账号标识只来自服务端令牌，浏览器状态里不保存用户 id。
@@ -2256,6 +2263,7 @@ def main() -> None:
         poll_account_prefetch()
         return
     pages = {
+        "投资工作台": lambda: page_workbench(api_base),
         "主页": lambda: page_home(api_base),
         "投资问答": lambda: page_questions(api_base),
         "自选研究": lambda: page_watchlist(api_base),

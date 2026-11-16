@@ -74,6 +74,8 @@ def profile_for_model(profile: UserProfile, *, exclude: set[str] | None = None) 
     """
     # 自动规划是展示用的重复派生结果；原始问卷、目标区间和财务约束已在下方保留。
     data = profile.model_dump(mode="json", exclude={"user_id", "risk_answers", "scoring_breakdown", "automatic_planning"} | (exclude or set()))
+    if data.get("investment_workspace"):
+        data["investment_workspace"] = {k:v for k,v in data["investment_workspace"].items() if k not in {"paper", "journal"}}
     # These answers already appear in questionnaire_details; keep the reasoning
     # summary and question IDs so the model can still distinguish its basis.
     if data.get("questionnaire_details"):

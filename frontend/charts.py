@@ -123,7 +123,7 @@ def render_line(data, *, x, y, color=None, width="stretch", key=None):
     return render_chart(chart, width=width, key=key)
 
 
-def render_bar(data, *, x, y, horizontal=False, width="stretch", key=None):
+def render_bar(data, *, x, y, horizontal=False, width="stretch", height=None, key=None):
     import altair as alt
     frame, value, color = _series_frame(data, x, y, None)
     label = alt.Y(field=x, type="nominal", title=None, sort=None) if horizontal else alt.X(field=x, type="nominal", title=None, sort=None)
@@ -134,4 +134,6 @@ def render_bar(data, *, x, y, horizontal=False, width="stretch", key=None):
     )
     if color:
         chart = chart.encode(color=alt.Color(field=color, type="nominal", title=None))
+    if height is not None:
+        chart = chart.properties(height=height)
     return render_chart(chart, width=width, key=key)

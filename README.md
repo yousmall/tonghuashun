@@ -48,7 +48,15 @@ deep 模式默认开启自动取数闭环：意图识别后，大模型同时从
 - 回答下方提供**「分析过程与结论可视化面板」**：分析过程页展示阶段耗时、取数与补证统计、任务节点与模型调用明细；结论页展示合规状态、置信度、规则分/模型分对比、资料来源分布与风险清单。面板只渲染响应中的审计字段，不前端推算。
 - 答辩口径、字段对照与演示脚本见 [可视化面板答辩说明](docs/defense-visualization-panel.md)。
 
+## 个性化投资建议与资产配置
+
+新增“投资工作台”：新手学习、教学模拟、带费用的交易复盘、当前持仓与偏好选股、决策记录。历史题材经确认后参与选股，完整持仓用于核对新增额度；详见[工作台使用说明](docs/investor-workbench.md)。
+
+在“风险评估”中确认保存问卷后，可查看结合投资目标、用款期限、应急储备、负债和回撤约束生成的配置方案，包括三类资产参考比例、建议依据、压力情景及复核安排。填写明确投资金额可换算资金安排，金额合计精确到分。收益目标不会放宽风险约束，未确认或过期测评不生成配置。详见[使用说明](docs/personalized-investment.md)。
+
 ## 启动 API
+
+2026-11-16图片要求补齐与最新验证见[验收记录](docs/requirements-acceptance-2026-11-16.md)。深入研究不要求3秒，使用独立有界等待队列；精简咨询保留快速响应目标。支持用`.venv/Scripts/python.exe scripts/serve_resilient.py --port 8000 --workers 2`启动带有限故障重启的本机API。`GET /api/v1/readyz`实际探测数据库连接；30天观测仅在窗口完成并核对采样覆盖后评估，不由短时成功率替代。
 
 使用 Python 3.11 或更高版本。
 
@@ -68,10 +76,11 @@ python -m uvicorn backend.app.main:app --reload --port 8000
 
 登录接口对同一账号加来源 IP 的连续失败次数做限流：默认 10 分钟内失败 5 次后锁定 60 秒，锁定期间返回 `429` 并带 `Retry-After`；可用 `WENCE_LOGIN_MAX_FAILURES`、`WENCE_LOGIN_WINDOW_SECONDS`、`WENCE_LOGIN_LOCKOUT_SECONDS` 调整。
 
-除组合诊断外，系统还提供两个画像接口：
+除组合诊断外，画像和规划接口包括：
 
 - `POST /api/v1/profile/assess`：问卷/文本生成**未确认**画像草稿，并返回提取证据和缺失字段。
 - `POST /api/v1/profile/confirm`：显式确认画像并递增版本号；已登录账号使用版本校验避免旧标签页覆盖新画像。已登录分析只使用该账号服务端保存的已确认画像；请求版本过期时返回 409。
+- `POST /api/v1/profile/investment-plan`：从当前登录账号已确认的问卷只读生成个性化建议与资产配置；可提交 `investment_amount` 换算参考金额，不接受客户端画像或风险等级。
 - `POST /api/v1/portfolio/analyze/stream`：以 NDJSON 逐阶段返回取数、研判、事实核验和风险检查状态，最后才返回完整建议包。原同步分析接口仍可用。
 
 组合与数值核验接口：

@@ -20,6 +20,10 @@ def _clear_file_analysis() -> None:
 
 
 def render_trade_analysis(analysis: dict) -> None:
+    if analysis.get("cost_review"):
+        from frontend.investor_workbench import render_review
+        with st.expander("查看扣费复盘"):
+            render_review(analysis["cost_review"])
     if analysis.get("input_kind") == "analysis_report":
         render_report_analysis(analysis)
         return

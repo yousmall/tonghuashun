@@ -4,11 +4,13 @@ import os
 
 
 class ResearchAdmission:
-    def __init__(self, limit=None, queue_seconds=None):
+    def __init__(self, limit=None, queue_seconds=None, max_pending=100):
         self.limit = int(limit if limit is not None else os.getenv("WENCE_RESEARCH_MAX_CONCURRENCY", "8"))
         self.queue_seconds = float(queue_seconds if queue_seconds is not None else os.getenv("WENCE_RESEARCH_QUEUE_SECONDS", "1"))
-        if self.limit < 1 or not 0 < self.queue_seconds <= 3:
-            raise ValueError("研究并发上限必须为正，排队预算须在 0 至 3 秒之间")
+        if self.limit < 1 or not 0 < self.queue_seconds <= 3600 or max_pending < 1:
+            raise ValueError("研究并发和等待容量必须为正，排队预算须在 0 至 3600 秒之间")
+        self.max_pending = max_pending
+        self.pending = 0
         self.loop = None
         self.semaphore = None
 
@@ -18,5 +20,11 @@ class ResearchAdmission:
             self.loop = loop
             self.semaphore = asyncio.Semaphore(self.limit)
         semaphore = self.semaphore
-        await asyncio.wait_for(semaphore.acquire(), timeout=self.queue_seconds)
+        if self.pending >= self.max_pending:
+            raise TimeoutError("研究等待队列已满")
+        self.pending += 1
+        try:
+            await asyncio.wait_for(semaphore.acquire(), timeout=self.queue_seconds)
+        finally:
+            self.pending -= 1
         return semaphore

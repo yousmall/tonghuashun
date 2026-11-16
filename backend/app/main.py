@@ -32,8 +32,11 @@ from backend.app.services.research_recovery import recover_research
 from backend.app.services.stock_recommendation import STOCK_RECOMMENDATION_TIMEOUT_SECONDS, StockRecommendationService
 from backend.app.services.automatic_consultation import run_automatic, source_item
 from backend.app.services.automatic_planning import AutomaticPlanningRequest, build_automatic_planning
+from backend.app.services.personalized_investment import PersonalizedInvestmentRequest, build_personalized_investment
+from backend.app.services.investor_workbench import WorkspaceSave, PaperOrder, JournalEntry, ReviewRequest, history_suggestions, review_trades, paper_order
 from backend.app.services.prepared_research import (PreparedResearchCache, PreparedResearchRequest, board_signature, report_is_ready, task_query)
 from backend.app.services.research_admission import ResearchAdmission
+from backend.app.services.dependency_health import DatabaseHealthProbe
 from backend.app.services.research_cache import ResearchFactCache
 from threading import Event
 
@@ -228,6 +231,7 @@ research_pipeline = AutomatedResearchPipeline(data_provider, cache=ResearchFactC
     lease_seconds=float(os.getenv("WENCE_DATA_CALL_TIMEOUT_SECONDS", "30")) + 5,
 ))
 service_metrics = ServiceMetrics()
+database_health_probe = DatabaseHealthProbe()
 local_consultation = LocalConsultationService()
 instant_research = InstantResearchService()
 local_research_admission = ResearchAdmission(
@@ -235,6 +239,11 @@ local_research_admission = ResearchAdmission(
     queue_seconds=float(os.getenv("WENCE_LOCAL_RESEARCH_QUEUE_SECONDS", "0.75")),
 )
 research_admission = ResearchAdmission()
+deep_research_admission = ResearchAdmission(
+    limit=int(os.getenv("WENCE_DEEP_RESEARCH_MAX_CONCURRENCY", "2")),
+    queue_seconds=float(os.getenv("WENCE_DEEP_RESEARCH_QUEUE_SECONDS", "1800")),
+    max_pending=int(os.getenv("WENCE_DEEP_RESEARCH_MAX_PENDING", "100")),
+)
 analysis_timeout_seconds = float(os.getenv("WENCE_ANALYSIS_TIMEOUT_SECONDS", "90"))
 if not 0 < analysis_timeout_seconds <= 300:
     raise ValueError("整次研究的时间预算须在 0 至 300 秒之间")
@@ -392,6 +401,11 @@ async def readiness() -> dict[str, object]:
         "research_cache": {"shared_same_host": research_pipeline.cache.shared is not None,
                            "error": research_pipeline.cache.shared_error},
         "research_concurrency_per_process": research_admission.limit,
+        "deep_research": {"active_limit": deep_research_admission.limit,
+            "waiting_limit": deep_research_admission.max_pending,
+            "waiting": deep_research_admission.pending,
+            "queue_budget_seconds": deep_research_admission.queue_seconds,
+            "three_second_target": False},
         "analysis_timeout_seconds": analysis_timeout_seconds,
         "deep_overall_timeout_seconds": None,
         "fast_response_timeout_seconds": fast_response_timeout_seconds,
@@ -413,6 +427,17 @@ async def readiness() -> dict[str, object]:
         "mysql_ready": database.configured and database.initialization_error is None,
         "session_thread_pool": session_thread_pool.snapshot(),
     }
+
+
+@app.get("/api/v1/readyz", tags=["system"])
+async def dependency_readiness(response: Response) -> dict[str, object]:
+    """Load balancer readiness; configuration alone is not a database heartbeat."""
+    db_ready = await database_health_probe.check(database)
+    ready = db_ready and llm_enabled and data_provider is not None
+    response.status_code = 200 if ready else 503
+    return {"status": "ready" if ready else "unavailable", "database_reachable": db_ready,
+            "model_configured": llm_enabled, "data_provider_configured": data_provider is not None,
+            "external_model_and_data_liveness_verified": False}
 
 
 @app.post("/api/v1/auth/register", response_model=AuthResponse, tags=["auth"])
@@ -1016,6 +1041,65 @@ async def automatically_plan_profile(request: AutomaticPlanningRequest, user: di
     return build_automatic_planning(profile, narrative=request.narrative, risk_answers=request.risk_answers)
 
 
+@app.post("/api/v1/profile/investment-plan", tags=["profile"])
+async def personalized_investment_plan(request: PersonalizedInvestmentRequest, user: dict[str, object] = Depends(customer_user)):
+    """只读生成当前账号方案；不接受客户端画像、评级或账号归属。"""
+    stored = await _trade_file_task(user, database.get_profile, int(user["id"]))
+    profile = UserProfile.model_validate({**stored["payload"], "version": stored["version"]}) if stored else None
+    return build_personalized_investment(profile, investment_amount=request.investment_amount)
+
+
+@app.get("/api/v1/investor/workspace", tags=["profile"])
+async def read_investor_workspace(user: dict[str, object] = Depends(customer_user)):
+    stored = await _trade_file_task(user, database.get_profile, int(user["id"]))
+    profile = UserProfile.model_validate({**stored["payload"], "version": stored["version"]}) if stored else UserProfile()
+    return {"profile": profile.model_dump(mode="json"), "workspace": profile.investment_workspace,
+            "history_suggestions": history_suggestions(profile.trading_analysis)}
+
+
+def _update_investor_workspace(user_id, request):
+    stored = database.get_profile(user_id)
+    profile = UserProfile.model_validate({**stored["payload"], "version": stored["version"]}) if stored else UserProfile(user_id=str(user_id))
+    if request.expected_version != profile.version:
+        raise ProfileVersionConflict("画像或工作台已在其他页面更新，请刷新后再提交。")
+    workspace = dict(profile.investment_workspace)
+    if isinstance(request, WorkspaceSave):
+        workspace.update(request.model_dump(mode="json", exclude={"expected_version"}))
+        workspace["confirmed"] = True
+    elif isinstance(request, JournalEntry):
+        entries = list(workspace.get("journal", []))
+        if len(entries)>=1000:
+            raise ValueError("决策记录已达到1000条上限")
+        from backend.app.risk_questionnaire import local_today
+        entries.append({**request.model_dump(mode="json", exclude={"expected_version"}), "recorded_on": local_today().isoformat()})
+        workspace["journal"] = entries
+    else:
+        workspace["paper"] = paper_order(workspace.get("paper"), request)
+    saved = profile.model_copy(update={"investment_workspace":workspace,"version":profile.version+1})
+    database.save_profile(user_id,saved.model_dump(mode="json"),saved.version,profile.version)
+    return saved
+
+
+@app.post("/api/v1/investor/workspace", tags=["profile"])
+async def save_investor_workspace(request: WorkspaceSave, user: dict[str, object] = Depends(customer_user)):
+    return await _trade_file_task(user, _update_investor_workspace, int(user["id"]), request)
+
+
+@app.post("/api/v1/investor/paper-order", tags=["profile"])
+async def place_paper_order(request: PaperOrder, user: dict[str, object] = Depends(customer_user)):
+    return await _trade_file_task(user, _update_investor_workspace, int(user["id"]), request)
+
+
+@app.post("/api/v1/investor/review", tags=["profile"])
+async def review_investor_history(request: ReviewRequest, user: dict[str, object] = Depends(customer_user)):
+    return await _trade_file_task(user, review_trades, request)
+
+
+@app.post("/api/v1/investor/journal", tags=["profile"])
+async def record_investor_journal(request: JournalEntry, user: dict[str, object] = Depends(customer_user)):
+    return await _trade_file_task(user, _update_investor_workspace, int(user["id"]), request)
+
+
 @app.post("/api/v1/profile/trades/inspect", tags=["profile"])
 async def inspect_user_trades(request: TradeHistoryUpload, user: dict[str, object] = Depends(customer_user)):
     return await _trade_file_task(user, inspect_trade_workbook, request)
@@ -1072,11 +1156,13 @@ async def confirm_user_profile(
     # 交易分析由专用上传接口生成；问卷确认不信任客户端提供的分析，且保留
     # 当前账号已确认的历史交易摘要，防止重新测评清掉交易画像。
     trading_analysis = {}
+    investment_workspace = {}
     if user is not None:
         stored = await _trade_file_task(user, database.get_profile, int(user["id"]))
         if stored:
             trading_analysis = stored["payload"].get("trading_analysis") or {}
-    confirmed = confirmed.model_copy(update={"trading_analysis": trading_analysis})
+            investment_workspace = stored["payload"].get("investment_workspace") or {}
+    confirmed = confirmed.model_copy(update={"trading_analysis": trading_analysis, "investment_workspace": investment_workspace})
     if user is not None:
         future = session_thread_pool.submit(
             str(user["_session_id"]),
@@ -1241,7 +1327,10 @@ async def _analyze_portfolio(
 
     try:
         try:
-            admission = local_research_admission if request.research_mode in {"lite", "instant"} else research_admission
+            admission = (deep_research_admission if request.research_mode == "deep" else
+                local_research_admission if request.research_mode in {"lite", "instant"} else research_admission)
+            if request.research_mode == "deep":
+                report("等待深入研究资源")
             admission_slot = await admission.acquire()
         except TimeoutError as exc:
             outcome = "OVERLOADED"

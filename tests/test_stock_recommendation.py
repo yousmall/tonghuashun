@@ -150,6 +150,28 @@ def service(provider, model=None, **options):
 
 
 @pytest.mark.asyncio
+async def test_confirmed_sector_preferences_change_verified_recommendations():
+    class SectorProvider(Provider):
+        async def get_basic_info(self, code):
+            return [self.fact("示例"+code,"industry","半导体" if code=="600001" else "制造业",code=code)]
+    workspace={"confirmed":True,"preferences":{"industries":["半导体"],"mode":"restrict"}}
+    _,_,advice=await service(SectorProvider()).run(request(investment_workspace=workspace),understanding())
+    assert [r.symbol for r in advice.stock_recommendation.recommendations]==["600001"]
+    assert advice.stock_recommendation.recommendations[0].personal_fit["bonus"]==5
+    assert next(r for r in advice.stock_recommendation.candidates if r.symbol=="600002").status=="excluded"
+
+
+@pytest.mark.asyncio
+async def test_saved_full_holdings_exclude_new_industry_exposure():
+    from backend.app.risk_questionnaire import local_today
+    workspace={"confirmed":True,"preferences":{},"holdings_complete":True,"holdings_as_of":local_today().isoformat(),
+        "cash":"10000","holdings":[{"code":"600003","industry":"制造业","value":"90000"}]}
+    _,_,advice=await service(Provider()).run(request(investment_workspace=workspace),understanding())
+    assert not advice.stock_recommendation.recommendations
+    assert all(c.status=="excluded" for c in advice.stock_recommendation.candidates)
+
+
+@pytest.mark.asyncio
 async def test_profile_directed_screening_fans_out_and_ranks_verified_stocks():
     provider = Provider()
     prepared, audit, advice = await service(provider).run(request(), understanding())
