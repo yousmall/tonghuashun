@@ -4,7 +4,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Callable
 
 import streamlit as st
@@ -176,7 +176,15 @@ def render_trade_profile(api_base: str, *, api_request: Callable) -> None:
                 st.caption("自动识别的原表预览")
                 st.dataframe(inspection["preview"], hide_index=True)
         today = datetime.now(timezone(timedelta(hours=8))).date()
-        end = st.date_input("近一年分析截止日", value=today, max_value=today, key="trade_profile_as_of")
+        file_last = inspection.get("last_trade_date")
+        as_of_key = "trade_profile_as_of"
+        if file_last and file_last < today.isoformat():
+            st.caption(f"文件内最后成交日为 {file_last}；默认按今天回溯一年，更早的成交会被排除。"
+                       "需要覆盖文件完整期间时，可把截止日设为该日期。")
+            if st.button(f"按文件最后成交日（{file_last}）统计", key=f"trade_profile_use_last_{digest}"):
+                st.session_state[as_of_key] = date.fromisoformat(file_last)
+                st.rerun()
+        end = st.date_input("近一年分析截止日", value=today, max_value=today, key=as_of_key)
         payload = {**base, "sheet_name": sheet, "header_row": int(header), "columns": mapping, "as_of": end.isoformat()}
         signature = hashlib.sha256(json.dumps({k: v for k, v in payload.items() if k != "content_base64"},
                                              sort_keys=True).encode()).hexdigest()

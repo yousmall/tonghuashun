@@ -1,6 +1,6 @@
 """Render the server's evidence dossier and reuse identical text in exports."""
 import streamlit as st
-from frontend.presentation import plain_language, fact_source
+from frontend.presentation import plain_language, fact_source, friendly_fact_rows, advice_facts
 
 STANCES = {"favorable": "支持因素", "caution": "不利因素", "neutral": "中性与待核实"}
 FINDING_STANCES = {"favorable": "有利", "caution": "不利", "neutral": "中性/待核实"}
@@ -67,11 +67,31 @@ def render_research_report(advice, *, key, compact=False, question: str = ""):
     with st.expander("展开支持因素、不利因素与重新评估条件", key=f"research_report_{key}",
                      expanded=not compact, on_change="rerun") as panel:
         if panel.open:
-            for title_text, lines in report_sections(advice)[1:]:
+            raw_sections = report.get("sections", [])
+            verified = {str(item) for item in advice.get("evidence", [])}
+            facts_by_id = {str(fact.get("fact_id", "")): fact for fact in advice_facts(advice)}
+            for index, (title_text, lines) in enumerate(report_sections(advice)[1:]):
                 with st.container(border=True):
                     st.markdown("**" + plain_language(title_text).replace("*", "") + "**")
                     for line in lines:
                         st.write(plain_language(line))
+                    raw = raw_sections[index] if index < len(raw_sections) else {}
+                    items = raw.get("evidence", []) or []
+                    linked_ids = [str(fid) for item in items for fid in (item.get("fact_ids") or [])]
+                    linked = [facts_by_id[fid] for fid in dict.fromkeys(linked_ids)
+                              if fid in verified and fid in facts_by_id]
+                    urls = [(item.get("observation") or "来源原文", item.get("source_url"))
+                            for item in items if isinstance(item.get("source_url"), str)
+                            and item["source_url"].startswith("https://")]
+                    if linked or urls:
+                        with st.expander(f"查看该维度的原始数据与来源（{len(linked)} 条）",
+                                         key=f"report_trace_{key}_{index}"):
+                            if linked:
+                                st.caption("下列资料通过了核验并被本报告引用；展开「投资逻辑链」可逐层查看它们如何支持结论。")
+                                st.dataframe(friendly_fact_rows(linked), width="stretch", hide_index=True)
+                            for url_index, (label, url) in enumerate(urls):
+                                st.link_button(f"打开原文 · {str(label)[:24]}", url,
+                                               key=f"report_url_{key}_{index}_{url_index}")
     try:
         markdown = report_markdown(advice, question)
     except Exception:  # 报告结构来自历史记录时可能缺少新字段，缺少就不提供下载

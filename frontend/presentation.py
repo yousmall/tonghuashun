@@ -572,7 +572,7 @@ def render_source_trace(advice: dict[str, Any], *, collapsed: bool = True, key: 
             )
         else:
             render_empty_state("没有可溯源的结论依据", "当前结论没有通过核验的资料引用，请先补充数据。",
-                               ":material/rule:")
+                               ":material/database:")
 
     if collapsed:
         with st.expander(f"数据溯源（{len(rows)} 条）", icon=":material/database:", key=key, on_change="rerun") as sources:
