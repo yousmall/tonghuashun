@@ -215,8 +215,9 @@ import streamlit as st
 from frontend import streamlit_app as ui
 from frontend.presentation import QUICK_ASKS
 ui.init_session()
-ui.selected_research_target = lambda direction: None
-st.session_state['presets'] = {d: ui.preset_questions(d) for d in QUICK_ASKS}
+from unittest.mock import patch
+with patch.object(ui, 'selected_research_target', return_value=None):
+    st.session_state['presets'] = {d: ui.preset_questions(d) for d in QUICK_ASKS}
 '''
     app = AppTest.from_string(script).run(timeout=20)
     assert not app.exception
@@ -232,9 +233,11 @@ def test_presets_use_selected_target_when_available():
 import streamlit as st
 from frontend import streamlit_app as ui
 ui.init_session()
-ui.selected_research_target = lambda direction: ('示例转债' if direction == '可转债分析' else '600519')
-st.session_state['stock'] = ui.preset_questions('个股研究')
-st.session_state['bond'] = ui.preset_questions('可转债分析')
+from unittest.mock import patch
+with patch.object(ui, 'selected_research_target',
+                  side_effect=lambda direction: ('示例转债' if direction == '可转债分析' else '600519')):
+    st.session_state['stock'] = ui.preset_questions('个股研究')
+    st.session_state['bond'] = ui.preset_questions('可转债分析')
 '''
     app = AppTest.from_string(script).run(timeout=20)
     assert not app.exception
@@ -242,13 +245,18 @@ st.session_state['bond'] = ui.preset_questions('可转债分析')
     assert app.session_state['bond'][0].startswith('示例转债')
 
 
-def test_clicking_concise_preset_submits_prefixed_question():
+def test_clicking_concise_preset_submits_prefixed_question(monkeypatch):
+    import streamlit as st
+    from frontend import streamlit_app as ui
+
+    def submit(base, direction, query):
+        st.session_state.sent = query
+
+    # Keep the mock active for widget callbacks, which run before the script.
+    monkeypatch.setattr(ui, 'submit_chat_analysis', submit)
     script = '''
 import streamlit as st
 from frontend import streamlit_app as ui
-def submit(base, direction, query):
-    st.session_state.sent = query
-ui.submit_chat_analysis = submit
 ui.init_session()
 st.session_state.profile['confirmed'] = True
 ui.render_preset_questions('test-only', '市场解读')

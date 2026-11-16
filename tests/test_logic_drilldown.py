@@ -66,6 +66,9 @@ def rendered_text(app) -> str:
     for name in ELEMENT_TYPES:
         for element in getattr(app, name, []):
             for attribute in ("value", "label"):
+                # Stateless link buttons have labels but no session-state value.
+                if attribute == "value" and element.type == "link_button":
+                    continue
                 value = getattr(element, attribute, None)
                 if isinstance(value, str):
                     parts.append(value)
@@ -73,6 +76,8 @@ def rendered_text(app) -> str:
     # 保证折叠层里的「打开原文」等标签也能被断言到。
     for element in app.main:
         for attribute in ("value", "label"):
+            if attribute == "value" and element.type == "link_button":
+                continue
             value = getattr(element, attribute, None)
             if isinstance(value, str):
                 parts.append(value)
@@ -80,7 +85,12 @@ def rendered_text(app) -> str:
 
 
 def run(code: str) -> AppTest:
-    return AppTest.from_string(code).run(timeout=30)
+    from unittest.mock import patch
+    from frontend import streamlit_app as ui
+
+    # AppTest shares imported modules with later tests; always restore mocks.
+    with patch.object(ui, "recent_conversations", return_value=[]):
+        return AppTest.from_string(code).run(timeout=30)
 
 
 def test_drilldown_renders_four_levels_and_original_sources():
@@ -177,7 +187,6 @@ def test_logic_chain_panels_start_collapsed_on_first_open():
               "from frontend import streamlit_app as ui\n"
               "ui.init_session()\n"
               "st.session_state.conversation = []\n"
-              "ui.recent_conversations = lambda *a, **k: []\n"
               "ui.render_logic_chain_banner('http://127.0.0.1:8000/api/v1')")
     assert not app.exception, [e.value for e in app.exception]
     text = rendered_text(app)
@@ -199,7 +208,6 @@ def test_banner_shows_a_full_demo_chain_without_any_answer():
               "from frontend import streamlit_app as ui\n"
               "ui.init_session()\n"
               "st.session_state.conversation = []\n"
-              "ui.recent_conversations = lambda *a, **k: []\n"
               "ui.render_logic_chain_banner('http://127.0.0.1:8000/api/v1', expanded=True)")
     assert not app.exception, [e.value for e in app.exception]
     text = rendered_text(app)
@@ -238,7 +246,6 @@ def test_banner_falls_back_to_demo_when_answer_has_no_evidence():
               f"ui.init_session()\n"
               f"st.session_state.conversation = [{{'role': 'assistant', 'content': '答',\n"
               f"    'payload': {empty_answer!r}}}]\n"
-              f"ui.recent_conversations = lambda *a, **k: []\n"
               f"ui.render_logic_chain_banner('http://127.0.0.1:8000/api/v1', expanded=True)")
     assert not app.exception, [e.value for e in app.exception]
     text = rendered_text(app)
@@ -265,7 +272,6 @@ def test_banner_drills_into_current_answer():
               f"ui.init_session()\n"
               f"st.session_state.conversation = [{{'role': 'user', 'content': '请分析'}},\n"
               f"    {{'role': 'assistant', 'content': '答', 'payload': {advice()!r}}}]\n"
-              f"ui.recent_conversations = lambda *a, **k: []\n"
               f"ui.render_logic_chain_banner('http://127.0.0.1:8000/api/v1', expanded=True)")
     assert not app.exception, [e.value for e in app.exception]
     text = rendered_text(app)
