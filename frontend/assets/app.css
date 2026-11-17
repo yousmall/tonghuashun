@@ -54,9 +54,15 @@ a { text-decoration: none; }
 a:hover { text-decoration: underline; }
 hr, [data-testid="stDivider"] hr { border-color: var(--wence-line-soft); }
 
-[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p {
-    color: var(--wence-muted);
-    line-height: 1.66;
+/* 全站移除辅助小字，同时移除独立说明行占用的布局间距。 */
+[data-testid="stCaptionContainer"],
+[data-testid="stElementContainer"]:has([data-testid="stCaptionContainer"]),
+.brand-note,
+.stat-card .n,
+.logic-note,
+.empty .d,
+.legal-strip {
+    display: none !important;
 }
 
 ::selection { background: #f3d6db; color: var(--wence-brand-strong); }
@@ -77,13 +83,13 @@ hr, [data-testid="stDivider"] hr { border-color: var(--wence-line-soft); }
 
 /* 侧栏品牌区 */
 .side-brand {
-    display: flex; align-items: center;
+    display: flex; align-items: center; justify-content: center;
     container-type: inline-size;
     padding: .15rem 0 .7rem;
     margin-bottom: .35rem;
     border-bottom: 1px solid var(--wence-line-soft);
 }
-.side-brand .brand-lockup { --logo-size: 100cqw; }
+.side-brand .brand-lockup { --logo-size: min(52cqw, 140px); }
 
 /* 侧栏分组标题 */
 .side-label {
@@ -208,15 +214,20 @@ hr, [data-testid="stDivider"] hr { border-color: var(--wence-line-soft); }
     box-shadow: none;
 }
 
-/* 侧栏账号卡 */
+/* 右下角账号菜单及其用户卡 */
 .side-user {
-    margin-top: .9rem; padding: .8rem .9rem;
+    display: flex; align-items: center; gap: .65rem;
+    margin-top: 0; padding: .65rem .7rem;
     background: #fff; border: 1px solid var(--wence-line);
     border-radius: 11px;
 }
+.side-avatar { width: 42px; height: 42px; flex: none; border-radius: 50%; object-fit: cover; }
+.side-user-info { min-width: 0; }
+.side-user .who { overflow-wrap: anywhere; }
+.side-user .account { color: var(--wence-muted); font-size: .8rem; overflow-wrap: anywhere; }
 .side-user .who { display: flex; align-items: center; gap: .45rem; font-weight: 650; font-size: 1rem; }
 .side-user .who :is(svg, span[data-testid]) { flex: none; }
-.side-user .state { display: flex; align-items: center; gap: .35rem; margin-top: .3rem; font-size: .86rem; color: var(--wence-muted); line-height: 1.55; }
+.side-user .state { display: flex; align-items: center; gap: .35rem; margin-top: .15rem; font-size: .78rem; color: var(--wence-muted); line-height: 1.4; }
 .side-user .dot { width: 7px; height: 7px; border-radius: 50%; background: #18794e; flex: none; }
 .side-user .dot.pending { background: #b26a00; }
 
@@ -775,15 +786,12 @@ button:focus-visible, input:focus-visible, textarea:focus-visible,
 .risk-result-card dd { margin:0; }
 .risk-result-body { display:flex; align-items:flex-start; gap:26px; }
 .risk-result-body .risk-result-main { flex:1 1 auto; min-width:0; }
-.risk-persona {
-    flex:0 0 340px; width:340px; aspect-ratio:1/1; margin:4px 26px 6px 0; border-radius:18px;
-    background-image:var(--persona-image); background-size:cover; background-position:center;
-    background-repeat:no-repeat; background-color:#fff;
-    border:1px solid #e3e6eb; box-shadow:0 12px 28px rgba(24,33,40,.14);
-}
+.risk-user-avatar { flex:0 0 220px; width:220px; margin:20px 20px 12px 0; text-align:center; }
+.risk-user-avatar img { width:100%; aspect-ratio:1; object-fit:cover; border-radius:50%; border:5px solid #fff; box-shadow:0 12px 28px rgba(24,33,40,.1); }
+.risk-user-avatar figcaption { margin-top:16px; color:#616a70; overflow-wrap:anywhere; }
 @media (max-width:900px) {
     .risk-result-body { flex-direction:column; gap:16px; }
-    .risk-persona { flex:0 0 auto; width:min(100%, 380px); margin:0 0 8px; }
+    .risk-user-avatar { flex:0 0 auto; width:min(100%, 180px); margin:0 0 8px; }
 }
 .st-key-risk_matching_rules button { color:#fa743b !important; text-align:left; border:0; background:transparent !important; }
 @media (max-width:640px) {
@@ -794,4 +802,23 @@ button:focus-visible, input:focus-visible, textarea:focus-visible,
     .st-key-risk-question-content [role="radiogroup"] label p { font-size:16px; }
     .risk-result-card { padding:22px 16px 8px; }
     .risk-result-card h2 { font-size:42px !important; }
+}
+
+/* 原生底栏预留账号行；入口靠右下角定位，弹层保持原生键盘与点击行为。 */
+.st-key-account_dock {
+    position: fixed;
+    right: 1.25rem;
+    bottom: .9rem;
+    width: 230px;
+    max-width: calc(100vw - 2rem);
+    z-index: 1001;
+}
+.st-key-account_dock [data-testid="stPopoverButton"] {
+    border-radius: 999px;
+    background: #fff;
+    box-shadow: 0 3px 12px rgba(31, 36, 48, .08);
+}
+
+.stApp:has(.st-key-account_dock) [data-testid="stBottomBlockContainer"] {
+    padding-bottom: .75rem;
 }

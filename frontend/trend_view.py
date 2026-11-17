@@ -11,6 +11,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 from frontend.charts import render_chart
+from frontend.technical_view import render_technical_indicators
 
 VERDICT_COLORS = {
     "上行": "#ad384e",
@@ -59,7 +60,8 @@ def verdict_badge(analysis: dict[str, Any]) -> str:
     return f"走势判断：{verdict}（{score:.1f} 分，置信度 {analysis.get('confidence', 0):.0%}）"
 
 
-def render_trend_metrics(analysis: dict[str, Any], *, unit_label: str = "") -> None:
+def render_trend_metrics(analysis: dict[str, Any], *, unit_label: str = "",
+                         show_annotations: bool = True) -> None:
     """四张卡：MA5、收盘相对 MA5、三日累计、判断。"""
 
     if not analysis.get("available"):
@@ -88,11 +90,12 @@ def render_trend_metrics(analysis: dict[str, Any], *, unit_label: str = "") -> N
                   delta=(f"{analysis['score']:.1f} 分" if analysis.get("score") is not None else None),
                   border=True)
     caption = three_day_text(analysis, unit)
-    if caption:
+    if show_annotations and caption:
         st.caption(caption)
 
 
-def render_trend_chart(result: dict[str, Any], *, key: str, height: int = 260) -> None:
+def render_trend_chart(result: dict[str, Any], *, key: str, height: int = 260,
+                       show_annotations: bool = True) -> None:
     """收盘序列叠加五日均线；两段数据都必须带真实日期。"""
 
     points = result.get("points") or []
@@ -121,7 +124,8 @@ def render_trend_chart(result: dict[str, Any], *, key: str, height: int = 260) -
     render_chart(chart.configure_view(stroke=None), width="stretch", key=f"trend_chart_{key}")
     caption = (f"数据区间 {str(points[0]['date'])} 至 {str(points[-1]['date'])} · {len(points)} 期"
                + (" · 虚线为五日均线" if len(ma5) >= 2 else ""))
-    st.caption(caption)
+    if show_annotations:
+        st.caption(caption)
 
 
 def render_signal_chart(analysis: dict[str, Any], *, key: str) -> None:
@@ -143,7 +147,7 @@ def render_signal_chart(analysis: dict[str, Any], *, key: str) -> None:
 
 
 def render_trend_panel(result: dict[str, Any], *, key: str, unit_label: str = "",
-                       show_signals: bool = True) -> None:
+                       show_signals: bool = True, show_annotations: bool = True) -> None:
     """完整的走势观察面板：卡片 + 曲线 + 信号拆解 + 文字限制。
 
     旧版响应可能没有 ``analysis`` 字段，此时只画价格曲线，不虚构均线与判断。
@@ -151,8 +155,10 @@ def render_trend_panel(result: dict[str, Any], *, key: str, unit_label: str = ""
 
     analysis = analysis_of(result)
     if analysis:
-        render_trend_metrics(analysis, unit_label=unit_label)
-    render_trend_chart(result, key=key)
+        render_trend_metrics(analysis, unit_label=unit_label, show_annotations=show_annotations)
+    render_trend_chart(result, key=key, show_annotations=show_annotations)
+    render_technical_indicators(analysis, points=result.get("points") or [], key=key,
+                                show_annotations=show_annotations)
     if analysis and analysis.get("neutralized"):
         st.info("多空信号同时成立，系统按“中和”原则不给出单边方向，判断降级为震荡。",
                 icon=":material/balance:")
@@ -160,10 +166,11 @@ def render_trend_panel(result: dict[str, Any], *, key: str, unit_label: str = ""
         with st.expander("查看信号拆解与计算口径", key=f"trend_signals_{key}", on_change="rerun") as panel:
             if panel.open:
                 render_signal_chart(analysis, key=key)
-                for signal in analysis.get("signals") or []:
+                for signal in (analysis.get("signals") or []) if show_annotations else []:
                     note = signal.get("note")
                     st.caption(f"{signal.get('label')}：{signal.get('reading')}" + (f"（{note}）" if note else ""))
-    for note in analysis.get("notes") or []:
-        if note:
-            st.caption(note)
-    st.caption("走势判断由收盘价与均线等可复算信号加权得出，是描述性观察，不预测收益，也不进入投资建议的证据链。")
+    if show_annotations:
+        for note in analysis.get("notes") or []:
+            if note:
+                st.caption(note)
+        st.caption("走势判断由收盘价与均线等可复算信号加权得出，是描述性观察，不预测收益，也不进入投资建议的证据链。")

@@ -580,6 +580,8 @@ def _render_research_board(api_base: str, page_direction: str, fetch: Callable,
         macro = section_facts(result, "macro")
         news = section_facts(result, "news")
         fund_facts = [fact for section in ("profile", "performance", "allocation", "reference") for fact in section_facts(result, section)] if direction == "fund" else []
+        if target and direction in {"stock", "fund", "convertible"} and api_request is not None:
+            _render_asset_technical(api_base, target, ASSET_TYPES[direction], api_request)
         if not rows and not detail_rows and not macro and not news and not fund_facts:
             if result.get("status") == "loading":
                 with st.container(horizontal=True):
@@ -646,7 +648,9 @@ def _render_research_board(api_base: str, page_direction: str, fetch: Callable,
                 render_table(rows, direction)
         if direction == "market" and api_request is not None:
             from frontend.index_board import render_index_board
-            render_index_board(api_base, api_request, key="market")
+            from frontend.api_client import backend_http_client, snapshot_fetch_factory
+            render_index_board(api_base, api_request, key="market",
+                factory=snapshot_fetch_factory(backend_http_client(api_base), st.session_state.get("auth_token")))
         if direction == "industry" and target and api_request is not None:
             _render_industry_trend(api_base, target, api_request)
         macro = section_facts(result, "macro")
@@ -681,10 +685,9 @@ def _render_industry_trend(api_base: str, target: str, api_request: Callable) ->
     key = f"{api_base}|{target}"
     with st.container(border=True):
         st.markdown("**行业走势与中和判断**")
-        st.caption("行业指数点位只用于走势观察，计算口径与个股一致：MA5、三日累计升幅与多信号中和。")
         if st.button("加载 / 刷新行业走势", key="industry_trend_load", icon=":material/show_chart:"):
             cache[key] = {"result": api_request(api_base, "POST", "/data/price-history",
-                                                {"target": target, "asset_type": "行业", "limit": 30})}
+                                                {"target": target, "asset_type": "行业", "limit": 60})}
             while len(cache) > 8:
                 cache.pop(next(iter(cache)))
         entry = cache.get(key)
@@ -695,7 +698,7 @@ def _render_industry_trend(api_base: str, target: str, api_request: Callable) ->
         if result.get("status") != "ok":
             st.caption(result.get("message") or "问财暂未返回该行业的历史点位。")
             return
-        render_trend_panel(result, key="industry_trend", unit_label=" 点")
+        render_trend_panel(result, key="industry_trend", unit_label=" 点", show_annotations=False)
 
 
 def restore_board_scroll(page_direction: str, *, has_conversation: bool) -> None:
@@ -729,3 +732,29 @@ def restore_board_scroll(page_direction: str, *, has_conversation: bool) -> None
     })();
     </script>"""
     st.html(script.replace("__BOARD_TOKEN__", token), unsafe_allow_javascript=True)
+
+
+def _render_asset_technical(api_base: str, target: str, asset_type: str, api_request: Callable) -> None:
+    """Independent, bounded on-demand history for stock, bond and NAV pages."""
+    from frontend.trend_view import render_trend_panel
+
+    cache = st.session_state.setdefault("technical_history_cache", {})
+    cache_key = f"{api_base}|{asset_type}|{target}"
+    with st.expander("技术指标与完整走势", key=f"asset_technical_{asset_type}", on_change="rerun") as panel:
+        if not panel.open:
+            return
+        if st.button("加载 / 刷新技术指标", key=f"asset_technical_load_{asset_type}", icon=":material/show_chart:"):
+            with st.spinner("正在读取历史行情并计算指标…"):
+                result = api_request(api_base, "POST", "/data/price-history",
+                                     {"target": target, "asset_type": asset_type, "limit": 60})
+            cache[cache_key] = result
+            while len(cache) > 8:
+                cache.pop(next(iter(cache)))
+        result = cache.get(cache_key)
+        if not isinstance(result, dict):
+            st.caption("点击加载后显示指标；切换类别不会重复请求行情。")
+            return
+        if result.get("status") != "ok":
+            st.info(result.get("message") or "历史行情暂不可用，请稍后刷新。")
+            return
+        render_trend_panel(result, key=f"asset_technical_{asset_type}_{target}", show_annotations=False)

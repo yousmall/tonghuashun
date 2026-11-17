@@ -719,6 +719,11 @@ def test_application_shares_client_between_semantics_and_all_specialists(monkeyp
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model,mode,expected", [
     ("deepseek-v4-flash", "auto", {"type": "disabled"}),
+    ("deepseek-v4.1-flash", "auto", {"type": "disabled"}),
+    ("DeepSeek-V4.1-Pro", "auto", {"type": "disabled"}),
+    ("deepseek-v4.1-flash", "omit", None),
+    ("deepseek-v4.1-flash", "enabled", {"type": "enabled"}),
+    ("deepseek-v4compatible", "auto", None),
     ("another-compatible-model", "auto", None),
     ("deepseek-v4-flash", "omit", None),
     ("another-compatible-model", "disabled", {"type": "disabled"}),

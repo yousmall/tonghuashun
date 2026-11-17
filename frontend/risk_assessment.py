@@ -1,53 +1,16 @@
 """单框、逐题的风险测评及证券式结果展示。"""
 from __future__ import annotations
 
-import base64
 from html import escape
-from pathlib import Path
 from typing import Callable
 
 import streamlit as st
-from streamlit.runtime import get_instance
+from frontend.user_settings import avatar_uri, display_name
 
 from backend.app.risk_questionnaire import (
     QUESTIONNAIRE_VERSION, QUESTIONS, RISK_NAMES, SCORING_NOTICE,
     answer_issues, assessment_is_current,
 )
-
-PERSONA_DIR = Path(__file__).resolve().parent / "assets" / "personas"
-PERSONA_FILES = {
-    1: "c1_conservative.jpg",
-    2: "c2_cautious.jpg",
-    3: "c3_steady.jpg",
-    4: "c4_active.jpg",
-    5: "c5_aggressive.jpg",
-}
-
-
-@st.cache_data(show_spinner=False, max_entries=5)
-def _persona_bytes(file_name: str) -> bytes:
-    """按文件名缓存画像原图，避免每轮重复读盘。"""
-
-    return (PERSONA_DIR / file_name).read_bytes()
-
-
-def _persona_uri(band: int) -> str:
-    """返回当前等级画像的图片地址；没有运行时环境时退回内联数据。"""
-
-    file_name = PERSONA_FILES.get(band)
-    if not file_name:
-        return ""
-    try:
-        data = _persona_bytes(file_name)
-    except OSError:
-        return ""
-    try:
-        runtime = get_instance()
-    except RuntimeError:
-        return "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")
-    uri = runtime.media_file_mgr.add(data, "image/jpeg", f"wence-persona-c{band}")
-    base_path = st.get_option("server.baseUrlPath").strip("/")
-    return f"/{base_path}{uri}" if base_path else uri
 
 
 def _remember_answer(question_id: str) -> None:
@@ -81,18 +44,16 @@ def _matching_rules() -> None:
         st.rerun()
 
 
-def result_html(profile: dict) -> str:
+def result_html(profile: dict, user: dict | None = None) -> str:
     band = int((profile.get("investor_category") or "C1")[1])
     name = profile.get("risk_description") or RISK_NAMES[band - 1]
     steps = "<span class='risk-step-line'></span>".join(
         f"<span class='risk-step{' active' if i == band else ''}'>{i}</span>" for i in range(1, 6)
     )
     product_levels = "R1" if band == 1 else f"R1–R{band}"
-    persona_uri = _persona_uri(band)
-    persona = (
-        f"""<figure class="risk-persona" role="img" aria-label="{escape(name)}画像"
-        title="{escape(name)}画像" style='--persona-image: url("{persona_uri}")'></figure>"""
-    ) if persona_uri else ""
+    persona = f"""<figure class="risk-user-avatar">
+        <img src="{escape(avatar_uri(user), quote=True)}" alt="用户头像">
+        <figcaption>{escape(display_name(user or {}))}</figcaption></figure>"""
     return f"""<section class="risk-result-card">
       <div class="risk-result-body">
         <div class="risk-result-main">
@@ -175,7 +136,7 @@ def render_risk_assessment(api_base: str, *, api_request: Callable) -> None:
             st.caption(SCORING_NOTICE)
             return
 
-        st.html(result_html(current))
+        st.html(result_html(current, st.session_state.get("auth_user")))
         _render_guidance(current)
         if st.button("查看投资者分类标准及适当性匹配规则 ›", key="risk_matching_rules", width="stretch"):
             _matching_rules()
@@ -196,8 +157,8 @@ def render_risk_assessment(api_base: str, *, api_request: Callable) -> None:
 
 
 def _render_guidance(profile: dict) -> None:
-    """与结果一起展示解释和资金约束；详细答题依据可展开核对。"""
-    if not profile.get("financial_plan"):
+    """风险评估只展示评级依据；规划和配置由投资规划页承载。"""
+    if not profile.get("assessment_reasons"):
         return
     st.markdown("### 评级依据与用户画像")
     st.caption(f"前19题基础风险分：{profile.get('risk_score', '未提供')} / 100。本金安全或零回撤选择按保守型处理；补充题不增加风险分。")
@@ -205,22 +166,7 @@ def _render_guidance(profile: dict) -> None:
         st.markdown(f"**{reason['dimension']}**：{reason['summary']}")
     for warning in profile.get("financial_warnings", []):
         st.warning(warning)
-    plan = profile["financial_plan"]
-    st.markdown("### 财务规划与资金安排")
-    st.table({
-        "项目": ["计划投入资金", "未来12个月必要支出", "已有应急储备", "每月还款负担", "首要目标", "最早用款时间", "流动性需求"],
-        "您的情况": [plan["investment_capital_label"], plan["near_term_spending_label"], plan["emergency_reserve_label"],
-                  plan["debt_service_label"], plan["goal_label"], plan["goal_horizon_label"], profile["liquidity_need"]],
-    })
-    st.caption("资金金额和时间保留您选择的区间；近期必要支出按比例区间上限预留，可在明确金额后重新评估。")
-    st.markdown("### 根据资金约束调整的配置参考")
-    rows = profile.get("allocation_guidance", [])
-    if rows:
-        st.table({"资产类别": [r["asset_class"] for r in rows],
-                  "参考区间": [f"{r['min_weight']:.0%}–{r['max_weight']:.0%}" for r in rows],
-                  "示例占比": [f"{r['reference_weight']:.1%}" for r in rows]})
-    st.caption("示例占比合计100%，用于解释资金约束；区间不能各自取上限后直接相加。产品仍需匹配风险等级、期限和持仓集中度。")
-    with st.expander("查看答题依据、配置规则与情景测算"):
+    with st.expander("查看答题依据与评分规则"):
         breakdown = profile.get("scoring_breakdown", [])
         if breakdown:
             st.table({"评分维度": [r["dimension"] for r in breakdown],
@@ -231,12 +177,3 @@ def _render_guidance(profile: dict) -> None:
             st.markdown(f"**{reason['dimension']}**")
             for answer in reason["answers"]:
                 st.markdown(f"- {answer}")
-        for explanation in plan.get("policy_explanations", []):
-            st.markdown(f"- {explanation}")
-        st.caption("情景一假设权益跌20%、固收跌5%、现金及低波动类不变；情景二分别跌40%、10%、0%。按示例占比计算，不是行情预测或实际最大回撤。")
-        for scenario in profile.get("stress_scenarios", []):
-            suffix = "，超过您选择的回撤上限" if scenario["exceeds_tolerance"] else ""
-            st.markdown(f"**{scenario['name']}**：假设组合损失 {scenario['estimated_loss']:.1%}{suffix}。")
-        st.caption("低波动资产也可能亏损；情景以外的跌幅、相关性变化、赎回限制和费用可能使损失更大。")
-    for followup in plan.get("followups", []):
-        st.info(followup)

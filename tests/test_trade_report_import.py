@@ -199,6 +199,8 @@ st.session_state.conversation = [
     {'role': 'user', 'content': '个股研究：分析下茅台'},
     {'role': 'assistant', 'content': '缺少资料', 'payload': {
         'response_scope': 'clarification', 'intent': 'security_research', 'research_mode': 'instant'}}]
+from frontend.conversation_logic import chain_key
+st.session_state[chain_key(st.session_state.conversation_id)] = True
 def retry(base, direction, query):
     st.session_state.retry_request = {'query': query, 'mode': st.session_state.research_mode}
 with patch.object(ui, 'render_page_header'), patch.object(ui, 'render_research_guide'), \

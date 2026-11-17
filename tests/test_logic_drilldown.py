@@ -160,11 +160,11 @@ def test_logic_chain_entry_explains_mechanism_without_answer():
     assert "引用编号由系统内部维护" in text
 
 
-def test_no_extra_navigation_entry_is_added():
-    """用户要求不单开工作栏：侧栏导航保持原样，入口常驻在主内容区顶部。"""
+def test_logic_chain_does_not_add_a_separate_navigation_entry():
+    """投资规划有独立入口，逻辑链入口仍位于主内容区顶部。"""
     from frontend.presentation import NAVIGATION
     from frontend.streamlit_app import render_logic_chain_banner
-    assert NAVIGATION == ['主页', '风险评估', '投资问答', '自选研究', '持仓分析']
+    assert NAVIGATION == ['主页', '风险评估', '投资规划', '投资问答', '自选研究', '持仓分析']
     assert callable(render_logic_chain_banner)
     app = run("import streamlit as st\n"
               "from frontend import streamlit_app as ui\n"
@@ -202,24 +202,16 @@ def test_logic_chain_panels_start_collapsed_on_first_open():
     assert '完成风险测评并发起一次咨询' not in entry_text
 
 
-def test_banner_shows_a_full_demo_chain_without_any_answer():
-    """没有任何真实回答时，直接给出有数值、有来源的四层演示逻辑链。"""
-    app = run("import streamlit as st\n"
+def test_banner_keeps_a_new_conversation_empty_and_never_fetches_other_history():
+    app = run("from unittest.mock import patch\n"
               "from frontend import streamlit_app as ui\n"
               "ui.init_session()\n"
-              "st.session_state.conversation = []\n"
-              "ui.render_logic_chain_banner('http://127.0.0.1:8000/api/v1', expanded=True)")
-    assert not app.exception, [e.value for e in app.exception]
+              "with patch.object(ui, 'api_request', side_effect=AssertionError('must not fetch history')):\n"
+              "    ui.render_logic_chain_banner('http://offline', expanded=True)\n")
+    assert not app.exception
     text = rendered_text(app)
-    assert '投资逻辑链 · 逐级展开与数据溯源' in text
-    assert '① 综合结论与关键信息' in text
-    assert '④ 原始来源' in text
-    assert '演示逻辑链' in text and '演示数据' in text
-    assert '示例科技' in text  # 默认就显示有主体的结论，不再是空态
-    assert '4 个维度' in text and '7 条已核验数据' in text
-    assert '| 支持分析 |' in text and '22.4 倍' in text and '查看原文' in text
-    assert '逐层点开完整演示逻辑链' in text
-    assert '没有可溯源的结论依据' not in text
+    assert '本对话尚未发起咨询' in text
+    assert '演示逻辑链' not in text and '示例科技' not in text
 
 
 def test_demo_advice_supports_full_four_level_drilldown():
@@ -236,23 +228,16 @@ def test_demo_advice_supports_full_four_level_drilldown():
     assert '不应出现在逻辑链里' not in text  # 未通过核验的资料被过滤
 
 
-def test_banner_falls_back_to_demo_when_answer_has_no_evidence():
-    """资料不足的回答不再渲染一片空态，而是说明原因并给出完整演示。"""
-    empty_answer = {"conclusion": "已有资料无法确定您指定的标的，请补充资料。",
-                    "compliance": {"status": "PASS"}, "facts": [], "evidence": [],
-                    "agent_results": []}
-    app = run(f"import streamlit as st\n"
-              f"from frontend import streamlit_app as ui\n"
-              f"ui.init_session()\n"
-              f"st.session_state.conversation = [{{'role': 'assistant', 'content': '答',\n"
-              f"    'payload': {empty_answer!r}}}]\n"
-              f"ui.render_logic_chain_banner('http://127.0.0.1:8000/api/v1', expanded=True)")
-    assert not app.exception, [e.value for e in app.exception]
+def test_banner_does_not_replace_an_unverified_answer_with_demo_or_old_answers():
+    empty_answer = {"conclusion": "需要补充资料", "compliance": {"status": "PASS"}, "facts": [], "evidence": []}
+    app = run("from frontend import streamlit_app as ui\n"
+              "ui.init_session()\n"
+              f"ui.st.session_state.conversation = [{{'role':'user','content':'当前问题'}},{{'role':'assistant','payload':{empty_answer!r}}}]\n"
+              "ui.render_logic_chain_banner('http://offline', expanded=True)\n")
+    assert not app.exception
     text = rendered_text(app)
     assert '没有通过核验的数据引用' in text
-    assert '演示逻辑链' in text and '示例科技' in text
-    assert '没有可溯源的结论依据' not in text
-    assert '本次没有形成可展开的分项分析' not in text
+    assert '演示逻辑链' not in text and '示例科技' not in text
 
 
 def test_has_traceable_evidence_filters_empty_and_blocked_answers():

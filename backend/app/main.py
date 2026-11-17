@@ -23,17 +23,21 @@ from contextlib import asynccontextmanager
 from contextlib import suppress
 from datetime import date, datetime, timedelta, timezone
 from time import perf_counter, monotonic
+from sqlalchemy.exc import SQLAlchemyError
+from backend.app.services.context_compression import prepare_request_context, HISTORY_MESSAGES
+from backend.app.services.rag import configured_store, DocumentUpload, SearchRequest, DocumentState
 from backend.app.services.history import cited_facts_of
 from backend.app.services.model_telemetry import analysis_telemetry, summarize_costs
 from backend.app.services.local_consultation import LocalConsultationService, select_scope
 from backend.app.services.instant_research import InstantResearchService
 from backend.app.services.trend_analytics import analyze_trend
+from backend.app.services.technical_indicators import history_bars
 from backend.app.services.research_recovery import recover_research
 from backend.app.services.stock_recommendation import STOCK_RECOMMENDATION_TIMEOUT_SECONDS, StockRecommendationService
 from backend.app.services.automatic_consultation import run_automatic, source_item
 from backend.app.services.automatic_planning import AutomaticPlanningRequest, build_automatic_planning
 from backend.app.services.personalized_investment import PersonalizedInvestmentRequest, build_personalized_investment
-from backend.app.services.investor_workbench import WorkspaceSave, PaperOrder, JournalEntry, ReviewRequest, history_suggestions, review_trades, paper_order
+from backend.app.models.auth_schemas import UserAppearanceUpdate
 from backend.app.services.prepared_research import (PreparedResearchCache, PreparedResearchRequest, board_signature, report_is_ready, task_query)
 from backend.app.services.research_admission import ResearchAdmission
 from backend.app.services.dependency_health import DatabaseHealthProbe
@@ -139,6 +143,7 @@ from backend.app.wechat_login import WechatLogin
 
 # 从本地 .env 加载可选外部服务配置；生产环境中已有的环境变量优先。
 load_dotenv()
+rag_service = configured_store()
 database = Database.from_env()
 session_thread_pool = SessionThreadPool.from_env(str(Path(__file__).resolve().parents[2] / ".tmp_flow/login_sessions.sqlite3"))
 wechat_login = WechatLogin.from_env()
@@ -547,6 +552,12 @@ def current_user(user: dict[str, object] = Depends(authenticated_user)) -> UserS
     return UserSummary.model_validate(user)
 
 
+@app.patch("/api/v1/auth/me", response_model=UserSummary, tags=["auth"])
+def update_current_user(request: UserAppearanceUpdate, user: dict[str, object] = Depends(authenticated_user)) -> UserSummary:
+    updated = database.update_user_appearance(int(user["id"]), request.model_dump(exclude_unset=True))
+    return UserSummary.model_validate(updated)
+
+
 @app.get("/api/v1/auth/session/status", tags=["auth"])
 def session_status(authorization: str | None = Header(default=None)) -> dict[str, bool]:
     """检查会话是否仍有效，但不把轮询本身算作用户活动。"""
@@ -870,15 +881,13 @@ async def price_history(
             message="尚未配置问财访问密钥，暂时无法加载历史走势。",
         )
     try:
-        facts = await data_provider.get_price_history(
+        load_history = getattr(data_provider, "get_technical_history", data_provider.get_price_history)
+        facts = await load_history(
             request.target, request.asset_type, limit=request.limit,
         )
     except RuntimeError as exc:
         return PriceHistoryResponse(**common, status="unavailable", message=str(exc))
-    points = [
-        PriceHistoryPoint(date=date.fromisoformat(str(fact.period)), value=float(fact.value))
-        for fact in facts if fact.period
-    ]
+    points = [PriceHistoryPoint(**bar) for bar in history_bars(facts)]
     urls = {fact.source_url for fact in facts if fact.source_url}
     analysis = analyze_trend(points) if len(points) >= 2 else None
     return PriceHistoryResponse(
@@ -1020,6 +1029,49 @@ async def _trade_file_task(user, function, *args):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+def _rag_store():
+    if rag_service is None:
+        raise HTTPException(status_code=503, detail="本地RAG已关闭")
+    return rag_service
+
+
+@app.get("/api/v1/rag/status", tags=["rag"])
+async def rag_status(user: dict[str, object] = Depends(customer_user)):
+    if rag_service is None:
+        return {"enabled": False, "ready": False}
+    return await _trade_file_task(user, rag_service.status, int(user["id"]))
+
+
+@app.get("/api/v1/rag/documents", tags=["rag"])
+async def rag_documents(user: dict[str, object] = Depends(customer_user)):
+    return await _trade_file_task(user, _rag_store().documents, int(user["id"]))
+
+
+@app.post("/api/v1/rag/documents", tags=["rag"])
+async def rag_import(request: DocumentUpload, user: dict[str, object] = Depends(customer_user)):
+    try:
+        return await _trade_file_task(user, _rag_store().add, int(user["id"]), request)
+    except (RuntimeError, OSError) as exc:
+        raise HTTPException(status_code=503, detail="本地向量模型不可用，请运行RAG部署脚本") from exc
+
+
+@app.post("/api/v1/rag/search", tags=["rag"])
+async def rag_search(request: SearchRequest, user: dict[str, object] = Depends(customer_user)):
+    try:
+        return await _trade_file_task(user, _rag_store().search, int(user["id"]), request)
+    except (RuntimeError, OSError) as exc:
+        raise HTTPException(status_code=503, detail="本地向量模型不可用，请运行RAG部署脚本") from exc
+
+
+@app.patch("/api/v1/rag/documents/{document_id}", tags=["rag"])
+async def rag_document_state(document_id: str, request: DocumentState,
+                             user: dict[str, object] = Depends(customer_user)):
+    try:
+        return await _trade_file_task(user, _rag_store().set_enabled, int(user["id"]), document_id, request.enabled)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="资料不存在") from exc
+
+
 @app.post("/api/v1/profile/auto-plan", tags=["profile"])
 async def automatically_plan_profile(request: AutomaticPlanningRequest, user: dict[str, object] = Depends(customer_user)):
     """只读规划预览；画像归属由账号决定，不生成未答题的答案或修改确认状态。"""
@@ -1047,57 +1099,6 @@ async def personalized_investment_plan(request: PersonalizedInvestmentRequest, u
     stored = await _trade_file_task(user, database.get_profile, int(user["id"]))
     profile = UserProfile.model_validate({**stored["payload"], "version": stored["version"]}) if stored else None
     return build_personalized_investment(profile, investment_amount=request.investment_amount)
-
-
-@app.get("/api/v1/investor/workspace", tags=["profile"])
-async def read_investor_workspace(user: dict[str, object] = Depends(customer_user)):
-    stored = await _trade_file_task(user, database.get_profile, int(user["id"]))
-    profile = UserProfile.model_validate({**stored["payload"], "version": stored["version"]}) if stored else UserProfile()
-    return {"profile": profile.model_dump(mode="json"), "workspace": profile.investment_workspace,
-            "history_suggestions": history_suggestions(profile.trading_analysis)}
-
-
-def _update_investor_workspace(user_id, request):
-    stored = database.get_profile(user_id)
-    profile = UserProfile.model_validate({**stored["payload"], "version": stored["version"]}) if stored else UserProfile(user_id=str(user_id))
-    if request.expected_version != profile.version:
-        raise ProfileVersionConflict("画像或工作台已在其他页面更新，请刷新后再提交。")
-    workspace = dict(profile.investment_workspace)
-    if isinstance(request, WorkspaceSave):
-        workspace.update(request.model_dump(mode="json", exclude={"expected_version"}))
-        workspace["confirmed"] = True
-    elif isinstance(request, JournalEntry):
-        entries = list(workspace.get("journal", []))
-        if len(entries)>=1000:
-            raise ValueError("决策记录已达到1000条上限")
-        from backend.app.risk_questionnaire import local_today
-        entries.append({**request.model_dump(mode="json", exclude={"expected_version"}), "recorded_on": local_today().isoformat()})
-        workspace["journal"] = entries
-    else:
-        workspace["paper"] = paper_order(workspace.get("paper"), request)
-    saved = profile.model_copy(update={"investment_workspace":workspace,"version":profile.version+1})
-    database.save_profile(user_id,saved.model_dump(mode="json"),saved.version,profile.version)
-    return saved
-
-
-@app.post("/api/v1/investor/workspace", tags=["profile"])
-async def save_investor_workspace(request: WorkspaceSave, user: dict[str, object] = Depends(customer_user)):
-    return await _trade_file_task(user, _update_investor_workspace, int(user["id"]), request)
-
-
-@app.post("/api/v1/investor/paper-order", tags=["profile"])
-async def place_paper_order(request: PaperOrder, user: dict[str, object] = Depends(customer_user)):
-    return await _trade_file_task(user, _update_investor_workspace, int(user["id"]), request)
-
-
-@app.post("/api/v1/investor/review", tags=["profile"])
-async def review_investor_history(request: ReviewRequest, user: dict[str, object] = Depends(customer_user)):
-    return await _trade_file_task(user, review_trades, request)
-
-
-@app.post("/api/v1/investor/journal", tags=["profile"])
-async def record_investor_journal(request: JournalEntry, user: dict[str, object] = Depends(customer_user)):
-    return await _trade_file_task(user, _update_investor_workspace, int(user["id"]), request)
 
 
 @app.post("/api/v1/profile/trades/inspect", tags=["profile"])
@@ -1350,6 +1351,21 @@ async def _analyze_portfolio(
             request = request.model_copy(update={"profile": profile})
         if request.profile.questionnaire_version and not assessment_is_current(request.profile):
             raise HTTPException(status_code=409, detail="风险测评未确认或已过期，请重新完成风险测评后再分析。")
+        history_context, context_history_status = None, "not_requested"
+        if (request.context_compression and request.use_conversation_history and user and request.conversation_id
+                and request.research_mode in {"deep", "fast"} and not request.industry_collaboration
+                and not _is_profile_stock_recommendation(request)):
+            report("整理对话上下文")
+            try:
+                history_context = await asyncio.wait_for(asyncio.wrap_future(session_thread_pool.submit(
+                    str(user["_session_id"]), database.get_conversation_context,
+                    int(user["id"]), request.conversation_id, request.research_direction, HISTORY_MESSAGES,
+                )), timeout=2)
+                context_history_status = ("not_found" if history_context is None else
+                                          "scope_mismatch" if history_context.get("scope_mismatch") else "loaded")
+            except (DatabaseUnavailable, SQLAlchemyError, TimeoutError):
+                context_history_status = "unavailable"
+        request = prepare_request_context(request, history=history_context, history_status=context_history_status)
         report("选择精简范围" if request.research_mode in {"lite", "instant"} else "理解问题")
         prefetch_key: tuple[Intent, str] | None = None
         if request.research_mode in {"lite", "instant", "auto"}:
@@ -1379,6 +1395,7 @@ async def _analyze_portfolio(
         fetch_intent = Intent.UNKNOWN if understanding.risk_rules or wrong_direction else understanding.intent
         report("查找资料")
         model_slice: dict[str, object] = {}
+        rag_audit = {"status": "skipped", "reason": "当前模式不使用向量检索"}
         if request.research_mode == "auto":
             history = None
             if (user and request.conversation_id and source_item(request.query) and not understanding.risk_rules
@@ -1415,6 +1432,38 @@ async def _analyze_portfolio(
                 target=understanding.target, data_requirements=understanding.data_requirements,
                 progress_sink=report, semantic=coordinator.semantic,
             )
+            # Current provider data is collected first. RAG can supplement passages,
+            # but cannot replace a fresh quote or cross account/asset boundaries.
+            if (rag_service is not None and request.use_rag and user and not understanding.risk_rules
+                    and not wrong_direction and not request.industry_collaboration):
+                report("检索本地知识库")
+                try:
+                    from backend.app.services.security_identity import STOCK_NAMES
+                    asset = {Intent.SECURITY_RESEARCH: "stock", Intent.FUND_SCREENING: "fund",
+                             Intent.CONVERTIBLE_BOND_ANALYSIS: "bond", Intent.INDUSTRY_ANALYSIS: "industry",
+                             Intent.MARKET_ANALYSIS: "market"}.get(fetch_intent)
+                    target = (understanding.target or request.research_target or "").strip()
+                    code = STOCK_NAMES.get(target, "") if asset == "stock" else ""
+                    if re.fullmatch(r"[0-9]{6}(?:\.[A-Z]{2})?", target.upper()):
+                        code = target.upper()
+                    lookup = SearchRequest(query=request.query[:1000],entity=target,entity_code=code,asset_type=asset)
+                    owner = int(user["id"])
+                    rag_audit = await asyncio.to_thread(rag_service.search, owner, lookup,
+                                                       general_only=not bool(target and asset),
+                                                       available_facts=prepared_request.facts)
+                    ids = {fact.fact_id for fact in prepared_request.facts}
+                    from backend.app.models import FactRecord
+                    retrieved = [FactRecord.model_validate(item["fact"]) for item in rag_audit["matches"]
+                                 if item["fact"]["fact_id"] not in ids]
+                    prepared_request = prepared_request.model_copy(update={"facts": [*prepared_request.facts, *retrieved][:4000]})
+                    original_ids = {fact.fact_id for fact in request.facts}
+                    acquired = [fact for fact in prepared_request.facts if fact.fact_id not in original_ids
+                                and fact.fact_id not in {item.fact_id for item in retrieved}]
+                    rag_audit["stored_facts"] = (await asyncio.to_thread(rag_service.ingest_facts, owner, acquired, asset)
+                                                  if asset else 0)
+                except Exception:
+                    logging.getLogger(__name__).warning("Local RAG unavailable", exc_info=True)
+                    rag_audit = {"status": "unavailable", "notice": "本地知识库暂不可用，继续执行原有取数与核验。"}
             async def recover_before_review(provisional):
                 nonlocal prepared_request, acquisition
                 recovered, acquisition = await recover_research(
@@ -1471,6 +1520,8 @@ async def _analyze_portfolio(
                 "research_mode": request.research_mode,
                 # 数字级对账：回答里每个数值是否能在所引事实中找到来源。
                 "numeric_grounding": summarize_grounding(advice.agent_results, prepared_request.facts),
+                "context_compression": {**request._context_compaction, "model_calls": len(telemetry["calls"])},
+                "rag": rag_audit,
             }
         )
         from backend.app.services.research_report import attach_research_report

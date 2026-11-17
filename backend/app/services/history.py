@@ -64,6 +64,8 @@ def summarise_advice(advice: dict[str, Any], used_fact_ids: set[str] | None = No
         "model_calls": advice.get("model_calls") or [],
         "model_cost": advice.get("model_cost") or {},
         "timings_ms": advice.get("timings_ms") or {},
+        "context_compression": advice.get("context_compression") or {},
+        "rag": advice.get("rag") or {},
     }
     if advice.get("user_fit"):
         summary["user_fit"] = advice["user_fit"]

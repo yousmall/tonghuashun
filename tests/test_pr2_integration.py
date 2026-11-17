@@ -1,10 +1,8 @@
 """PR #2与现有基金、自选、账号及研究上下文的集成边界。"""
 from datetime import timedelta
-from io import BytesIO
 from time import perf_counter
 
 import pytest
-from PIL import Image
 from streamlit.testing.v1 import AppTest
 
 from backend.app.risk_questionnaire import local_today
@@ -13,7 +11,8 @@ from backend.app.services.local_consultation import LocalConsultationService, se
 from backend.app.services.index_board import fetch_index_board
 from backend.app.services.provider_errors import ProviderCallError
 from frontend.hot_sectors import describe, parse_sector_facts, volume_label
-from frontend.risk_assessment import PERSONA_FILES, _persona_bytes, result_html
+from frontend.risk_assessment import result_html
+from frontend.user_settings import DEFAULT_AVATAR
 from tests.test_context_link import FACTS, fact, request, turn
 
 
@@ -151,13 +150,10 @@ st.write('ok')
 
 
 @pytest.mark.parametrize('band',[1,2,3,4,5])
-def test_all_five_risk_personas_remain_valid_images_and_match_level(band):
-    payload = _persona_bytes(PERSONA_FILES[band])
-    with Image.open(BytesIO(payload)) as image:
-        assert image.format=='JPEG' and min(image.size)>100
-        image.verify()
+def test_all_five_risk_results_use_default_account_avatar(band):
     html = result_html({'investor_category':f'C{band}'})
-    assert 'risk-persona' in html and f'C{band}' in html
+    assert DEFAULT_AVATAR in html and f'C{band}' in html
+    assert 'risk-user-avatar' in html and 'personas/' not in html
 
 
 @pytest.mark.asyncio

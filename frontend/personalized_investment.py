@@ -1,4 +1,4 @@
-"""风险评估页的个性化建议、配置金额与人工复核安排。"""
+"""投资规划页的个性化资产配置与金额预览。"""
 from __future__ import annotations
 
 import json
@@ -35,23 +35,6 @@ def render_investment_result(result: dict) -> None:
     if result.get("investment_amount") is not None:
         st.caption(f"本次资金 {result['investment_amount']:,.2f} 元；金额按示例占比分配并处理分位舍入。该金额仅用于本次预览。")
     st.caption("示例占比合计100%；各类别区间的上下限不能独立相加。必要支出包含在现金及低波动类安排内。")
-    for recommendation in result["recommendations"]:
-        with st.container(border=True):
-            st.markdown(f"**{recommendation['title']}**")
-            st.write(recommendation["action"])
-            st.caption("依据：" + recommendation["basis"])
-    for message in result.get("warnings", []):
-        st.warning(message)
-    with st.expander("查看假设损失与复核安排"):
-        for explanation in result["policy_explanations"]:
-            st.write(explanation)
-        for scenario in result["stress_scenarios"]:
-            assumptions = "、".join(f"{name}{shock:+.0%}" for name, shock in scenario["assumptions"].items())
-            amount = f"，对应 {scenario['loss_amount']:,.2f} 元" if scenario["loss_amount"] is not None else ""
-            suffix = "，超过已选回撤边界" if scenario["exceeds_tolerance"] else ""
-            st.write(f"{scenario['name']}（{assumptions}）：组合假设损失 {scenario['estimated_loss']:.1%}{amount}{suffix}。")
-        st.table([{"复核时机": item["when"], "安排": item["action"]} for item in result["review_plan"]])
-        st.caption(f"画像版本：{result['profile_version']} · 生成日期：{result['generated_on']} · 测评有效期至 {summary['valid_until']}")
     st.caption(result["notice"])
 
 

@@ -29,6 +29,7 @@ NEWS_FIELDS = frozenset({"announcement_excerpt", "news", "announcement", "resear
 MULTI_VALUE_FIELDS = frozenset(
     {
         *NEWS_FIELDS,
+        "rag_document_excerpt", "rag_education_excerpt",
         'exchange_calendar_notice',
         'risk_warning_inventory',
         'audit_opinion_evidence', 'regulatory_status_evidence', 'disclosure_status_evidence',
@@ -78,6 +79,7 @@ PORTFOLIO_FIELDS = frozenset({"weight", "portfolio_weight", "sector_weight", "fu
 
 # 面向用户的中文指标名：任何展示给用户的文案都必须经它转换，不能回显内部字段编码。
 FIELD_LABELS: dict[str, str] = {
+    'rag_document_excerpt': '知识库资料原文', 'rag_education_excerpt': '投资基础知识原文',
     'industry_constituent_inventory': '行业成分股完整名单',
     'constituent_revenue': '行业成分股营业收入',
     'exchange_calendar_notice': '交易所年度休市公告',
@@ -212,6 +214,10 @@ def fact_max_age_seconds(fact: FactRecord) -> int:
     """按数据类型返回可接受最大年龄，避免用统一阈值处理行情和财报。"""
 
     field = fact.field.casefold()
+    if field == "rag_document_excerpt":
+        return 90 * 86400
+    if field == "rag_education_excerpt":
+        return 365 * 86400
     if field in FAST_MARKET_FIELDS:
         return 60
     if field in NEWS_FIELDS:

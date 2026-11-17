@@ -621,7 +621,7 @@ class IwencaiSkillHubProvider:
         return "问财数据查询失败，请稍后重试。"
 
     async def get_price_history(
-        self, target: str, asset_type: str, *, limit: int = 30
+        self, target: str, asset_type: str, *, limit: int = 30, include_ohlcv: bool = False
     ) -> list[FactRecord]:
         """沿用已开通的只读查询 Skill，返回有真实日期的价格/净值/点位事实。"""
 
@@ -632,7 +632,11 @@ class IwencaiSkillHubProvider:
             asset_type, "收盘价")
         skill = ("hithink-fund-query" if asset_type == "基金"
                  else "hithink-industry-query" if asset_type == "行业" else "hithink-market-query")
-        query = f"{target}近{limit}个交易日每日{label}，逐日列出日期和{label}"
+        fields = label
+        if include_ohlcv and asset_type != "基金":
+            fields += "、最高价、最低价、成交量（逐日注明成交量单位），价格使用同一不复权口径"
+            metric = "ohlcv"
+        query = f"{target}近{limit}个交易日每日{fields}，逐日列出日期和{fields}"
         return await self._request(
             "/v1/query2data",
             {"query": query, "page": "1", "limit": str(limit),
@@ -643,6 +647,10 @@ class IwencaiSkillHubProvider:
             history_metric=metric,
             history_limit=limit,
         )
+
+    async def get_technical_history(self, target: str, asset_type: str, *, limit: int = 60) -> list[FactRecord]:
+        """同一次只读请求获取指标所需的高低收与成交量；基金仍使用净值。"""
+        return await self.get_price_history(target, asset_type, limit=limit, include_ohlcv=True)
 
     async def get_quote(self, symbol: str) -> list[FactRecord]:
         return await self.query(f"{symbol} 最新价、涨跌幅、成交量、换手率、行情更新时间（精确到秒）", entity_hint=symbol)
@@ -1461,7 +1469,7 @@ def _history_value(value: Any) -> float | None:
 
 
 def _history_record_code(record: dict[str, Any]) -> str | None:
-    for key in ("股票代码", "证券代码", "基金代码", "代码"):
+    for key in ("股票代码", "证券代码", "基金代码", "指数代码", "板块代码", "行业代码", "代码"):
         match = re.search(r"(?<!\d)(\d{6})(?!\d)", str(record.get(key) or ""))
         if match:
             return match.group(1)
@@ -1476,7 +1484,28 @@ def _history_metric_matches(raw_key: str, metric: str) -> bool:
         return name.startswith("单位净值")
     if metric == "close_price":
         return name.startswith(("收盘价", "收盘点位", "收盘指数", "指数收盘"))
+    if metric == "high_price":
+        return name.startswith(("最高价", "最高点位", "最高点", "最高指数", "指数最高"))
+    if metric == "low_price":
+        return name.startswith(("最低价", "最低点位", "最低点", "最低指数", "指数最低"))
+    if metric == "volume":
+        return bool(re.match(r"^(?:成交量|交易量|volume)(?:$|[（(])", name, re.I))
     return False
+
+
+def _history_volume(value: Any, column: str, record: dict) -> tuple[float | None, str | None]:
+    """Retain explicit vendor units, including a genuine zero-volume session."""
+    if isinstance(value, bool) or value is None:
+        return None, None
+    units = r"亿股|万股|股|亿手|万手|手|亿份|万份|份|万张|张"
+    text = str(value).replace(",", "").strip()
+    match = re.fullmatch(r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*(" + units + r")?", text)
+    if not match:
+        return None, None
+    number = float(match.group(1))
+    unit_match = re.search(r"[（(](" + units + r")[）)]", column)
+    unit = match.group(2) or (unit_match.group(1) if unit_match else record.get("成交量单位"))
+    return (number, unit) if math.isfinite(number) and number >= 0 else (None, None)
 
 
 def _history_facts(
@@ -1488,6 +1517,11 @@ def _history_facts(
         from backend.app.data_provider.recovery_series import parse_recovery_series
         return parse_recovery_series(payload, target=entity_hint, source_id=source_id, kind=metric)
 
+    if metric == "ohlcv":
+        return [fact for field in ("close_price", "high_price", "low_price", "volume")
+                for fact in _history_facts(payload, entity_hint=entity_hint, source_id=source_id,
+                                           metric=field, limit=limit)]
+
     records = list(_find_record_lists(payload))[:100]
     target_match = re.search(r"(?<!\d)(\d{6})(?!\d)", entity_hint)
     target_code = target_match.group(1) if target_match else None
@@ -1495,7 +1529,7 @@ def _history_facts(
     codes.discard(None)
     if not target_code and len(codes) > 1:
         return []
-    values: dict[date, tuple[float, str | None]] = {}
+    values: dict[date, tuple[float, str | None, str | None]] = {}
     conflicts: set[date] = set()
     today = datetime.now(timezone(timedelta(hours=8))).date()
     for record in records:
@@ -1511,28 +1545,29 @@ def _history_facts(
                 break
         for raw_key, raw_value in record.items():
             key = str(raw_key)
-            suffix = re.search(r"\[(\d{8})\]$", key)
-            column_name = key[:suffix.start()] if suffix else key
+            suffix = re.search(r"\[(\d{8})\]", key)
+            column_name = key[:suffix.start()] + key[suffix.end():] if suffix else key
             if not _history_metric_matches(column_name, metric):
                 continue
             observed = _history_date(suffix.group(1)) if suffix else row_date
-            amount = _history_value(raw_value)
-            if not observed or not amount or observed > today or (latest_nav and observed > latest_nav):
+            amount, unit = (_history_volume(raw_value, column_name, record) if metric == "volume"
+                            else (_history_value(raw_value), None))
+            if not observed or amount is None or observed > today or (latest_nav and observed > latest_nav):
                 continue
             previous = values.get(observed)
-            if previous and not math.isclose(previous[0], amount, rel_tol=1e-9):
+            if previous and (not math.isclose(previous[0], amount, rel_tol=1e-9) or previous[2] != unit):
                 conflicts.add(observed)
             elif observed not in conflicts:
-                values[observed] = (amount, source_url or (previous[1] if previous else None))
+                values[observed] = (amount, source_url or (previous[1] if previous else None), unit)
     captured_at = datetime.now(timezone.utc)
     return [
         FactRecord(
             fact_id=f"IW-{uuid4().hex[:16].upper()}", entity=entity_hint,
-            field=metric, value=amount, period=observed.isoformat(),
+            field=metric, value=amount, unit=unit, period=observed.isoformat(),
             snapshot_time=captured_at, source_id=source_id, source_url=source_url,
             quality=0.90,
         )
-        for observed, (amount, source_url) in [
+        for observed, (amount, source_url, unit) in [
             item for item in sorted(values.items()) if item[0] not in conflicts
         ][-limit:]
     ]

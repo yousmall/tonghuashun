@@ -4,8 +4,8 @@ import pytest
 from fastapi.testclient import TestClient
 from streamlit.testing.v1 import AppTest
 from backend.app.models import UserProfile
-from backend.app.services.investor_workbench import (
-    Trade,ReviewRequest,WorkspaceSave,PaperOrder,review_trades,fit_candidate,cost_scenario,paper_order,history_suggestions)
+from backend.app.services.investment_support import (
+    Trade,ReviewRequest,WorkspaceSave,review_trades,fit_candidate,cost_scenario,history_suggestions)
 from backend.app.risk_questionnaire import local_today
 
 def trade(side,price,quantity=100,fee=5,day="2026-11-01",code="600000"):
@@ -72,60 +72,29 @@ def test_workspace_rejects_duplicates_nonfinite_and_conflicting_preferences():
     h={"code":"600000","industry":"银行","value":1000}
     with pytest.raises(ValueError): WorkspaceSave(**{**payload,"holdings":[h,h]})
 
-def test_paper_cash_sell_restrictions_and_replay_are_server_calculated():
-    def order(**patch): return PaperOrder(expected_version=1,**{**trade("buy",10),**patch})
-    first=paper_order({},order())
-    assert first["cash"]=="98995.00"
-    with pytest.raises(ValueError): paper_order(first,order(side="sell"))
-    with pytest.raises(ValueError): paper_order(first,order(quantity=1))
-    sold=paper_order(first,order(side="sell",price=11,date="2026-11-02"))
-    assert sold["cash"]=="100090.00" and sold["review"]["matched_net"]==90
-    assert first["cash"]=="98995.00" and len(first["trades"])==1
-    with pytest.raises(ValueError): paper_order(sold,order(side="sell",date="2026-11-03"))
-
 def test_history_suggestions_are_not_automatically_confirmed():
     a={"confirmed":True,"reported_median_holding_days":16,"report_sections":[{"title":"题材偏好","rows":[{"label":"半导体"},{"label":"其他"}]}]}
     s=history_suggestions(a)
     assert s["industries"]==["半导体"] and s["style"]=="短期观察"
     assert history_suggestions({**a,"confirmed":False})["industries"]==[]
 
-def test_real_api_account_isolation_version_conflicts_and_risk_confirmation_protection(monkeypatch,request):
-    from backend.app import main
-    from backend.app.database import Database
-    from backend.app.session_pool import SessionThreadPool
-    from backend.app.risk_questionnaire import QUESTIONS,evaluate_answers
-    db=Database("sqlite+pysqlite:///:memory:","test-workbench-secret-longer-than-thirty-two-characters"); db.initialize()
-    pool=SessionThreadPool(); request.addfinalizer(pool.shutdown)
-    monkeypatch.setattr(main,"database",db); monkeypatch.setattr(main,"session_thread_pool",pool)
-    with TestClient(main.app) as c:
-        assert c.get("/api/v1/investor/workspace").status_code==401
-        def account(name):
-            r=c.post("/api/v1/auth/register",json={"username":name,"password":"Test-workbench-123"}).json()
-            return {"Authorization":"Bearer "+r["access_token"]}
-        a,b=account("workbench-a"),account("workbench-b")
-        payload={"expected_version":1,"preferences":{"industries":["半导体"]},"cash":50000,"holdings":[],"holdings_complete":True,"holdings_as_of":local_today().isoformat()}
-        saved=c.post("/api/v1/investor/workspace",headers=a,json=payload)
-        assert saved.status_code==200 and saved.json()["version"]==2
-        assert c.post("/api/v1/investor/workspace",headers=a,json=payload).status_code==409
-        assert c.get("/api/v1/investor/workspace",headers=b).json()["workspace"]=={}
-        answers=dict(zip((q.id for q in QUESTIONS),"ACABDCCACCBBCCBCCDBCADAECDC",strict=True))
-        values={**evaluate_answers(answers),"version":2,"investment_workspace":{"paper":{"cash":9999999}}}
-        confirmed=c.post("/api/v1/profile/confirm",headers=a,json={"profile":UserProfile(**values).model_dump(mode="json")})
-        assert confirmed.status_code==200 and "paper" not in confirmed.json()["investment_workspace"]
-        assert confirmed.json()["investment_workspace"]["preferences"]["industries"]==["半导体"]
-        result=c.post("/api/v1/investor/review",headers=a,json={"trades":[trade("buy",10),trade("sell",11)]})
-        assert result.status_code==200 and result.json()["matched_net"]==90
+def test_removed_workbench_endpoints_are_not_registered():
+    from backend.app.main import app
+    client = TestClient(app)
+    assert client.get("/api/v1/investor/workspace").status_code == 404
+    for path in ("workspace", "paper-order", "review", "journal"):
+        assert client.post(f"/api/v1/investor/{path}", json={}).status_code == 404
 
-def test_new_workbench_ui_and_tab_navigation():
-    app=AppTest.from_string('''
+
+def test_removed_workbench_has_no_navigation_entry_and_migrates_old_sessions():
+    script = """
 import streamlit as st
-from frontend.investor_workbench import render_workbench
-def api(*args):
-    return {'profile':{'version':1},'workspace':{},'history_suggestions':{'industries':[],'style':'未设定','notice':'待确认'}}
-render_workbench('http://localhost',api_request=api,go_to=lambda page:None)
-''').run(timeout=15)
-    assert not app.exception and len(app.radio[0].options)==5
-    assert app.title[0].value=="投资工作台"
-    for label in app.radio[0].options[1:]:
-        app.radio[0].set_value(label).run(timeout=15)
-        assert not app.exception
+from frontend import streamlit_app as ui
+ui.init_session()
+st.session_state.navigation = '投资工作台'
+ui.page_navigation()
+"""
+    app = AppTest.from_string(script).run(timeout=15)
+    assert not app.exception
+    assert app.session_state['navigation'] == '主页'
+    assert all('工作台' not in button.label for button in app.button)

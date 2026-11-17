@@ -13,6 +13,7 @@ from typing import Any
 
 from backend.app.models.index_board import IndexBoardResponse, IndexQuoteItem
 from backend.app.services.trend_analytics import analyze_trend, close_series
+from backend.app.services.technical_indicators import history_bars
 
 INDEXES: tuple[tuple[str, str], ...] = (
     ("上证指数", "000001.SH"),
@@ -23,7 +24,7 @@ INDEXES: tuple[tuple[str, str], ...] = (
     ("科创50", "000688.SH"),
 )
 BENCHMARK = "沪深300"
-HISTORY_LIMIT = 30
+HISTORY_LIMIT = 60
 
 
 def _public_error(error: BaseException) -> str:
@@ -76,7 +77,7 @@ def _quote_item(facts: list[Any], name: str, code: str) -> dict[str, Any]:
 async def _load_history(provider: Any, name: str, semaphore: asyncio.Semaphore) -> list[Any]:
     async with semaphore:
         return await asyncio.wait_for(
-            provider.get_price_history(name, "指数", limit=HISTORY_LIMIT), timeout=22)
+            getattr(provider, "get_technical_history", provider.get_price_history)(name, "指数", limit=HISTORY_LIMIT), timeout=22)
 
 
 async def fetch_index_board(provider: Any, *, limit: int = HISTORY_LIMIT) -> IndexBoardResponse:
@@ -105,16 +106,18 @@ async def fetch_index_board(provider: Any, *, limit: int = HISTORY_LIMIT) -> Ind
         return_exceptions=True,
     )
     series: dict[str, Any] = {}
+    bars_by_name: dict[str, list] = {}
     history_errors = {}
     for (name, _code), result in zip(INDEXES, results):
         if isinstance(result, BaseException) or not result:
             if isinstance(result, BaseException):
                 history_errors[name] = _public_error(result)
             continue
-        cleaned = close_series([(getattr(fact, "period", None), getattr(fact, "value", None))
-                                for fact in result])
+        bars = history_bars(result)
+        cleaned = close_series(bars)
         if len(cleaned) >= 2:
             series[name] = cleaned
+            bars_by_name[name] = bars
     benchmark = series.get(BENCHMARK)
     items: list[IndexQuoteItem] = []
     notes: list[str] = []
@@ -124,7 +127,7 @@ async def fetch_index_board(provider: Any, *, limit: int = HISTORY_LIMIT) -> Ind
         analysis = None
         if cleaned is not None:
             analysis = analyze_trend(
-                cleaned.points,
+                bars_by_name[name],
                 benchmark=benchmark.points if benchmark is not None and name != BENCHMARK else None,
                 benchmark_name=BENCHMARK if benchmark is not None and name != BENCHMARK else None,
             )

@@ -131,7 +131,8 @@ def slice_facts_for_model(
         return (tier, 0 if fact.quality >= 0.6 else 1, -freshness, -fact.quality)
 
     selected.sort(key=rank)
-    kept = selected[:limit]
+    passages = [fact for fact in selected if fact.field in {"rag_document_excerpt", "rag_education_excerpt"}][:min(6, limit)]
+    kept = [fact for fact in selected if fact not in passages][:max(0, limit-len(passages))] + passages
     dropped = len(selected) - len(kept)
     summary = {
         "available": len(facts),
@@ -165,6 +166,8 @@ def slice_facts_for_agent(facts: list[FactRecord], agent_id: str, baseline_ids: 
         role_intent, limit=20,
     )
     required.update(fact.fact_id for fact in supplement)
+    required.update(fact.fact_id for fact in facts if fact.field in {"rag_document_excerpt", "rag_education_excerpt"}
+                    and fact_is_current(fact, current))
     pending = list(required)
     while pending:
         fact = by_id.get(pending.pop())

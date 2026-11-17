@@ -242,8 +242,8 @@ def test_streamlit_renders_numbered_fact_and_pdf_page_link():
     evidence = fact("600519.SH", "net_profit", 10, unit="亿元", source_field="公告第 18 页",
                     source_url="https://example.com/filing.pdf").model_dump(mode="json")
     script = f"""
-from frontend.result_views import render_advice
-render_advice({{
+from frontend.result_views import render_advice_details
+render_advice_details({{
     'research_mode': 'auto', 'conclusion': '已核对年度资料', 'compliance': {{'status': 'PASS'}},
     'facts': [{evidence!r}], 'answer_fact_ids': [{evidence['fact_id']!r}], 'evidence': [{evidence['fact_id']!r}],
 }})

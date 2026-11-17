@@ -60,7 +60,7 @@ def test_pdf_retains_warnings_sources_and_escaped_user_text():
     assert len(exported.getvalue()) > 10000
 
 
-def test_every_chat_answer_has_distinct_pdf_download_and_images():
+def test_each_chat_round_exports_from_the_shared_chain_with_a_distinct_download_key():
     import json
     script = 'import json\nreport=json.loads(' + repr(json.dumps(advice())) + ')\n' + """
 import streamlit as st
@@ -74,12 +74,30 @@ st.session_state.conversation = [
     {'role':'assistant','content':'结果','payload':report},
     {'role':'user','content':'问题乙'},
     {'role':'assistant','content':'结果','payload':report}]
+from frontend.conversation_logic import chain_key, conversation_rounds
+if st.session_state.get('show_chain_details'):
+    key = chain_key(st.session_state.conversation_id)
+    rounds = conversation_rounds(st.session_state.conversation)
+    selected = st.session_state.get(f'{key}_round', rounds[-1]['id'])
+    st.session_state[key] = True
+    st.session_state[f'{key}_{selected}_details'] = True
 with patch.object(ui,'api_request',return_value=None):
     ui.page_questions('http://test-only')
 """
     app = AppTest.from_string(script).run(timeout=15)
     assert not app.exception
-    assert len(app.get('download_button')) == 2
+    assert not app.get('download_button') and not app.get('vega_lite_chart')
+    app.session_state['show_chain_details'] = True
+    app.run(timeout=15)
+    assert not app.exception
+    assert len(app.get('download_button')) == 1
+    latest_id = app.get('download_button')[0].proto.id
+    from frontend.conversation_logic import conversation_rounds
+    first_round = conversation_rounds(app.session_state['conversation'])[0]['id']
+    next(field for field in app.selectbox if field.label == '查看本对话的咨询轮次').set_value(first_round).run(timeout=15)
+    assert not app.exception
+    assert len(app.get('download_button')) == 1
+    assert app.get('download_button')[0].proto.id != latest_id
     assert not app.get('image')
     assert len(app.get('vega_lite_chart')) == 1
 

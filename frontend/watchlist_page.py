@@ -13,6 +13,7 @@ from frontend.financial_view import period_info
 from frontend.presentation import WATCHLIST_RESEARCH_PREFIX, RESEARCH_PREFIX, fact_time, render_empty_state
 from frontend.research_board import entity_rows, format_fact, data_period
 from frontend.snapshots import poll_snapshot, clear_snapshot
+from frontend.conversation_logic import render_single_answer_chain
 from frontend.result_views import render_advice, render_answer_charts
 from backend.app.watchlist_policy import WATCHLIST_CAPACITY, WATCHLIST_PAGE_SIZES
 
@@ -181,6 +182,7 @@ def _comparison_result(api_base, actions):
             actions["save"]()
     if st.session_state.get("watchlist_comparison_advice"):
         render_advice(st.session_state.watchlist_comparison_advice, export_key="watchlist_comparison", question="、".join(request["targets"]) + "横向对比")
+        render_single_answer_chain(st.session_state.watchlist_comparison_advice, question="、".join(request["targets"]) + "横向对比", key="watchlist_comparison")
         st.button("进入本方向继续追问", on_click=actions["go_to"], args=("投资问答",), key="continue_comparison")
 
 

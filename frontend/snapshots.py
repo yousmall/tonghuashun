@@ -25,7 +25,8 @@ def poll_snapshot(name, signature, fetch, *, refresh=False):
             task.cancel()
         task = None
     ttl = 0.8 if isinstance(value, dict) and value.get("status") == "loading" else 60 if isinstance(value, dict) and value.get("status") in {"ok", "partial"} else 30
-    if not refresh and value is not None and monotonic() - st.session_state.get(prefix + "_loaded", 0) < ttl:
+    # 显式刷新可能发生在旧缓存有效期内，必须先消费其后台结果。
+    if not refresh and task is None and value is not None and monotonic() - st.session_state.get(prefix + "_loaded", 0) < ttl:
         return value
     if task is None:
         task = board_prefetch_executor().submit(fetch, refresh)

@@ -206,7 +206,7 @@ render_automatic_planning('http://localhost', api_request=api)
     next(button for button in app.button if button.label == "自动识别并规划").click().run(timeout=15)
     assert not app.exception
     assert {"风险偏好识别","收益预期分析","投资期限规划"} <= {item.value for item in app.subheader}
-    assert len(app.table) == 2  # 时间线及原文依据均实际渲染。
+    assert not app.table and not app.expander and not app.warning
     assert app.session_state["sent"]["risk_answers"] == {}
     assert app.session_state["automatic_plan_preview"]["horizon_plan"]["exact_months"] == 24
     app.session_state["risk_assessment_answers"] = {"q26":"A"}

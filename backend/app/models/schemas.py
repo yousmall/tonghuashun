@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 from .research_report import ResearchReport
 from .trend import MovingAveragePoint, TrendAnalysis
 from .decision import ComparisonDecision
@@ -430,6 +430,13 @@ class OrchestrationRequest(BaseModel):
     # 最近对话由客户端显式传入，既支持多轮理解，也避免服务端跨用户串话。
     conversation_id: str | None = Field(default=None, max_length=128)
     context_messages: list["ConversationTurn"] = Field(default_factory=list, max_length=20)
+    use_rag: bool = True
+    context_compression: bool = True
+    # Existing API clients opt in; the first-party chat enables owned-history loading.
+    use_conversation_history: bool = False
+    _model_context: dict[str, Any] | None = PrivateAttr(default=None)
+    _context_source_key: str | None = PrivateAttr(default=None)
+    _context_compaction: dict[str, Any] = PrivateAttr(default_factory=dict)
 
     @field_validator("query")
     @classmethod
@@ -603,6 +610,10 @@ class PriceHistoryRequest(BaseModel):
 class PriceHistoryPoint(BaseModel):
     date: date
     value: float = Field(gt=0)
+    high: float | None = Field(default=None, gt=0)
+    low: float | None = Field(default=None, gt=0)
+    volume: float | None = Field(default=None, ge=0)
+    volume_unit: str | None = None
 
 
 class PriceHistoryResponse(BaseModel):
@@ -818,6 +829,8 @@ class AdvicePackage(BaseModel):
     stock_recommendation: StockRecommendationResult | None = None
     # 回答中数字与所引事实的对账结果（数值级幻觉检测）；为空表示本次未核验。
     numeric_grounding: dict[str, Any] | None = None
+    rag: dict[str, Any] = Field(default_factory=dict)
+    context_compression: dict[str, Any] = Field(default_factory=dict)
 
 
 class SnapshotOptions(BaseModel):

@@ -60,7 +60,7 @@ FIELD_LABELS.update({
     "cpi": "居民消费价格指数", "ppi": "工业生产者价格指数", "pmi": "采购经理指数",
     "social_financing": "社会融资", "interest_rate": "利率", "event_score": "事件影响评分", "governance_score": "公司治理评分",
 })
-NAVIGATION = ["主页", "风险评估", "投资问答", "自选研究", "持仓分析"]
+NAVIGATION = ["主页", "风险评估", "投资规划", "投资问答", "自选研究", "持仓分析"]
 # 投资问答由后端自动判断并获取所需资料；以下类型映射仅供保留的资料管理工具使用。
 DATA_KINDS = {"实时行情": "quote", "财务指标": "financial", "财经新闻": "news", "公告": "announcement",
               "研报": "research_report", "基金 / ETF": "fund", "行业排名": "industry", "可转债": "convertible"}

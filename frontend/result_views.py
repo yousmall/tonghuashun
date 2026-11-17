@@ -124,6 +124,31 @@ def render_automatic_answer(advice: dict[str, Any]) -> None:
 
 
 def render_advice(advice: dict[str, Any], *, export_key: str = "answer", question: str = "", compact: bool = False) -> None:
+    """Conversation bubbles contain only the reviewed conclusion and material risks."""
+    compliance = advice.get("compliance") or {}
+    st.markdown("**分析结论**")
+    st.write(plain_language(advice.get("conclusion")) or "现有资料不足，暂时无法作出判断。")
+    st.markdown("**风险结论**")
+    risks = [visible_risk_conclusion(advice), *visible_risks(advice),
+             *compliance.get("required_disclosures", []), compliance.get("risk_notice")]
+    if compliance.get("status") == "BLOCK":
+        risks.insert(0, "本次风险检查未通过，暂不形成可执行的投资建议。")
+    elif compliance.get("status") != "PASS":
+        risks.insert(0, "这份分析仍需核实，请勿直接据此买卖。")
+    if (advice.get("data_acquisition") or {}).get("mode") == "demo" or any(
+            fact.get("source_id") == "DEMO_SNAPSHOT" for fact in advice.get("facts") or []):
+        risks.append("本结果含示例数据，仅用于演示。")
+    reason = visible_compliance_reason(advice)
+    if compliance.get("status") != "PASS" and reason:
+        risks.append(reason)
+    risks = list(dict.fromkeys(plain_language(value) for value in risks if value))
+    if not risks:
+        risks = ["投资存在价格波动和亏损风险；本次分析不保证收益。"]
+    for value in risks:
+        st.write(value)
+
+
+def render_advice_details(advice: dict[str, Any], *, export_key: str = "answer", question: str = "", compact: bool = False) -> None:
     """最近回答优先展示结论与图表；历史回答折叠细节，重要风险始终可见。"""
     advice = {**advice, "facts": list(advice.get("facts") or [])}
     compliance = advice.get("compliance") or {}

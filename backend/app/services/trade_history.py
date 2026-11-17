@@ -460,7 +460,7 @@ def analyze_trade_history(request: TradeHistoryUpload, *, today: date | None = N
         limitations.append("文件未提供证券类型，按用户上传的股票记录统计；请确认没有混入基金、债券或其他品种。")
     if excluded:
         limitations.append(f"共排除 {sum(excluded.values())} 行，具体原因可在数据核验中查看。")
-    from backend.app.services.investor_workbench import ReviewRequest, review_trades
+    from backend.app.services.investment_support import ReviewRequest, review_trades
     # 仅汇总保存；不把逐笔复盘明细追加进账号画像。
     review = review_trades(ReviewRequest(trades=[{k:t[k] for k in ("date","code","side","quantity","price","fee","industry")} for t in trades]))
     review.pop("closed", None)

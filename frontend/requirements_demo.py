@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import streamlit as st
 from frontend.result_views import render_advice
+from frontend.conversation_logic import render_single_answer_chain
 
 st.set_page_config(page_title="问策智投 · 功能验收", layout="wide")
 st.title("问策智投 · 功能验收演示")
@@ -33,6 +34,7 @@ st.write("历史隔离验证：" + ("通过" if load["history_isolation_passed"]
 name = st.selectbox("选择功能场景", [sample["name"] for sample in report["samples"]])
 sample = next(sample for sample in report["samples"] if sample["name"] == name)
 render_advice(sample["advice"], export_key="acceptance", question="合成测试问题：" + name)
+render_single_answer_chain(sample["advice"], question="合成测试问题：" + name, key="acceptance_" + name)
 with st.expander("验收边界与可分享报告"):
     for limitation in report["limitations"]:
         st.write(limitation)

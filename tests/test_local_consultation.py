@@ -221,4 +221,5 @@ with patch.object(result_views, 'render_answer_charts', forbidden):
     app.run(timeout=15)
     assert not app.exception
     assert perf_counter() - start < 3
-    assert any('精简咨询已完成' in item.value for item in app.caption)
+    assert [item.value for item in app.markdown if item.value.startswith('**')] == ['**分析结论**', '**风险结论**']
+    assert not app.caption and not app.expander

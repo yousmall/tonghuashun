@@ -62,7 +62,7 @@ def test_current_history_and_automatic_answers_expose_the_same_validation_panel(
     data["research_mode"] = mode
     if mode == "auto":
         data["response_scope"] = "clarification"
-    script = ("import json\nfrom frontend.result_views import render_advice\n"
+    script = ("import json\nfrom frontend.result_views import render_advice_details as render_advice\n"
               f"render_advice(json.loads({json.dumps(data, ensure_ascii=False)!r}), export_key='case', compact={compact})")
     app = AppTest.from_string(script).run(timeout=15)
     assert not app.exception

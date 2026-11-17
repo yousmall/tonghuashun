@@ -43,6 +43,24 @@ class ThreeDayRise(BaseModel):
     end_date: date | None = None
 
 
+class IndicatorPoint(BaseModel):
+    date: date
+    values: dict[str, float | None] = Field(default_factory=dict)
+
+
+class TechnicalIndicator(BaseModel):
+    name: str
+    category: str
+    parameters: str
+    method: str
+    available: bool = False
+    latest_date: date | None = None
+    latest: dict[str, float] = Field(default_factory=dict)
+    series: list[IndicatorPoint] = Field(default_factory=list)
+    unit: str | None = None
+    message: str | None = None
+
+
 class TrendAnalysis(BaseModel):
     """多信号中和后的走势判断；信号冲突时明确降级为震荡。"""
 
@@ -67,3 +85,4 @@ class TrendAnalysis(BaseModel):
     confidence: float = Field(default=0.0, ge=0, le=1)
     signals: list[TrendSignal] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+    indicators: dict[str, TechnicalIndicator] = Field(default_factory=dict)

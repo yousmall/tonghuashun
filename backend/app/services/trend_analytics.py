@@ -194,9 +194,12 @@ def analyze_trend(
 ) -> TrendAnalysis:
     """计算均线、三日升幅与中和判断；数据不足时返回显式不可用。"""
 
+    points = list(points)
     series = close_series(points)
     benchmark_series = close_series(benchmark) if benchmark is not None else None
-    analysis = TrendAnalysis(window=len(series), benchmark_name=benchmark_name)
+    from backend.app.services.technical_indicators import calculate_indicators
+    analysis = TrendAnalysis(window=len(series), benchmark_name=benchmark_name,
+                             indicators=calculate_indicators(points))
     if series.conflicts:
         analysis.notes.append(f"有 {series.conflicts} 个交易日的数值自相矛盾，已整条剔除。")
     if len(series) == 0:

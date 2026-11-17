@@ -29,7 +29,7 @@ from backend.app.services.scoring_dimensions import QUALITATIVE_RUBRICS
 from backend.app.services.recommendation_recovery import derive_explicit_state, derive_history_metrics, history_window
 from backend.app.services.disclosure_reader import allowed_disclosure_url, read_disclosure
 from backend.app.services.disclosure_evidence import derive_disclosure_assessments
-from backend.app.services.investor_workbench import Preferences, fit_candidate
+from backend.app.services.investment_support import Preferences, fit_candidate
 
 DOCUMENT_FIELDS = {*NEWS_FIELDS, "event"}
 CRITERIA = {"policy": ("policy",), "event": ("event",),

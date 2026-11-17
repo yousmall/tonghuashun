@@ -147,7 +147,7 @@ def render_logic_chain_entry(advice: dict[str, Any] | None = None, *,
         render_logic_chain_guide()
         if not advice:
             st.info("完成风险测评并发起一次咨询后，这里会直接展开本次回答的四层逻辑链；"
-                    "页面顶部的同一面板在任何页面都能查看。", icon=":material/lightbulb:")
+                    "同一对话的后续咨询共用一个逻辑链。", icon=":material/lightbulb:")
             return
         st.markdown("**本次回答的逻辑链**")
         render_logic_drilldown(advice, key=f"{key}_drill")
@@ -161,11 +161,9 @@ def render_logic_drilldown(advice: dict[str, Any], *, key: str = "logic") -> Non
         return
     if not has_traceable_evidence(advice):
         st.info("这条回答没有通过核验的数据引用，暂时无法逐级下钻；"
-                "请补充标的资料后重新分析，或查看页面上的演示逻辑链。",
+                "请补充标的资料后重新分析；本轮的其他过程记录仍可在完整分析中查看。",
                 icon=":material/lightbulb:")
         return
-    st.caption("逐级展开：① 结论 → ② 分项观点 → ③ 数据点 → ④ 原始来源。"
-               "仅显示通过核验并被最终结论引用的资料。")
     verified, all_facts = _fact_maps(advice)
     findings = (advice.get("research_report") or {}).get("key_findings") or []
     with st.expander("① 综合结论与关键信息", icon=":material/lightbulb:", key=f"{key}_conclusion"):

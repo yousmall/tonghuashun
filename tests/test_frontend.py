@@ -80,7 +80,7 @@ def test_navigation_and_profile_call_to_action():
     assert app.title[0].value == '风险评估'
     assert app.session_state['navigation'] == '风险评估'
     assert '用户标识' not in [field.label for field in app.text_input]
-    assert [field.key for field in app.text_area] == ['automatic_plan_narrative']
+    assert not app.text_area
     assert not app.number_input
     assert len(app.radio) == 1 and app.radio[0].value is None
     assert next(button for button in app.button if button.label == '下一题').disabled
@@ -146,10 +146,9 @@ ui.page_questions('http://localhost')
     assert not app.exception
     assert sum(item.value == '价格仍可能下跌。' for item in app.markdown) == 1
     assert not app.metric
-    assert len(app.warning) == 1
-    assert "仍需核实" in app.warning[0].value
-    assert "未能取得最新市场数据" not in app.warning[0].value
-    assert any(item.label == '核验记录' for item in app.expander)
+    assert not app.warning
+    assert any("仍需核实" in item.value for item in app.markdown)
+    assert not any(item.label == '核验记录' for item in app.expander)
     assert any('风险丁' in item.value for item in app.markdown)
     assert not any('其余需要注意' in item.label for item in app.expander)
 
@@ -251,10 +250,10 @@ with patch.object(ui, 'api_request', side_effect=fake_api):
     assert not app.exception
     assert app.session_state['history_fetches'] == []
     assert not app.get('vega_lite_chart')
-    next(button for button in app.button if button.label == '加载 / 刷新近 30 期走势').click().run(timeout=15)
+    next(button for button in app.button if button.label == '加载 / 刷新近 60 期走势').click().run(timeout=15)
     assert not app.exception
     assert app.session_state['history_fetches'] == [
-        {'target': '600519', 'asset_type': '股票', 'limit': 30}
+        {'target': '600519', 'asset_type': '股票', 'limit': 60}
     ]
     assert len(app.get('vega_lite_chart')) == 1
 
@@ -271,7 +270,7 @@ with patch.object(ui, 'api_request', side_effect=fake_api):
     ui.page_watchlist('http://localhost')
 """
     app = AppTest.from_string(script).run(timeout=15)
-    next(button for button in app.button if button.label == '加载 / 刷新近 30 期走势').click().run(timeout=15)
+    next(button for button in app.button if button.label == '加载 / 刷新近 60 期走势').click().run(timeout=15)
     assert not app.exception
     assert not app.get('vega_lite_chart')
     assert any('无法绘制走势' in item.value for item in app.info)
@@ -400,7 +399,8 @@ with patch.object(ui, 'api_request', side_effect=fake_api), patch.object(ui, 're
     assert app.session_state['navigation'] == '投资问答'
     assert app.session_state['conversation_id'] == 'saved'
     assert app.session_state['conversation'][1]['payload']['compliance']['status'] == 'REVIEW'
-    assert len(app.warning) == 1
+    assert any("仍需核实" in item.value for item in app.markdown)
+    assert not app.warning
 
 
 def test_market_query_passes_fund_filter_and_keeps_news():
@@ -520,6 +520,12 @@ with patch.object(ui, 'analysis_executor', return_value=FakeExecutor()), patch.o
         from backend.app.research_routing import PROFILE_STOCK_RECOMMENDATION_QUERY
         ui.submit_chat_analysis('http://localhost', '个股研究', PROFILE_STOCK_RECOMMENDATION_QUERY, recommend_stocks=True)
     ui.finish_chat_analyses()
+    if st.session_state.get('show_chain_details'):
+        from frontend.conversation_logic import chain_key, conversation_rounds
+        key = chain_key(st.session_state.conversation_id)
+        rounds = conversation_rounds(st.session_state.conversation)
+        st.session_state[key] = True
+        st.session_state[f"{key}_{rounds[-1]['id']}_details"] = True
     ui.page_questions('http://localhost')
     ui._background_analysis_status()
 """
@@ -566,6 +572,10 @@ with patch.object(ui, 'analysis_executor', return_value=FakeExecutor()), patch.o
         return
     answer = app.session_state["conversation"][-1]["payload"]
     assert answer["facts"][0]["fact_id"] == "candidate-only"
+    assert not app.dataframe  # Tables belong to the chain, not the conversation bubble.
+    app.session_state['show_chain_details'] = True
+    app.run(timeout=15)
+    assert not app.exception
     if outcome != "approved":
         assert any("暂无通过核验" in notice.value for notice in app.info)
     if outcome != "empty":
@@ -1005,7 +1015,7 @@ ui.page_questions('http://localhost')
     assert not any(field.label == '在资料里查找' for field in home.text_input)
     assert not any(tab.label in {'查询资料', '补充资料'} for tab in home.tabs)
     assert '查找资料' not in NAVIGATION
-    assert NAVIGATION[:3] == ['主页', '风险评估', '投资问答']
+    assert NAVIGATION[:4] == ['主页', '风险评估', '投资规划', '投资问答']
     assert '风险调整' not in NAVIGATION and '投资偏好' not in NAVIGATION
 
 
@@ -1115,7 +1125,7 @@ with patch.object(ui, 'api_request', side_effect=fake_api):
     app = AppTest.from_string(script).run(timeout=15)
     assert not app.exception
     assert len(app.radio) == 1 and app.radio[0].value is None
-    assert [field.key for field in app.text_area] == ['automatic_plan_narrative']
+    assert not app.text_area
     assert not app.number_input and not app.slider
     assert next(b for b in app.button if b.label == '上一题').disabled
     assert next(b for b in app.button if b.label == '下一题').disabled

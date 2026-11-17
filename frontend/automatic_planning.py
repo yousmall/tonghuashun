@@ -1,4 +1,4 @@
-"""自动规划的原文输入、三项结果与可核对的时间安排。"""
+"""自动规划的原文输入与三项核心结果。"""
 from __future__ import annotations
 
 import json
@@ -38,8 +38,6 @@ def render_planning_result(result: dict) -> None:
                 st.caption(f"明确期限：{horizon['exact_months']}个月")
             else:
                 st.caption("保留期限区间；明确用款时间后可生成具体日期。")
-    for message in result.get("warnings", []):
-        st.warning(message)
     for message in result.get("missing_information", []):
         st.info(message)
     scenario = returns.get("scenario")
@@ -48,15 +46,6 @@ def render_planning_result(result: dict) -> None:
                  f"{scenario['months']}个月后为 {scenario['ending_amount']:,.2f} 元，"
                  f"差额 {scenario['profit']:,.2f} 元。")
         st.caption(scenario["basis"])
-    st.table([{"时间节点":item["when"], "日期":item.get("date") or "依实际用款日安排", "安排":item["action"]}
-              for item in horizon["milestones"]])
-    with st.expander("查看自动识别依据"):
-        evidence = result.get("evidence", [])
-        if evidence:
-            st.table([{"来源":item["source"], "原文":item["text"]} for item in evidence])
-        else:
-            st.caption("尚无可识别的明确资料。")
-        st.caption(f"生成日期：{result['generated_on']}。原文识别仅保留本次预览；确认并保存问卷后，问卷规划随账号恢复。")
 
 
 def render_automatic_planning(api_base: str, *, api_request: Callable) -> None:

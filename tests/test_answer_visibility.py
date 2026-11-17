@@ -39,8 +39,9 @@ def test_latest_and_history_hide_diagnostics_by_default_but_keep_review_and_real
     assert "补齐各专业智能体" not in body
     assert "集中度风险较高" in body and "提价对业绩影响尚不明确" in body
     assert "观点存在分歧" in body
-    assert app.warning and "仍需核实" in app.warning[0].value
-    assert any(item.label == "核验记录" for item in app.expander)
+    assert "仍需核实" in body
+    assert [item.value for item in app.markdown if item.value.startswith("**")] == ["**分析结论**", "**风险结论**"]
+    assert not app.expander and not app.dataframe and not app.caption
 
 
 def test_projection_preserves_original_audit_and_pdf_keeps_details_in_appendix():

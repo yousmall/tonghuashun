@@ -15,9 +15,11 @@ from sqlalchemy import Float, case, cast, DateTime, ForeignKey, Index, Integer, 
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 from sqlalchemy.pool import StaticPool
+from sqlalchemy.dialects.mysql import MEDIUMTEXT
 
 from backend.app.auth import hash_password
 from backend.app.watchlist_policy import WATCHLIST_CAPACITY
+from backend.app.user_appearance import default_display_name
 
 
 class DatabaseUnavailable(RuntimeError):
@@ -52,6 +54,14 @@ class UserRow(Base):
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     conversations: Mapped[list["ConversationRow"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+
+
+class UserAppearanceRow(Base):
+    """展示资料独立存储，新旧账号均无需修改 users 表结构。"""
+    __tablename__ = "user_appearances"
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    display_name: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    avatar_data: Mapped[str | None] = mapped_column(Text().with_variant(MEDIUMTEXT(), "mysql"), nullable=True)
 
 
 class AdminRoleRow(Base):
@@ -338,6 +348,24 @@ class Database:
                     raise ValueError("微信绑定账号不存在")
                 return self._user_with_role(session, row)
 
+    def update_user_appearance(self, user_id: int, changes: dict[str, Any]) -> dict[str, Any]:
+        """按服务端认证的用户标识更新；省略字段保留原值，空值恢复默认。"""
+        self.require_ready()
+        assert self.session_factory is not None
+        with self.session_factory.begin() as session:
+            user = session.get(UserRow, user_id)
+            if user is None:
+                raise ValueError("登录账号不存在")
+            appearance = session.get(UserAppearanceRow, user_id)
+            if appearance is None:
+                appearance = UserAppearanceRow(user_id=user_id)
+                session.add(appearance)
+            for field in ("display_name", "avatar_data"):
+                if field in changes:
+                    setattr(appearance, field, changes[field])
+            session.flush()
+            return self._user_with_role(session, user)
+
     def save_profile(
         self, user_id: int, payload: dict[str, Any], version: int,
         expected_version: int | None = None,
@@ -603,6 +631,40 @@ class Database:
                 ],
             }
 
+    def get_conversation_context(self, user_id: int, conversation_id: str,
+                                 direction: str | None = None, limit: int = 200) -> dict[str, Any] | None:
+        """Read bounded text only, scoped to the owner and original research direction."""
+        self.require_ready()
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 200:
+            raise ValueError("context history limit must be within 1..200")
+        assert self.session_factory is not None
+        with self.session_factory() as session:
+            owned = session.scalar(select(ConversationRow.id).where(
+                ConversationRow.id == conversation_id, ConversationRow.user_id == user_id))
+            if not owned:
+                return None
+            if direction:
+                first = session.execute(select(
+                    func.substr(MessageRow.content, 1, 80),
+                    MessageRow.payload["research_direction"].as_string(),
+                ).where(MessageRow.conversation_id == conversation_id, MessageRow.user_id == user_id,
+                        MessageRow.role == "user").order_by(MessageRow.id).limit(1)).first()
+                recorded = first[1] if first else None
+                if not recorded and first:
+                    recorded = next((label for label in ("市场解读", "行业分析", "个股研究", "基金筛选", "可转债分析")
+                                     if first[0].startswith(label + "：")), None)
+                if recorded != direction:
+                    return {"messages": [], "scope_mismatch": True, "has_more": False}
+            rows = session.execute(select(
+                MessageRow.role, func.substr(MessageRow.content, 1, 20001), MessageRow.created_at,
+            ).where(MessageRow.conversation_id == conversation_id, MessageRow.user_id == user_id)
+              .order_by(MessageRow.id.desc()).limit(limit + 1)).all()
+            # A one-character sentinel avoids MySQL LENGTH's byte count for Chinese text.
+            return {"messages": [{"role": role, "content": content[:20000], "created_at": self._utc(created)}
+                                 for role, content, created in reversed(rows[:limit])],
+                    "has_more": len(rows) > limit,
+                    "content_truncated": any(len(content) > 20000 for _, content, _ in rows[:limit])}
+
     def rename_conversation(self, user_id: int, conversation_id: str, title: str) -> bool:
         self.require_ready()
         assert self.session_factory is not None
@@ -741,7 +803,12 @@ class Database:
 
     @classmethod
     def _user_with_role(cls, session: Session, row: UserRow, include_password: bool = False) -> dict[str, Any]:
-        return {**cls._user_dict(row, include_password), "role": "admin" if session.get(AdminRoleRow, row.id) else "user"}
+        result = {**cls._user_dict(row, include_password), "role": "admin" if session.get(AdminRoleRow, row.id) else "user"}
+        appearance = session.get(UserAppearanceRow, row.id)
+        if appearance is not None:
+            result["display_name"] = appearance.display_name or result["display_name"]
+            result["avatar_data"] = appearance.avatar_data
+        return result
 
     @staticmethod
     def _utc(value: datetime) -> datetime:
@@ -749,7 +816,8 @@ class Database:
 
     @classmethod
     def _user_dict(cls, row: UserRow, include_password: bool = False) -> dict[str, Any]:
-        result = {"id": row.id, "username": row.username, "created_at": cls._utc(row.created_at)}
+        result = {"id": row.id, "username": row.username, "created_at": cls._utc(row.created_at),
+                  "display_name": default_display_name(row.id, row.username), "avatar_data": None}
         if include_password:
             result["password_hash"] = row.password_hash
         return result

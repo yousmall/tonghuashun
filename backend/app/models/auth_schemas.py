@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
+from backend.app.user_appearance import normalize_avatar
 
 
 class Credentials(BaseModel):
@@ -25,6 +26,29 @@ class UserSummary(BaseModel):
     username: str
     created_at: datetime
     role: Literal["user", "admin"] = "user"
+    display_name: str = ""
+    avatar_data: str | None = None
+
+
+class UserAppearanceUpdate(BaseModel):
+    """只修改当前账号的展示资料，不修改登录账号或权限。"""
+
+    model_config = {"extra": "forbid"}
+
+    display_name: str | None = Field(default=None, max_length=40)
+    avatar_data: str | None = Field(default=None, max_length=2_800_000)
+
+    @field_validator("display_name")
+    @classmethod
+    def clean_display_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return " ".join(value.split()) or None
+
+    @field_validator("avatar_data")
+    @classmethod
+    def validate_avatar(cls, value: str | None) -> str | None:
+        return normalize_avatar(value) if value else None
 
 
 class AuthResponse(BaseModel):

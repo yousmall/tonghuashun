@@ -180,14 +180,21 @@ def test_market_page_renders_the_index_board_with_a_fake_api():
         "    return section\n"
         "def fake_api(base, method, path, payload=None, **kwargs):\n"
         "    return board_data if path == '/market/index-board' else []\n"
-        "with patch.object(board, 'board_prefetch_executor', return_value=ImmediateExecutor()):\n"
+        "def fake_factory(client, token):\n"
+        "    return lambda base, path, payload: lambda refresh: fake_api(base, 'POST', path, payload)\n"
+        "with (\n"
+        "    patch.object(board, 'board_prefetch_executor', return_value=ImmediateExecutor()),\n"
+        "    patch('frontend.snapshots.board_prefetch_executor', return_value=ImmediateExecutor()),\n"
+        "    patch('frontend.api_client.snapshot_fetch_factory', side_effect=fake_factory),\n"
+        "):\n"
         "    board.render_research_board('http://test-only', '市场解读', fake_fetch, api_request=fake_api)\n"
     )
     app = run(script)
     labels = [metric.label for metric in app.metric]
     assert "上证指数" in labels
     assert len(app.get("vega_lite_chart")) >= 2
-    assert any("归一" in caption.value for caption in app.caption)
+    assert not any("归一化只用于" in caption.value or "参与计算" in caption.value
+                   or "走势判断由" in caption.value for caption in app.caption)
 
 
 INDUSTRY_SECTIONS = {
@@ -238,7 +245,7 @@ def test_industry_page_loads_the_industry_trend_on_demand():
     assert app.session_state["calls"] == []
     next(button for button in app.button if button.label == "加载 / 刷新行业走势").click().run(timeout=20)
     assert not app.exception
-    assert app.session_state["calls"] == [{"target": "半导体", "asset_type": "行业", "limit": 30}]
+    assert app.session_state["calls"] == [{"target": "半导体", "asset_type": "行业", "limit": 60}]
     assert "五日均线 MA5" in [metric.label for metric in app.metric]
 
 

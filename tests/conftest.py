@@ -45,6 +45,7 @@ def semantic():
 
 @pytest.fixture(autouse=True)
 def offline_application(monkeypatch, semantic):
+    monkeypatch.setattr(main, "rag_service", None)
     monkeypatch.setattr(main, "coordinator", CoordinatorAgent(
         make_rule_agents(), verify_facts, basic_compliance_check, semantic=semantic))
     monkeypatch.setattr(main, "research_pipeline", AutomatedResearchPipeline(None))

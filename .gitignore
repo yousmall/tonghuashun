@@ -39,3 +39,6 @@ examples/last_run_report.json
 
 # Local acceptance and publication scratch workspace
 .tmp_test/
+
+# Private RAG corpus, vectors and downloaded models
+data/rag/

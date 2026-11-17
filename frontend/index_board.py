@@ -4,9 +4,8 @@ from __future__ import annotations
 from time import monotonic
 from typing import Any
 
-import altair as alt
-import pandas as pd
 import streamlit as st
+from frontend.snapshots import poll_snapshot
 from frontend.charts import render_chart
 
 from frontend.trend_view import render_trend_panel
@@ -14,9 +13,14 @@ from frontend.trend_view import render_trend_panel
 CACHE_TTL = 60
 
 
-def load_index_board(api_base: str, api_request, *, refresh: bool = False) -> dict[str, Any]:
-    """会话内缓存 60 秒；刷新按钮显式跳过缓存。"""
+def load_index_board(api_base: str, api_request, *, refresh: bool = False, factory=None) -> dict[str, Any]:
+    """页面后台刷新，复用进行中的任务；保留同步调用供独立工具使用。"""
 
+    if factory is not None:
+        return poll_snapshot(
+            "index_board", (api_base, st.session_state.get("auth_token")),
+            factory(api_base, "/market/index-board", {}), refresh=refresh,
+        )
     cache = st.session_state.setdefault("index_board_cache", {})
     entry = cache.get(api_base)
     if entry and not refresh and monotonic() - entry["loaded_at"] < CACHE_TTL:
@@ -29,8 +33,9 @@ def load_index_board(api_base: str, api_request, *, refresh: bool = False) -> di
     return result
 
 
-def _normalized_frame(items: list[dict[str, Any]]) -> pd.DataFrame:
+def _normalized_frame(items: list[dict[str, Any]]):
     """以各自首个点为 100 归一化，避免不同点位量级无法同图比较。"""
+    import pandas as pd
 
     rows: list[dict[str, Any]] = []
     for item in items:
@@ -47,15 +52,26 @@ def _normalized_frame(items: list[dict[str, Any]]) -> pd.DataFrame:
     return frame
 
 
-def render_index_board(api_base: str, api_request, *, key: str = "market") -> None:
+def render_index_board(api_base: str, api_request, *, key: str = "market", factory=None) -> None:
+    # 独立刷新指数区，慢行情请求和指数选择不阻塞或重画整张研究页。
+    st.fragment(run_every=5 if factory is not None else None)(_render_index_board)(
+        api_base, api_request, key=key, factory=factory,
+    )
+
+
+def _render_index_board(api_base: str, api_request, *, key: str, factory=None) -> None:
     with st.container(horizontal=True, vertical_alignment="center"):
         st.markdown("**主要指数 · 五日均线、连续三日升幅与中和判断**")
         st.space("stretch")
         refresh = st.button("刷新指数", key=f"index_board_refresh_{key}", icon=":material/refresh:")
-    result = load_index_board(api_base, api_request, refresh=refresh)
+    result = load_index_board(api_base, api_request, refresh=refresh, factory=factory)
+    if result.get("status") == "loading" or result.get("refreshing"):
+        st.caption("指数行情正在后台更新，可继续提问；已显示数据为更新前快照。"
+                   if result.get("items") else "指数行情正在后台加载，可继续提问。")
     items = result.get("items") or []
     if not items:
-        st.caption((result.get("notes") or ["指数看板暂不可用。"])[0])
+        if result.get("status") != "loading":
+            st.caption((result.get("notes") or ["指数看板暂不可用。"])[0])
         return
     for start in range(0, len(items), 3):
         columns = st.columns(3)
@@ -77,6 +93,8 @@ def render_index_board(api_base: str, api_request, *, key: str = "market") -> No
                 st.caption(" · ".join(caption) if caption else (item.get("message") or "历史点位暂未取得"))
     frame = _normalized_frame(items)
     if not frame.empty:
+        import altair as alt
+
         with st.container(border=True):
             st.markdown("**指数走势对比（起点归一为 100）**")
             chart = alt.Chart(frame).mark_line(strokeWidth=2).encode(
@@ -87,7 +105,6 @@ def render_index_board(api_base: str, api_request, *, key: str = "market") -> No
                          alt.Tooltip("归一化:Q", format=".2f")],
             ).properties(height=280)
             render_chart(chart.configure_view(stroke=None), width="stretch", key=f"index_compare_{key}")
-            st.caption("归一化只用于同图比较相对强弱，不代表收益率；各指数点位量级不同。")
     options = [item for item in items if (item.get("analysis") or {}).get("available")]
     if options:
         names = {item["name"]: item for item in options}
@@ -102,7 +119,5 @@ def render_index_board(api_base: str, api_request, *, key: str = "market") -> No
                 "metric_label": "收盘点位",
                 "analysis": item.get("analysis") or {},
             }
-            render_trend_panel(pseudo, key=f"index_{key}_{item.get('code')}", unit_label=" 点")
-    for note in result.get("notes") or []:
-        st.caption(note)
-    st.caption("指数走势来自问财历史点位；判断只描述已发生的价格序列，不构成投资建议。")
+            render_trend_panel(pseudo, key=f"index_{key}_{item.get('code')}", unit_label=" 点",
+                               show_annotations=False)

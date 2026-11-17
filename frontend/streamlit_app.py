@@ -33,7 +33,10 @@ import httpx
 import streamlit as st
 from frontend.charts import render_bar, render_chart
 from frontend.risk_assessment import render_risk_assessment
+from frontend.user_settings import avatar_uri, display_name, render_user_settings
 from backend.app.risk_questionnaire import assessment_is_current
+from backend.app.services.context_compression import client_context_messages
+from frontend.conversation_logic import render_conversation_logic_chain, render_single_answer_chain
 from frontend.result_views import render_advice, cached_answer_images, answer_export_payload, show_status
 from frontend.api_client import (backend_http_client, request_json, overview_fetch, snapshot_fetch_factory,
                                  AnalysisProgress, request_analysis)
@@ -54,7 +57,6 @@ from frontend.logic_drilldown import (
     has_traceable_evidence, render_logic_chain_entry, render_logic_chain_guide,
     render_logic_drilldown,
 )
-from frontend.logic_demo import DEMO_ADVICE, DEMO_NOTICE, demo_trace_markdown
 
 DEFAULT_API_BASE = os.getenv("WENCE_API_BASE", "http://127.0.0.1:8000/api/v1")
 BRAND_LOGO = Path(__file__).resolve().parent / "assets" / "brand-logo.png"
@@ -158,6 +160,9 @@ def page_navigation() -> str:
     if current in {"投资偏好", "风险调整"}:  # 兼容旧浏览器会话
         current = "风险评估"
         st.session_state.navigation = current
+    if current == "投资工作台":
+        current = "主页"
+        st.session_state.navigation = current
     with st.container(key="nav"):
         st.button("主页", key="nav_home", width="stretch",
                   type="primary" if current == "主页" else "tertiary",
@@ -165,27 +170,49 @@ def page_navigation() -> str:
         st.button("风险评估", key="nav_assessment", width="stretch",
                   type="primary" if current == "风险评估" else "tertiary",
                   on_click=go_to, args=("风险评估",))
+        st.button("投资规划", key="nav_planning", width="stretch",
+                  type="primary" if current == "投资规划" else "tertiary",
+                  on_click=go_to, args=("投资规划",))
         for page, key in (("投资问答", "nav_questions"), ("自选研究", "nav_watchlist"),
-                          ("持仓分析", "nav_portfolio"), ("投资工作台", "nav_workbench")):
+                          ("持仓分析", "nav_portfolio")):
             st.button(page, key=key, width="stretch",
                       type="primary" if current == page else "tertiary",
                       on_click=go_to, args=(page,))
     return str(st.session_state.get("navigation", current))
 
 
-def render_side_user(api_base: str) -> None:
-    """侧栏账号卡：只展示账号名与偏好状态，不暴露任何后端标识。"""
+def render_user_card() -> None:
+    """账号菜单中的头像、昵称、登录账号与偏好状态。"""
 
     user = st.session_state.auth_user or {}
     account_name = str(user.get("username", ""))
-    username = "微信用户" if re.fullmatch(r"wx_[0-9a-f]{40}", account_name) else escape(account_name)
+    username = "微信账号" if re.fullmatch(r"wx_[0-9a-f]{40}", account_name) else escape(account_name)
     ready = profile_ready()
     state = "风险评估已确认" if ready else "待完成风险评估"
     dot = "dot" if ready else "dot pending"
     st.html(
-        f"<div class='side-user'><div class='who'>{username}</div>"
-        f"<div class='state'><span class='{dot}'></span>{state}</div></div>"
+        f"<div class='side-user'><img class='side-avatar' src='{escape(avatar_uri(user), quote=True)}' alt='用户头像'>"
+        f"<div class='side-user-info'><div class='who'>{escape(display_name(user))}</div>"
+        f"<div class='account'>{username}</div>"
+        f"<div class='state'><span class='{dot}'></span>{state}</div></div></div>"
     )
+
+
+def render_account_dock() -> None:
+    """原生底栏最后一行靠右，和聊天输入区依次排列，不互相覆盖。"""
+    if not st.session_state.get("auth_user"):
+        return
+    # 原生底栏为账号入口留出一行，聊天输入自然排在其上方。
+    with st.bottom:
+        st.container(key="account_dock_space", height=56, border=False)
+    # 弹层放在常规主区，以便其内容正常挂载，再将入口定位到右下角。
+    with st.container(key="account_dock"):
+        menu_key = "account_settings_menu_" + st.session_state.get("navigation", "主页")
+        with st.popover("用户 · 个人设置", icon=":material/account_circle:", key=menu_key, width=230):
+            render_user_card()
+            st.button("个人设置", key="account_settings_entry", icon=":material/manage_accounts:",
+                      width="stretch", on_click=go_to, args=("个人设置",))
+
 
 
 def invalidate_recent_conversations(api_base: str | None = None) -> None:
@@ -258,7 +285,7 @@ def render_recent_chats(api_base: str) -> None:
         if not histories:
             st.caption("暂无咨询记录。")
             return
-        with st.container(height=360, border=False, key="recent-chat-list"):
+        with st.container(height=180, border=False, key="recent-chat-list"):
             for item in histories:
                 conversation_id = item.get("id")
                 if not conversation_id:
@@ -297,7 +324,6 @@ def render_sidebar(api_base: str, *, full: bool) -> str | None:
         page = page_navigation()
         background_analysis_status()
         render_recent_chats(api_base)
-        render_side_user(api_base)
         if st.button("退出登录", width="stretch", icon=":material/logout:"):
             api_request(api_base, "POST", "/auth/logout")
             reset_user_session()
@@ -410,12 +436,9 @@ def register_browser_session(api_base: str) -> None:
 
 
 def enforce_session_timeout(api_base: str) -> None:
-    """租约检查在后台进行；等待结果时才启用短轮询。"""
-    pending = bool(st.session_state.get("session_status_task")) or (
-        bool(st.session_state.get("auth_token"))
-        and monotonic() - st.session_state.get("session_status_checked_at", 0.0) >= 30
-    )
-    st.fragment(run_every=1 if pending else 30)(_check_session_timeout)(api_base, pending)
+    """固定局部轮询，实际租约请求仍每 30 秒最多提交一次。"""
+    # 不切换片段定时器，正常检查完成无需重画聊天、图表和侧栏。
+    st.fragment(run_every=2)(_check_session_timeout)(api_base, False)
 
 
 def _check_session_timeout(api_base: str, polling: bool) -> None:
@@ -442,7 +465,7 @@ def _check_session_timeout(api_base: str, polling: bool) -> None:
         unavailable = result is None or result.data is None
         changed = unavailable != st.session_state.get("service_unavailable", False)
         st.session_state.service_unavailable = unavailable
-        if changed or polling:
+        if changed:
             st.rerun()
         return
 
@@ -451,9 +474,6 @@ def _check_session_timeout(api_base: str, polling: bool) -> None:
     future = account_read_executor().submit(request_json, backend_http_client(api_base),
         api_base, "GET", "/auth/session/status", None, token)
     st.session_state.session_status_task = {"future": future, "token": token, "api_base": api_base}
-    context = get_script_run_ctx(suppress_warning=True)
-    if context and getattr(context, "fragment_ids_this_run", None):
-        st.rerun()
 
 
 def utc_now() -> str:
@@ -686,10 +706,9 @@ def run_analysis(api_base: str, query: str) -> dict[str, Any] | None:
         "research_mode": st.session_state.get("research_mode", "instant"),
         "portfolio": st.session_state.portfolio,
         "conversation_id": st.session_state.conversation_id,
-        "context_messages": [
-            {key: turn[key] for key in ("role", "content", "created_at") if key in turn}
-            for turn in [*st.session_state.conversation, user_turn][-20:]
-        ],
+        "context_compression": True,
+        "use_conversation_history": True,
+        "context_messages": client_context_messages([*st.session_state.conversation, user_turn]),
     }
     advice = stream_analysis(api_base, payload)
     if advice:
@@ -749,10 +768,9 @@ def submit_chat_analysis(api_base: str, direction: str, query: str, *, recommend
         "research_mode": "deep" if recommend_stocks else st.session_state.get("research_mode", "instant"),
         "portfolio": [dict(item) for item in st.session_state.portfolio],
         "conversation_id": conversation_id,
-        "context_messages": [] if recommend_stocks else [
-            {key: turn[key] for key in ("role", "content", "created_at") if key in turn}
-            for turn in [*st.session_state.conversation, user_turn][-20:]
-        ],
+        "context_compression": True,
+        "use_conversation_history": not recommend_stocks,
+        "context_messages": [] if recommend_stocks else client_context_messages([*st.session_state.conversation, user_turn]),
     }
     token = st.session_state.auth_token
     if collaboration is not None:
@@ -762,7 +780,7 @@ def submit_chat_analysis(api_base: str, direction: str, query: str, *, recommend
                         "research_materials": collaboration["research_materials"],
                         # The fixed industry task owns intent; other pages' dialogue
                         # stays in reference_materials, separate from this conversation.
-                        "context_messages": []})
+                        "context_messages": [], "use_conversation_history": False})
     client = backend_http_client(api_base)
     progress = AnalysisProgress()
     preview = None
@@ -889,6 +907,8 @@ def save_research_session() -> None:
 
 def activate_research(direction: str) -> None:
     """切换完整研究上下文，避免问题、证据和结果跨方向混用。"""
+    if direction == "多智能体协同":
+        direction = "行业分析"
     if direction == st.session_state.get("active_research_direction", QUICK_ASKS[0]):
         return
     save_research_session()
@@ -929,14 +949,17 @@ def page_questions(api_base: str) -> None:
 
 
 def render_quick_ask(api_base: str) -> None:
-    """五个方向共用布局，各自拥有独立页面和底部输入框。"""
+    """五个研究方向与最右侧的协同入口共用顶部导航。"""
     st.session_state.setdefault("research_direction", st.session_state.get("active_research_direction", QUICK_ASKS[0]))
     direction = st.segmented_control(
-        "研究方向", QUICK_ASKS, key="research_direction", required=True,
+        "研究方向", [*QUICK_ASKS, "多智能体协同"], key="research_direction", required=True,
         on_change=select_research_direction, width="stretch", persist_state="session",
     )
     activate_research(direction or QUICK_ASKS[0])
-    render_research_page(api_base, direction or QUICK_ASKS[0])
+    if direction == "多智能体协同":
+        render_research_page(api_base, "行业分析", collaboration=True)
+    else:
+        render_research_page(api_base, direction or QUICK_ASKS[0])
 
 
 def create_board_fetch(api_base: str):
@@ -1195,20 +1218,22 @@ def render_research_guide(direction: str) -> None:
         render_review_guide()
 
 
-def render_research_page(api_base: str, direction: str) -> None:
-    render_page_header(direction)
-    st.title(direction)
-    render_research_guide(direction)
+def render_research_page(api_base: str, direction: str, *, collaboration: bool = False) -> None:
+    title = "多智能体协同" if collaboration else direction
+    render_page_header(title)
+    st.title(title)
+    if not collaboration:
+        render_research_guide(direction)
     # 空白页先展示本方向的数据；已有对话中将数据折叠，方便继续阅读回答。
-    if st.session_state.conversation:
+    if collaboration:
+        from frontend.industry_collaboration import render_industry_collaboration
+        render_industry_collaboration(api_base, ready=profile_ready(), submit=submit_chat_analysis)
+    elif st.session_state.conversation:
         with st.expander("本页领域数据", expanded=False, on_change="rerun", icon=":material/monitoring:") as section:
             if section.open:
                 render_research_board(api_base, direction, create_board_fetch(api_base), api_request=api_request)
     else:
         render_research_board(api_base, direction, create_board_fetch(api_base), api_request=api_request)
-    if direction == "行业分析":
-        from frontend.industry_collaboration import render_industry_collaboration
-        render_industry_collaboration(api_base, ready=profile_ready(), submit=submit_chat_analysis)
     # 市场解读在「相关资讯」之后补一块热门板块观察，位置在页底「研究模式」之上。
     if direction == "市场解读":
         from frontend.hot_sectors import render_hot_sectors
@@ -1217,11 +1242,15 @@ def render_research_page(api_base: str, direction: str) -> None:
     if not profile_ready():
         st.info("请先确认投资偏好，再开始分析。", icon=":material/person_edit:")
         st.button("进行风险评估", type="primary", on_click=go_to, args=("风险评估",))
-    # 逻辑链与数据溯源常驻入口：空白页也能查看机制，有回答时直接对最新回答逐级下钻。
-    latest_advice = next(
-        (turn.get("payload") for turn in reversed(st.session_state.conversation)
-         if turn.get("role") == "assistant" and isinstance(turn.get("payload"), dict)), None)
-    render_logic_chain_entry(latest_advice, key=f"logic_entry_{direction}")
+    def research_from_chain(question):
+        st.session_state.research_mode = "deep"
+        submit_chat_analysis(api_base, direction, question)
+
+    render_conversation_logic_chain(
+        st.session_state.conversation, conversation_id=st.session_state.conversation_id,
+        api_base=api_base, api_request=api_request,
+        on_research=research_from_chain if profile_ready() and direction not in st.session_state.get("analysis_jobs", {}) else None,
+    )
     if direction == "个股研究":
         if profile_ready():
             render_prepared_stock_report(api_base)
@@ -1248,28 +1277,17 @@ def render_research_page(api_base: str, direction: str) -> None:
     for turn_index, turn in enumerate(st.session_state.conversation):
         with st.chat_message(turn["role"]):
             if turn["role"] == "assistant" and turn.get("payload"):
-                if turn.get("phase") == "preview":
-                    st.caption("已有资料概要 · 详细报告正在后台分析，完成后会更新此回答。")
-                elif turn.get("phase") == "preview_failed":
-                    st.caption("已有资料概要 · 详细报告未完成，本条仍仅为精简概要。")
                 previous = st.session_state.conversation[turn_index - 1] if turn_index else {}
                 render_advice(turn["payload"], export_key=f"chat_{turn_index}", compact=turn_index != latest_answer,
                               question=previous.get("content", "") if previous.get("role") == "user" else "")
-                answer = turn["payload"]
-                if (turn_index == latest_answer and previous.get("role") == "user"
-                        and answer.get("response_scope") == "clarification"
-                        and answer.get("intent") == "security_research"
-                        and answer.get("research_mode") in {"instant", "lite"}
-                        and direction not in st.session_state.get("analysis_jobs", {})):
-                    if st.button("补查资料并分析", key=f"load_answer_{direction}_{turn_index}", type="primary"):
-                        st.session_state.research_mode = "deep"
-                        submit_chat_analysis(api_base, direction, previous["content"])
-                        st.rerun()
             else:
                 content = turn["content"]
                 if turn["role"] == "user":
                     content = content.removeprefix(RESEARCH_PREFIX[direction])
-                st.write(plain_language(content) if turn["role"] == "assistant" else content)
+                if turn["role"] == "assistant":
+                    render_advice({"conclusion": content, "compliance": {"status": "REVIEW"}})
+                else:
+                    st.write(content)
     # 必须在页面顶层调用，Streamlit 才会将唯一输入框固定在底部。
     mode = st.session_state.get("research_mode")
     if mode not in {"instant", "deep"}:
@@ -1302,77 +1320,13 @@ def render_research_page(api_base: str, direction: str) -> None:
     restore_board_scroll(direction, has_conversation=bool(st.session_state.conversation))
 
 
-def _logic_chain_advice(api_base: str) -> dict[str, Any] | None:
-    """只取「确实能逐级下钻」的回答，且找到即返回，避免每次重跑都翻历史。
-
-    资料不足、被风险检查拦截、或没有认可引用的回答渲染出来只会是四层空态，
-    跳过它们，由顶部面板改用演示数据展示完整机制。
-    """
-
-    current = [
-        turn.get("payload") for turn in reversed(st.session_state.get("conversation") or [])
-        if turn.get("role") == "assistant" and isinstance(turn.get("payload"), dict)
-    ]
-    found = next((payload for payload in current if has_traceable_evidence(payload)), None)
-    if found:
-        return found
-    for item in (recent_conversations(api_base, nonblocking=True) or [])[:2]:
-        conversation_id = item.get("id")
-        if not conversation_id:
-            continue
-        detail = api_request(api_base, "GET", f"/history/{conversation_id}", quiet=True)
-        if isinstance(detail, dict):
-            found = next(
-                (message.get("payload") for message in reversed(detail.get("messages") or [])
-                 if message.get("role") == "assistant"
-                 and isinstance(message.get("payload"), dict)
-                 and has_traceable_evidence(message.get("payload"))), None
-            )
-            if found:
-                return found
-    return None
-
-
 def render_logic_chain_banner(api_base: str, *, expanded: bool = False) -> None:
-    """主内容区顶部的常驻折叠面板：不新增任何导航栏目，任何页面都能看到。
-
-    页面刚打开时默认收起，不遮挡主内容；点开后才加载下钻内容。Streamlit 按 key
-    记住状态，用户手动展开后不会因为切换页面又缩回去。
-    """
-
-    with st.expander("投资逻辑链 · 逐级展开与数据溯源", icon=":material/account_tree:",
-                     key="global_logic_chain", expanded=expanded, on_change="rerun") as panel:
-        if not panel.open:
-            return
-        render_logic_chain_guide()
-        advice = _logic_chain_advice(api_base)
-        if advice:
-            st.markdown("**本次 / 最近咨询的逻辑链**（真实数据，逐层点开，直到原始来源）")
-            render_logic_drilldown(advice, key="banner_logic_chain")
-            if st.checkbox("再看一份完整的演示逻辑链", key="logic_chain_demo_toggle"):
-                st.caption(DEMO_NOTICE)
-                render_logic_drilldown(DEMO_ADVICE, key="banner_logic_demo")
-        else:
-            # 没有可用真实回答时，用带数值、来源与原文链接的示例说明机制，
-            # 避免面板看起来「全是说明、没有信息」。完整四层放在折叠里按需渲染，
-            # 默认视图只渲染一张轻量表格，不拖慢每次页面刷新。
-            st.info("最近一次咨询没有通过核验的数据引用（资料不足、尚未发起分析，"
-                    "或已被风险检查拦截），暂时无法逐级下钻。请先在「研究资料」里加载该标的资料，"
-                    "或在后台预生成完整报告。", icon=":material/info:")
-            st.markdown(
-                "**演示逻辑链 · 四层一览**  \n" + DEMO_NOTICE + "  \n"
-                "**① 综合结论**：" + plain_language(DEMO_ADVICE["conclusion"]) + "  \n"
-                "**② 分项观点**：市场环境、行业分析、个股研究、持仓分析 4 个维度，"
-                "各含判断、可信度、风险条件与重新判断条件。  \n"
-                "**③ 数据点**：下表 7 条已核验数据，含数值、数据时间与报告期。  \n"
-                "**④ 原始来源**：见「来源」「原文」两列；派生指标可在下方折叠里回溯上游资料与计算规则。"
-            )
-            st.markdown(demo_trace_markdown())
-            with st.expander("逐层点开完整演示逻辑链（① 结论 → ② 分项观点 → ③ 数据点 → ④ 原始来源）",
-                             key="banner_demo_drill", on_change="rerun",
-                             icon=":material/account_tree:") as demo_panel:
-                if demo_panel.open:
-                    render_logic_drilldown(DEMO_ADVICE, key="banner_logic_demo")
+    """Compatibility entry for the current conversation; no history fetch or demo fallback."""
+    render_conversation_logic_chain(
+        st.session_state.get("conversation") or [],
+        conversation_id=st.session_state.get("conversation_id", "current"), expanded=expanded,
+        api_base=api_base, api_request=api_request,
+    )
 
 
 def render_materials_panel(api_base: str) -> None:
@@ -1485,22 +1439,26 @@ def render_materials_body(api_base: str) -> None:
                     st.rerun()
 
 
-def page_workbench(api_base: str) -> None:
-    from frontend.investor_workbench import render_workbench
-    render_workbench(api_base, api_request=api_request, go_to=go_to)
-
-
 def page_profile(api_base: str) -> None:
     """保留风险问卷，支持从股票交易记录补充行为画像。"""
     from frontend.trade_profile import render_trade_profile
-    from frontend.automatic_planning import render_automatic_planning
-    from frontend.personalized_investment import render_personalized_investment
     render_page_header("风险评估")
     st.title("风险评估")
     render_risk_assessment(api_base, api_request=api_request)
+    render_trade_profile(api_base, api_request=api_request)
+
+
+def page_planning(api_base: str) -> None:
+    """自动规划、个性化建议与资产配置的统一入口。"""
+    from frontend.automatic_planning import render_automatic_planning
+    from frontend.personalized_investment import render_personalized_investment
+    render_page_header("投资规划")
+    st.title("投资规划")
+    st.caption("结合风险评估与投资目标，查看自动规划、个性化建议和资产配置。")
+    st.button("前往风险评估", key="planning_assessment", icon=":material/assignment:",
+              on_click=go_to, args=("风险评估",))
     render_automatic_planning(api_base, api_request=api_request)
     render_personalized_investment(api_base, api_request=api_request)
-    render_trade_profile(api_base, api_request=api_request)
 
 
 def available_analyses() -> list[tuple[str, dict[str, Any]]]:
@@ -1707,12 +1665,12 @@ def render_price_history_panel(api_base: str, items: list[dict[str, Any]]) -> No
         selected = options[selected_id]
         target = str(selected.get("target", "")).strip()
         asset_type = str(selected.get("asset_type", "股票"))
-        if st.button("加载 / 刷新近 30 期走势", icon=":material/show_chart:", key="load_price_history"):
+        if st.button("加载 / 刷新近 60 期走势", icon=":material/show_chart:", key="load_price_history"):
             st.session_state.price_history = None
             with st.spinner("正在从问财获取历史数据…"):
                 st.session_state.price_history = api_request(
                     api_base, "POST", "/data/price-history",
-                    {"target": target, "asset_type": asset_type, "limit": 30},
+                    {"target": target, "asset_type": asset_type, "limit": 60},
                 )
         result = st.session_state.get("price_history")
         if not isinstance(result, dict) or result.get("target") != target or result.get("asset_type") != asset_type:
@@ -1904,6 +1862,7 @@ def page_portfolio(api_base: str) -> None:
     if st.session_state.get("portfolio_advice"):
         result = st.session_state.portfolio_advice
         render_advice(result, export_key="portfolio", question="请诊断我的持仓组合")
+        render_single_answer_chain(result, question="请诊断我的持仓组合", key="portfolio")
         if result.get("allocation"):
             st.subheader("资产分配参考")
             st.dataframe(
@@ -1976,11 +1935,11 @@ def reset_user_session() -> None:
         "research_results", "market_query_result", "data_selected", "auth_notice",
         "recent_conversations", "recent_conversations_loaded_at", "history_detail_cache",
         "history_before_id", "history_offset", "history_last_search", "history_search",
-        "analysis_jobs", "analysis_notice", "industry_trend_cache", "fund_analytics_results", "preset_asked", "hot_sector_cache",
+        "analysis_jobs", "analysis_notice", "industry_trend_cache", "technical_history_cache", "fund_analytics_results", "preset_asked", "hot_sector_cache", "index_board_cache",
     ):
         st.session_state.pop(key, None)
     for key in list(st.session_state):
-        if key.startswith(("workbench_", "manual_review_", "trade_profile_", "risk_score_", "risk_answer_", "automatic_plan_", "research_chat_", "preset_question_", "industry_collaboration_", "board_target_", "board_refresh_", "board_poll_", "board_favorite_", "board_saved_", "fund_analytics_", "admin_")) or key == "profile_narrative":
+        if key.startswith(("account_settings_", "workbench_", "manual_review_", "trade_profile_", "risk_score_", "risk_answer_", "automatic_plan_", "research_chat_", "preset_question_", "industry_collaboration_", "board_target_", "board_refresh_", "board_poll_", "board_favorite_", "board_saved_", "fund_analytics_", "conversation_logic_", "admin_")) or key == "profile_narrative":
             st.session_state.pop(key, None)
     st.session_state.conversation_id = str(uuid.uuid4())
     # 账号标识只来自服务端令牌，浏览器状态里不保存用户 id。
@@ -2185,6 +2144,8 @@ def page_conversations(api_base: str) -> None:
             detail["next_before_id"] = older.get("next_before_id")
             st.session_state.history_detail_cache = detail
             st.rerun()
+    render_conversation_logic_chain(detail["messages"], conversation_id=selected_id,
+                                    api_base=api_base, api_request=api_request)
     for message_index, message in enumerate(detail["messages"]):
         with st.chat_message(message["role"]):
             if message["role"] == "assistant" and message.get("payload"):
@@ -2192,13 +2153,17 @@ def page_conversations(api_base: str) -> None:
                 render_advice(message["payload"], export_key=f"history_{message_index}",
                               question=previous.get("content", "") if previous.get("role") == "user" else "")
             else:
-                st.write(plain_language(message["content"]) if message["role"] == "assistant" else message["content"])
+                if message["role"] == "assistant":
+                    render_advice({"conclusion": message["content"], "compliance": {"status": "REVIEW"}})
+                else:
+                    st.write(message["content"])
 
 
 def _render_service_unavailable(api_base: str) -> None:
     """后端暂时不可用时的兜底界面：保留侧栏，给出重试与退出入口。"""
 
     render_sidebar(api_base, full=False)
+    render_account_dock()
     st.warning("暂时连接不上分析服务，请稍后重试。")
     st.caption("您的登录状态仍保留在本机；服务恢复后重新打开页面即可继续。")
 
@@ -2245,15 +2210,15 @@ def main() -> None:
         st.session_state.navigation = "投资问答"
         st.session_state.history_view = True
     page = render_sidebar(api_base, full=True)
-    render_logic_chain_banner(api_base)
     if page in {"主页", "自选研究", "投资问答"}:
         ensure_watchlist_loaded(api_base, nonblocking=True)
     if not st.session_state.get("profile_restored") and (api_base, "/profile") in st.session_state.get("account_prefetch_results", {}):
         st.session_state.profile_restored = _restore_profile(api_base, nonblocking=True)
-    if not st.session_state.get("profile_restored") and page == "风险评估":
+    if not st.session_state.get("profile_restored") and page in {"风险评估", "投资规划"}:
         st.info("正在恢复风险评估，请稍候。", icon=":material/sync:")
         if st.session_state.get("account_prefetch"):
             poll_account_prefetch()
+        render_account_dock()
         return
     if st.session_state.get("history_view"):
         page = "历史记录"
@@ -2261,17 +2226,20 @@ def main() -> None:
         render_page_header("自选研究")
         st.info("正在加载自选标的，请稍候。", icon=":material/sync:")
         poll_account_prefetch()
+        render_account_dock()
         return
     pages = {
-        "投资工作台": lambda: page_workbench(api_base),
         "主页": lambda: page_home(api_base),
         "投资问答": lambda: page_questions(api_base),
         "自选研究": lambda: page_watchlist(api_base),
         "持仓分析": lambda: page_portfolio(api_base),
         "历史记录": lambda: page_insights(api_base),
         "风险评估": lambda: page_profile(api_base),
+        "投资规划": lambda: page_planning(api_base),
+        "个人设置": lambda: render_user_settings(api_base, api_request=api_request),
     }
     pages.get(page, lambda: page_home(api_base))()
+    render_account_dock()
     # 注册轮询前先处理本轮页面提交，避免已完成的读取打断聊天输入。
     if st.session_state.get("account_prefetch"):
         poll_account_prefetch()

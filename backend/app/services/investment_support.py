@@ -1,4 +1,4 @@
-"""投资教学、已确认偏好/持仓、费用复盘。所有价格均为用户输入的情景值。"""
+"""选股偏好、持仓约束与交易画像复盘共用计算。"""
 from __future__ import annotations
 from collections import defaultdict, deque
 from datetime import date
@@ -185,44 +185,3 @@ def cost_scenario(amount, preferences):
     return {"amount":float(a),"round_trip_cost":float(cost.quantize(Decimal('.01'))),
         "break_even_return":float(cost/a),"notice":"按相同买卖金额、双边佣金及滑点的静态算术情景，费率为用户假设，未包含其他费用；不是上涨预测或交易所收费标准。"}
 
-class PaperOrder(Input):
-    expected_version: int=Field(ge=1)
-    side: Literal["buy","sell"]
-    code: str=Field(pattern=r"^\d{6}$")
-    quantity: int=Field(gt=0,le=1000000)
-    price: Decimal=Field(gt=0,le=1000000,decimal_places=4)
-    fee: Decimal=Field(ge=0,le=1000000,decimal_places=2)
-    date: date
-
-class JournalEntry(Input):
-    expected_version: int=Field(ge=1)
-    code: str=Field(pattern=r"^\d{6}$")
-    thesis: str=Field(min_length=1,max_length=1000)
-    invalidation: str=Field(min_length=1,max_length=1000)
-    review_date: date
-    outcome: str=Field(default="",max_length=2000)
-
-def paper_order(state, order):
-    """教学假设：初始10万元、100股整手、买入次日才能卖出，不连接券商。"""
-    from copy import deepcopy
-    from backend.app.risk_questionnaire import local_today
-    state=deepcopy(state or {"cash":"100000.00","trades":[]})
-    trades=state["trades"]
-    if len(trades)>=1000: raise ValueError("教学账户已达到1000笔记录上限")
-    if order.quantity%100: raise ValueError("本教学练习每笔数量须为100股的整数倍")
-    if order.date>local_today() or trades and order.date<date.fromisoformat(trades[-1]["date"]):
-        raise ValueError("交易日期不能倒退或晚于今天")
-    cash=Decimal(state["cash"]); amount=order.price*order.quantity
-    if order.side=="buy":
-        if amount+order.fee>cash: raise ValueError("模拟现金不足")
-        cash-=amount+order.fee
-    else:
-        available=sum(t["quantity"]*(1 if t["side"]=="buy" else -1) for t in trades if t["code"]==order.code and t["date"]<order.date.isoformat())
-        available-=sum(t["quantity"] for t in trades if t["code"]==order.code and t["side"]=="sell" and t["date"]==order.date.isoformat())
-        if order.quantity>available: raise ValueError("模拟可卖持仓不足（教学练习禁止卖出当日买入股数）")
-        if amount<order.fee: raise ValueError("费用不能超过卖出金额")
-        cash+=amount-order.fee
-    state["cash"]=str(cash.quantize(Decimal('.01')))
-    trades.append(order.model_dump(mode="json",exclude={"expected_version"}))
-    state["review"]=review_trades(ReviewRequest(trades=trades))
-    return state
