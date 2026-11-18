@@ -61,7 +61,7 @@ class UserAppearanceRow(Base):
     __tablename__ = "user_appearances"
     user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
     display_name: Mapped[str | None] = mapped_column(String(40), nullable=True)
-    avatar_data: Mapped[str | None] = mapped_column(Text().with_variant(MEDIUMTEXT(), "mysql"), nullable=True)
+    avatar_data: Mapped[str | None] = mapped_column(Text().with_variant(MEDIUMTEXT(), "mysql", "mariadb"), nullable=True)
 
 
 class AdminRoleRow(Base):
@@ -233,11 +233,22 @@ class Database:
                     if index.name in {"ix_conversations_user_updated", "ix_messages_user_conversation_id"}:
                         index.create(self.engine, checkfirst=True)
             self._ensure_watchlist_name_column()
+            self._ensure_avatar_capacity()
             if backfill:
                 self._backfill_consultations()
             self.initialization_error = None
         except SQLAlchemyError as exc:
             self.initialization_error = type(exc).__name__
+
+    def _ensure_avatar_capacity(self) -> None:
+        """将旧库的头像列扩容，允许保存重编码后的 PNG。"""
+        if self.engine is None or self.engine.dialect.name not in {"mysql", "mariadb"}:
+            return
+        with self.engine.begin() as connection:
+            columns = inspect(connection).get_columns("user_appearances")
+            avatar = next(column for column in columns if column["name"] == "avatar_data")
+            if type(avatar["type"]).__name__ in {"TINYTEXT", "TEXT"}:
+                connection.exec_driver_sql("ALTER TABLE user_appearances MODIFY COLUMN avatar_data MEDIUMTEXT NULL")
 
     def _ensure_watchlist_name_column(self) -> None:
         """旧库补上自选名称列；失败时由上层统一记录初始化错误。"""

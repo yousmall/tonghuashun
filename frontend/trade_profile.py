@@ -10,6 +10,7 @@ from typing import Callable
 import streamlit as st
 from frontend.charts import render_bar
 
+from backend.app.risk_questionnaire import assessment_is_current
 from backend.app.services.trade_history import FIELD_LABELS, REQUIRED
 
 
@@ -105,7 +106,72 @@ def render_report_analysis(analysis: dict) -> None:
     st.caption(f"来源：{source['file_name']}；文件校验值：{source['sha256']}")
 
 
-def render_trade_profile(api_base: str, *, api_request: Callable) -> None:
+def render_trade_portrait(profile: dict, *, draft: dict | None = None) -> None:
+    analysis = draft or profile.get("trading_analysis")
+    if not analysis:
+        return
+
+    report = analysis.get("input_kind") == "analysis_report"
+    st.markdown("### 用户画像 · Excel 交易行为")
+    period = " 至 ".join(str(day) for day in (analysis.get("window_start"), analysis.get("window_end")) if day)
+    source = "汇总报告" if report else "成交明细"
+    state = "待确认" if draft else "已保存"
+    st.caption(" ｜ ".join(filter(None, (state, source, period))))
+
+    days = analysis.get("reported_median_holding_days" if report else "average_matched_holding_days")
+    trade_count = analysis["trade_count"]
+    active_days = analysis.get("active_days")
+    daily = trade_count / active_days if active_days else None
+    if days is None:
+        investor_type = "交易活跃型，持有周期待核对" if daily is not None and daily >= 5 else "持有周期待核对"
+        holding = "可用持有时长数据不足。"
+    else:
+        investor_type = "短线交易型" if days <= 10 else "波段交易型" if days <= 30 else "较长周期持有型"
+        basis = "报告持有时长中位数" if report else "可匹配成交的平均持有时长"
+        holding = f"{basis}为 {days:g} 天。"
+    if daily is not None and daily >= 5 and days is not None:
+        investor_type += "，成交较频繁"
+    st.markdown(f"**行为类型**：{investor_type}。{holding}")
+    trading = f"成交 {trade_count:,} 笔，涉及 {analysis['security_count']:,} 只股票"
+    if daily is not None:
+        trading += f"，每个有成交日平均 {daily:.1f} 笔"
+    st.markdown(f"**交易活跃度与覆盖**：{trading}。")
+
+    top = analysis.get("top_securities") or []
+    if top:
+        st.markdown(f"**交易集中度**：成交额最高的单只股票占双边成交额 {top[0]['turnover_share']:.1%}。")
+    if report:
+        for section in analysis.get("report_sections", []):
+            dimension, metric, _ = section["columns"]
+            if dimension not in {"板块", "题材方向"} or not section["rows"] or "金额" not in metric:
+                continue
+            leading = max(section["rows"], key=lambda row: row["value"])
+            share = leading.get("calculated_share")
+            if share:
+                st.markdown(f"**{dimension}偏好**：表内成交金额最大的类别占 {share:.1%}。")
+                st.text(leading["label"])
+
+    product_types = profile.get("preferred_product_types")
+    if assessment_is_current(profile) and product_types:
+        if (profile.get("financial_plan") or {}).get("equity_cap") == 0:
+            focus = "根据已确认问卷的资金用途及回撤约束，先比较流动性和期限匹配的固定收益类产品。"
+        else:
+            levels = "、".join(profile.get("suitable_product_levels") or [])
+            match = f"风险等级在 {levels} 范围内的" if levels else ""
+            focus = f"按已确认问卷比较{match}{'、'.join(product_types)}，核对成本和赎回条件。"
+    else:
+        focus = "可先比较分散型宽基指数产品和低波动固定收益类产品的波动、费用及赎回条件。完成风险问卷后确认适用品种。"
+    st.markdown(f"**建议关注的品种**：{focus}")
+    if (days is not None and days <= 10) or (daily is not None and daily >= 5):
+        st.markdown("**后续关注**：优先复盘交易频次与扣费，用扣费后结果检验短周期交易是否有效。")
+    if report:
+        st.caption("汇总指标来自上传报告；持有时长使用报告的中位数口径。")
+        if any(not check["matches"] for check in analysis.get("reconciliation", [])):
+            st.warning("报告部分合计存在差异，请查看下方数据核验后再使用结论。")
+    st.caption("行为分型依据：持有时长不超过 10 天为短线，超过 10 天至 30 天为波段，超过 30 天为较长周期。风险等级和拟投资期限以问卷为准。")
+
+
+def render_trade_profile(api_base: str, *, api_request: Callable) -> dict | None:
     with st.container(border=True, key="trade-profile-panel"):
         st.subheader("从 Excel 分析用户画像")
         st.caption("上传同一用户的股票成交明细或交易行为分析报告（.xlsx / .xls，最多 5 MB）。"
@@ -144,8 +210,7 @@ def render_trade_profile(api_base: str, *, api_request: Callable) -> None:
         if not inspection or st.session_state.get("trade_profile_file_digest") != digest:
             return
         if inspection.get("input_kind") == "analysis_report":
-            _render_report_import(api_base, base, digest, inspection, api_request=api_request)
-            return
+            return _render_report_import(api_base, base, digest, inspection, api_request=api_request)
         sheet = st.selectbox("交易工作表", inspection["sheets"],
                              index=inspection["sheets"].index(inspection["sheet_name"]), key=f"trade_profile_sheet_{digest}")
         if sheet != inspection["sheet_name"]:
@@ -200,7 +265,7 @@ def render_trade_profile(api_base: str, *, api_request: Callable) -> None:
             if analysis:
                 st.session_state.trade_profile_draft = {"signature": signature, "analysis": analysis,
                                                        "version": int(st.session_state.profile.get("version") or 1)}
-        _render_analysis_draft(api_base, payload, signature, api_request=api_request)
+        return _render_analysis_draft(api_base, payload, signature, api_request=api_request)
 
 
 def _render_report_import(api_base, base, digest, inspection, *, api_request):
@@ -217,7 +282,7 @@ def _render_report_import(api_base, base, digest, inspection, *, api_request):
         if analysis:
             st.session_state.trade_profile_draft = {"signature": signature, "analysis": analysis,
                                                    "version": int(st.session_state.profile.get("version") or 1)}
-    _render_analysis_draft(api_base, base, signature, api_request=api_request)
+    return _render_analysis_draft(api_base, base, signature, api_request=api_request)
 
 
 def _render_analysis_draft(api_base, payload, signature, *, api_request):
@@ -244,3 +309,4 @@ def _render_analysis_draft(api_base, payload, signature, *, api_request):
             discard_account_result(api_base, "/profile")
             st.session_state.trade_profile_notice = "交易行为画像已保存。"
             st.rerun()
+    return draft["analysis"] if not stale else None

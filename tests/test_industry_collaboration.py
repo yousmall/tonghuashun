@@ -85,13 +85,14 @@ def test_collaborating_agents_receive_cross_direction_metrics_and_lineage(agent_
 
 
 @pytest.mark.asyncio
-async def test_api_runs_four_specialists_in_parallel_then_verifies(semantic, monkeypatch):
+@pytest.mark.parametrize("target", ["半导体", None])
+async def test_api_runs_four_specialists_in_parallel_then_verifies(semantic, monkeypatch, target):
     started = set()
     event = asyncio.Event()
 
     def handler(agent_id):
         async def run(req):
-            assert req.industry_collaboration
+            assert req.industry_collaboration and req.research_target == target
             assert {f.fact_id for f in req.facts} >= {"market", "stock", "fund", "convertible"}
             started.add(agent_id)
             if len(started) == 4:
@@ -105,10 +106,12 @@ async def test_api_runs_four_specialists_in_parallel_then_verifies(semantic, mon
                                    verify_facts, basic_compliance_check, semantic=semantic)
 
     async def understand(req):
-        return RequestUnderstanding(intent=Intent.INDUSTRY_ANALYSIS, target="半导体", confidence=1, risk_rules=[], reason="测试固定任务")
-    monkeypatch.setattr(coordinator, "understand_request", understand)
+        pytest.fail("显式行业协同不应调用语义意图识别")
+    monkeypatch.setattr(semantic, "understand", understand)
     monkeypatch.setattr(main, "coordinator", coordinator)
-    result = await main.analyze_portfolio(request(facts=[fact(fid) for fid in ["market", "stock", "fund", "convertible"]]), None)
+    result = await main.analyze_portfolio(request(
+        research_target=target, facts=[fact(fid) for fid in ["market", "stock", "fund", "convertible"]],
+    ), None)
     assert started == {"market", "industry", "security", "fund"}
     assert {r.agent_id for r in result.agent_results} == started
     assert {f.fact_id for f in result.facts} >= {"market", "stock", "fund", "convertible"}
@@ -122,20 +125,23 @@ async def test_api_runs_four_specialists_in_parallel_then_verifies(semantic, mon
 
 
 @pytest.mark.asyncio
-async def test_reference_opinions_are_separate_from_model_evidence():
+@pytest.mark.parametrize("has_facts", [True, False])
+async def test_reference_opinions_are_separate_from_model_evidence(has_facts):
     sent = []
     class Client:
         config = SimpleNamespace(model="offline-fixture")
         async def complete_json(self, *, system, payload):
             sent.append((system, payload))
             return {"agent_id": "security", "status": "degraded", "confidence": .2,
-                    "opinion": "仅有价格资料，缺少充分研究依据。", "facts_used": ["stock"]}
+                    "opinion": "缺少充分研究依据。", "facts_used": ["stock"] if has_facts else []}
     result = await HybridInvestmentAgent("security", make_rule_agents()["security"], Client()).run(request(
-        facts=[fact("stock")], research_materials=[{"source": "可转债分析", "summary": "过往转债观点待复核"}]))
+        facts=[fact("stock")] if has_facts else [],
+        research_materials=[{"source": "可转债分析", "summary": "过往转债观点待复核"}]))
     assert sent[0][1]["reference_materials"][0]["source"] == "可转债分析"
     assert "不能作为事实" in sent[0][0]
-    assert {f["fact_id"] for f in sent[0][1]["authorized_facts"]} == {"stock"}
-    assert result.facts_used == ["stock"]
+    expected = ["stock"] if has_facts else []
+    assert [f["fact_id"] for f in sent[0][1]["authorized_facts"]] == expected
+    assert result.facts_used == expected
 
 
 @pytest.mark.asyncio
@@ -145,7 +151,7 @@ async def test_missing_materials_leave_all_specialists_in_review(semantic):
     result = await coordinator.run(request(), understanding=understanding)
     assert {r.agent_id for r in result.agent_results} == {"market", "industry", "security", "fund"}
     assert not result.evidence and result.compliance.status == "REVIEW"
-    assert "证据不足" in result.conclusion
+    assert "证据不足" in result.conclusion and "行业景气指标" in result.conclusion
 
 
 def test_industry_button_submits_deep_research_without_changing_chat_mode():

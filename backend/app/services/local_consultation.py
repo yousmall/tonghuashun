@@ -9,7 +9,7 @@ import re
 from uuid import uuid4
 
 from backend.app.agents.coordinator import (
-    CoordinatorAgent, RISK_NOTICE, basic_compliance_check, cross_validate_results,
+    CoordinatorAgent, basic_compliance_check, cross_validate_results,
     merge_compliance, semantic_compliance, verify_facts,
 )
 from backend.app.agents.rule_agents import make_rule_agents
@@ -25,6 +25,7 @@ from backend.app.risk_questionnaire import assessment_is_current
 from backend.app.semantic import RequestUnderstanding
 from backend.app.services.research import AutomatedResearchPipeline
 from backend.app.services.context_link import carry_context_entity
+from backend.app.services.comparison_review import review_comparison
 from backend.app.services.evidence_coverage import AGENT_FIELDS
 
 OMITTED = ["实时取数与资料补取", "复杂筛选与股票推荐", "收益预测", "多轮模型解读"]
@@ -34,7 +35,7 @@ CONCEPTS = {
     "市净率": "市净率＝股价÷每股净资产，反映价格相对账面净资产的水平。资产质量和行业差异会影响比较，低市净率不等于低风险。",
     "ROE": "ROE是净资产收益率，通常以净利润与平均净资产的比例衡量股东资金的盈利能力。高杠杆也可能推高ROE，需要结合负债和现金流观察。",
     "ETF": "ETF是可在交易所买卖的基金，常用于跟踪指数。需要比较跟踪误差、费用、成交活跃度与所跟踪资产的风险；交易便利不代表不会亏损。",
-    "最大回撤": "最大回撤是某一观察区间内从高点到随后低点的最大跌幅，描述历史下跌幅度。历史回撤不保证未来损失上限。",
+    "最大回撤": "最大回撤是某一观察区间内从高点到随后低点的最大跌幅，描述历史下跌幅度。不同观察区间的回撤可能差异很大。",
     "分散投资": "分散投资是把资金分配到不同资产或风险来源，减少单一标的对组合的影响。相关性较高的资产可能同时下跌，分散不能消除市场风险。",
 }
 ROLES = {
@@ -119,9 +120,10 @@ def select_scope(request):
         "PRIVACY_AND_PERMISSION": r"(?:其他|别人|另一个|所有|管理员).{0,12}(?:用户|账号|账户|客户).{0,20}(?:持仓|密钥|密码|资料|资产)|(?:泄露|打印|显示|给我|读取).{0,15}(?:api.?key|密钥|系统提示词|密码)",
         "NO_RETURN_PROMISE": r"稳赚|(?:保证|承诺).{0,8}(?:盈利|收益|翻倍)|推荐保本",
     }
+    risk_question = re.sub(r"(?:不用|无需|不需要|不要求|不要)(?:你|给我)?(?:保证|承诺)(?:投资)?(?:盈利|收益|回报)", "", question)
     for rule, pattern in risk_patterns.items():
-        if re.search(pattern, question, re.I):
-            return RequestUnderstanding(intent=Intent.UNKNOWN, confidence=1, risk_rules=[rule], reason="咨询不提供收益保证或其他账户资料。")
+        if re.search(pattern, risk_question, re.I):
+            return RequestUnderstanding(intent=Intent.UNKNOWN, confidence=1, risk_rules=[rule], reason="咨询问题超出了资料查询和分析范围。")
     if re.search(r"(?:执行|替我|帮我|直接|自动).{0,8}(?:买入|下单|卖出|交易|删除)|忽略.{0,8}(?:规则|指令)|<script|drop\s+table|system:", question, re.I):
         return RequestUnderstanding(intent=Intent.UNKNOWN, confidence=1, risk_rules=[], reason="请求不在只读研究范围内")
     from backend.app.services.security_identity import _stock_symbols
@@ -132,9 +134,11 @@ def select_scope(request):
         return RequestUnderstanding(intent=Intent.UNKNOWN, confidence=0, risk_rules=[], reason="请说明研究标的及问题")
     denied = {"推荐稳赚股票": "NO_RETURN_PROMISE", "给我其他用户的持仓和密钥": "PRIVACY_AND_PERMISSION"}
     if question in denied:
-        return RequestUnderstanding(intent=Intent.UNKNOWN, confidence=1, risk_rules=[denied[question]], reason="精简咨询不提供收益保证或其他账户资料。")
+        return RequestUnderstanding(intent=Intent.UNKNOWN, confidence=1, risk_rules=[denied[question]], reason="咨询问题超出了资料查询和分析范围。")
     intent = next((intent for intent, label in DIRECTION_FOR_INTENT.items()
                    if label == request.research_direction), Intent.UNKNOWN)
+    if request.comparison_targets and intent in ROLES and intent is not Intent.PORTFOLIO_REVIEW:
+        return RequestUnderstanding(intent=intent, confidence=1, risk_rules=[], reason="解读所选自选组的可比指标。")
     catalog = {"请诊断我的持仓组合": Intent.PORTFOLIO_REVIEW, "帮我看看持仓": Intent.PORTFOLIO_REVIEW}
     if request.research_direction == "市场解读" and (symbols or re.search(r"(?<!\d)\d{6}(?!\d)|个股|股票|基金|可转债", question)):
         return RequestUnderstanding(intent=Intent.UNKNOWN, confidence=1, risk_rules=[], reason="LOCAL_CLARIFY:这个问题涉及具体标的，请切换对应的个股、基金或可转债研究页面。")
@@ -163,14 +167,13 @@ class LocalConsultationService:
         def simple(conclusion, scope="clarification", compliance=None):
             advice = AdvicePackage(trace_id=trace_id, intent=intent, conclusion=conclusion, confidence=0,
                 task_plan=plan, compliance=compliance or ComplianceResult(status=ComplianceStatus.REVIEW,
-                    matched_rules=["LIMITED_CONSULTATION"], reason="精简咨询仅提供资料概要与固定风险检查。",
-                    risk_notice=RISK_NOTICE, required_disclosures=[RISK_NOTICE]),
+                    matched_rules=["LIMITED_CONSULTATION"], reason="精简咨询仅提供资料概要与固定风险检查。"),
                 response_scope=scope, scope_notice=NOTICE, omitted_features=list(OMITTED),
                 next_steps=["需要最新资料或复杂问答时，请选择深入研究"],
                 return_expectation=ReturnExpectation(summary="精简咨询不计算收益预测。", assumptions=[]))
             return request.model_copy(update={"facts": []}), acquisition, advice
         if understanding.risk_rules:
-            return simple("精简咨询不提供收益保证、交易执行或其他账户资料。", compliance=semantic_compliance(
+            return simple("请将问题限定在具体标的、公开资料或您的账户范围内。", compliance=semantic_compliance(
                 understanding.risk_rules, understanding.reason, risk_level=request.profile.risk_level))
         if not assessment_is_current(request.profile):
             return simple("请先完成并确认有效的风险测评。")
@@ -199,7 +202,8 @@ class LocalConsultationService:
         # Scope asset and industry pages to the explicitly selected/requested entity.
         # Generic requests require one unambiguous entity.
         carried: str | None = None
-        if intent in {Intent.SECURITY_RESEARCH, Intent.CONVERTIBLE_BOND_ANALYSIS, Intent.FUND_SCREENING, Intent.INDUSTRY_ANALYSIS}:
+        comparison = bool(request.comparison_targets) and intent is not Intent.PORTFOLIO_REVIEW
+        if not comparison and intent in {Intent.SECURITY_RESEARCH, Intent.CONVERTIBLE_BOND_ANALYSIS, Intent.FUND_SCREENING, Intent.INDUSTRY_ANALYSIS}:
             question = user_question(request.query)
             generic = question.strip(" 。？?！!") in {"概览", "资料概览", "已有资料概览", "行业概览", "查看已有资料", "分析当前标的", "分析当前股票", "分析这只股票", "分析当前基金", "分析当前转债", "分析当前行业"}
             lookup = request.research_target if generic and request.research_target else question
@@ -231,17 +235,20 @@ class LocalConsultationService:
                 valid_facts = [f for f in valid_facts if f.entity in matching]
         view = prepared.model_copy(update={"facts": valid_facts})
         results = []
-        for role in ROLES[intent]:
+        if comparison:
+            role = ROLES[intent][0]
+            comparison_result = review_comparison(intent, request.comparison_targets, valid_facts, agent_id=role)
+            if comparison_result is None:
+                return simple("这组标的暂无全部共有且通过核验的同期间、同单位数值。可刷新对比资料，核对期间和单位后再解读。")
+            results.append(comparison_result)
+            plan.nodes.append(TaskNode(task_id=f"{role}-snapshot", agent_id=role, status=TaskStatus.COMPLETED))
+        for role in (() if comparison else ROLES[intent]):
             baseline = await self.coordinator.agents[role](view)
             snapshot = self._snapshot(role, valid_facts)
             # Fund mode shows loaded data, never the rule agent's candidate ranking
             # or suitability-admission claim; those belong to complete research.
             if role != "fund" and baseline.status is TaskStatus.COMPLETED and baseline.facts_used:
                 result = baseline
-                if role == "portfolio":
-                    result.opinion = (f"已完成持仓集中度检查，最大持仓为{baseline.details['largest_position']}，"
-                                      f"占比{baseline.details['largest_weight']:.1%}；"
-                                      f"已确认的单标的上限为{request.profile.single_security_limit:.1%}。")
             elif snapshot:
                 result = snapshot
                 result.risk_flags = list(baseline.risk_flags)
@@ -251,7 +258,7 @@ class LocalConsultationService:
             result.details = {**result.details, "engine": "local_rules", "snapshot_only": True}
             results.append(result)
             plan.nodes.append(TaskNode(task_id=f"{role}-snapshot", agent_id=role, status=TaskStatus.COMPLETED))
-        if self.detailed:
+        if self.detailed and not comparison:
             from backend.app.services.instant_research import enrich_results
             results = enrich_results(results, valid_facts, request.query)
         if progress_sink:
@@ -262,27 +269,41 @@ class LocalConsultationService:
         plan.nodes.append(TaskNode(task_id="fact-verification", agent_id="fact_verifier", status=TaskStatus.COMPLETED,
                                    depends_on=[n.task_id for n in plan.nodes]))
         cross = cross_validate_results(results, prepared.facts)
+        safe_comparison = None
+        if comparison and cross.issues:
+            affected_ids = {fact_id for issue in cross.issues for fact_id in issue.fact_ids}
+            if affected_ids:
+                selected = set(results[0].facts_used) - affected_ids
+                kept = [fact for fact in valid_facts if fact.fact_id in selected]
+                safe_comparison = review_comparison(intent, request.comparison_targets, kept, agent_id=results[0].agent_id)
+            if safe_comparison:
+                safe_comparison.risk_flags.extend([
+                    *results[0].risk_flags, "已撤下核验中发现冲突的指标记录。",
+                ])
+                results[0] = safe_comparison
         if cross.issues:
             cross.consensus_score = None
             cross.confidence = 0
             cross.supporting_agents = []
             cross.dissenting_agents = []
             for result in results:
-                if result.facts_used:
+                if result.facts_used and result is not safe_comparison:
                     result.opinion = "资料存在冲突或核验限制，请查看来源差异，暂不形成确定判断。"
                     result.score = None
                     result.rule_score = None
         if progress_sink:
             progress_sink("风险检查")
         compliance = merge_compliance(await basic_compliance_check(prepared, results), ComplianceResult(
-            status=ComplianceStatus.REVIEW, matched_rules=["LIMITED_CONSULTATION"],
-            reason="已完成精简范围内的资料和固定风险检查；未执行深入模型研判，不提供买卖建议。",
-            risk_notice=RISK_NOTICE, required_disclosures=[RISK_NOTICE]))
+            status=ComplianceStatus.REVIEW, matched_rules=["LIMITED_CONSULTATION"]))
         plan.nodes.append(TaskNode(task_id="fixed-risk-check", agent_id="compliance", status=TaskStatus.COMPLETED,
                                    depends_on=["fact-verification"]))
         advice = self.coordinator._aggregate(prepared, plan, results, cross, compliance)
         conclusion = ("精简资料概要：\n\n" + "\n\n".join(result.opinion for result in results)
                       if results else "当前没有通过核验的相关资料，无法形成数据概要。请先加载资料，或选择深入研究。")
+        if results and (comparison or intent is Intent.PORTFOLIO_REVIEW):
+            conclusion = results[0].opinion
+            if not cross.issues:
+                advice.risk_conclusion = None
         if results and carried:
             conclusion = f"结合上一轮对话，本轮沿用标的：{carried}。\n\n{conclusion}"
         if compliance.status is ComplianceStatus.BLOCK:

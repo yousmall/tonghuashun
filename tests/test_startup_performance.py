@@ -202,7 +202,9 @@ import streamlit as st
 from frontend import streamlit_app as ui
 ui.init_session()
 st.session_state.auth_token = 'isolated-test'
-st.session_state.auth_user = {'username': 'test-user', 'role': 'user'}
+st.session_state.auth_user = {
+    'username': 'test-user', 'role': 'user', 'display_name': '测试账号', 'avatar_data': None,
+}
 st.session_state.profile_restored = True
 st.session_state.profile['confirmed'] = True
 st.session_state.navigation = '自选研究'

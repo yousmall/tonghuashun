@@ -91,4 +91,3 @@ def render_home(api_base, *, ready, header, go_to, recent, fetch, resume):
         with st.expander("使用流程与操作说明", key="home_guide", on_change="rerun", icon=":material/help:") as guide:
             if guide.open:
                 render_guide()
-    st.caption("分析仅供参考，不保证收益。投资前，请结合自己的情况判断。")

@@ -33,7 +33,9 @@ import streamlit as st
 from frontend import streamlit_app as ui
 ui.init_session()
 st.session_state.auth_token = 'ui-test'
-st.session_state.auth_user = {'id': 1, 'username': 'test-user'}
+st.session_state.auth_user = {
+    'username': 'test-user', 'role': 'user', 'display_name': '用户test', 'avatar_data': None,
+}
 """
 MAIN = """
 with patch.object(ui, 'api_request', return_value={'id': 1, 'username': 'test-user'}), patch.object(ui, 'register_browser_session'), patch.object(ui, 'enforce_session_timeout'):
@@ -63,6 +65,26 @@ st.session_state.request_paths = paths
 
     assert not app.exception
     assert "/auth/me" not in app.session_state["request_paths"]
+
+
+def test_main_recovers_presentation_for_existing_session_once():
+    script = SETUP + """
+st.session_state.auth_user = {'username': 'test-user', 'role': 'user'}
+st.session_state.profile_restored = True
+avatar = 'data:image/png;base64,dGVzdA=='
+account = {'id': 1, 'username': 'test-user', 'role': 'user', 'display_name': '已保存昵称', 'avatar_data': avatar}
+with patch.object(ui, 'api_request', return_value=account) as api, patch.object(ui, 'register_browser_session'), patch.object(ui, 'enforce_session_timeout'):
+    ui.main()
+    st.session_state.auth_me_count = sum(call.args[2] == '/auth/me' for call in api.call_args_list)
+"""
+    app = AppTest.from_string(script).run()
+
+    assert not app.exception
+    assert app.session_state["auth_me_count"] == 1
+    assert app.session_state["auth_user"] == {
+        "username": "test-user", "role": "user", "display_name": "已保存昵称",
+        "avatar_data": "data:image/png;base64,dGVzdA==",
+    }
 
 
 def test_navigation_and_profile_call_to_action():
@@ -1248,6 +1270,7 @@ st.session_state.profile['confirmed'] = True
 st.session_state.conversation = [{'role': 'user', 'content': '市场解读：原市场问题'}]
 st.session_state.facts = [{'fact_id': 'market', 'field': 'news', 'value': '市场资料'}]
 st.session_state.portfolio = [{'name': '测试基金', 'weight': .2}]
+st.session_state.research_mode = 'deep'
 def fake_stream(base, payload):
     st.session_state.portfolio_sent = payload
     return {'conclusion': '组合结果', 'compliance': {'status': 'REVIEW'}, 'facts': []}
@@ -1255,13 +1278,58 @@ with patch.object(ui, 'stream_analysis', side_effect=fake_stream):
     ui.page_portfolio('http://localhost')
 """
     app = AppTest.from_string(script).run(timeout=15)
+    next(slider for slider in app.slider if slider.key == 'portfolio_stress_shock').set_value(20).run(timeout=15)
     next(button for button in app.button if button.label == '分析我的持仓').click().run(timeout=15)
     assert not app.exception
+    assert app.session_state['portfolio_sent']['portfolio_stress_percent'] == 20
+    assert app.session_state['portfolio_sent']['research_mode'] == 'instant'
     assert app.session_state['portfolio_sent']['facts'] == []
     assert len(app.session_state['portfolio_sent']['context_messages']) == 1
     assert app.session_state['portfolio_advice']['conclusion'] == '组合结果'
     assert app.session_state['conversation'][0]['content'] == '市场解读：原市场问题'
     assert app.session_state['facts'][0]['fact_id'] == 'market'
+
+
+def test_watchlist_interpretation_sends_only_the_selected_group():
+    script = SETUP + """
+from datetime import date
+from frontend import watchlist_page
+
+st.session_state.profile['confirmed'] = True
+st.session_state.watchlist = [
+    {'id': 1, 'target': '600519', 'asset_type': '股票'},
+    {'id': 2, 'target': '600036', 'asset_type': '股票'},
+]
+st.session_state.watchlist_comparison_request = {
+    'ids': [1, 2], 'targets': ['600519', '600036'], 'asset_type': '股票'
+}
+items = [
+    {'target': code, 'entity': name, 'entity_code': code + '.SH', 'facts': [{
+        'fact_id': code, 'entity': name, 'entity_code': code + '.SH',
+        'field': 'roe', 'value': value, 'period': date.today().isoformat(), 'unit': '%',
+    }]}
+    for code, name, value in [('600519', '甲公司', 25), ('600036', '乙公司', 9)]
+]
+def fake_stream(base, payload):
+    st.session_state.sent = payload
+    return {'conclusion': '两者净资产收益率相差16个百分点。', 'compliance': {'status': 'REVIEW'}, 'facts': []}
+
+with patch.object(watchlist_page, 'poll_snapshot', return_value={'status': 'ok', 'items': items}), \\
+     patch.object(ui, 'stream_analysis', side_effect=fake_stream):
+    watchlist_page._comparison_result('http://localhost', {
+        'analysis': ui.run_analysis, 'activate': ui.activate_research, 'add_fact': ui.add_fact,
+        'factory': lambda *_: None, 'save': lambda: None, 'go_to': lambda *_: None,
+        'ready': lambda: True,
+    })
+"""
+    app = AppTest.from_string(script).run(timeout=15)
+    next(button for button in app.button if button.label == '解读这组对比').click().run(timeout=15)
+    assert not app.exception
+    sent = app.session_state['sent']
+    assert sent['research_direction'] == '个股研究' and sent['research_mode'] == 'instant'
+    assert sent['comparison_targets'] == ['600519', '600036'] and not sent['auto_fetch']
+    assert {fact['fact_id'] for fact in sent['facts']} == {'600519', '600036'}
+    assert any('相差16个百分点' in item.value for item in app.markdown)
 
 
 def test_watchlist_research_opens_matching_direction_without_previous_context():

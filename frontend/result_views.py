@@ -133,17 +133,18 @@ def render_advice(advice: dict[str, Any], *, export_key: str = "answer", questio
              *compliance.get("required_disclosures", []), compliance.get("risk_notice")]
     if compliance.get("status") == "BLOCK":
         risks.insert(0, "本次风险检查未通过，暂不形成可执行的投资建议。")
-    elif compliance.get("status") != "PASS":
-        risks.insert(0, "这份分析仍需核实，请勿直接据此买卖。")
+    elif compliance.get("status") != "PASS" and ("LIMITED_CONSULTATION" not in (compliance.get("matched_rules") or [])
+                                                  or (advice.get("cross_validation") or {}).get("issues")):
+        risks.insert(0, "这份分析仍需核实。")
     if (advice.get("data_acquisition") or {}).get("mode") == "demo" or any(
             fact.get("source_id") == "DEMO_SNAPSHOT" for fact in advice.get("facts") or []):
         risks.append("本结果含示例数据，仅用于演示。")
     reason = visible_compliance_reason(advice)
     if compliance.get("status") != "PASS" and reason:
         risks.append(reason)
-    risks = list(dict.fromkeys(plain_language(value) for value in risks if value))
+    risks = list(dict.fromkeys(text for value in risks if (text := plain_language(value))))
     if not risks:
-        risks = ["投资存在价格波动和亏损风险；本次分析不保证收益。"]
+        risks = ["标的价格可能波动，持有期间可能出现亏损。"]
     for value in risks:
         st.write(value)
 
@@ -187,7 +188,7 @@ def render_advice_details(advice: dict[str, Any], *, export_key: str = "answer",
         st.write(plain_language(advice.get("conclusion")) or "资料不足，暂未形成结论。")
         risks = [visible_risk_conclusion(advice), *visible_risks(advice),
                  *compliance.get("required_disclosures", []), compliance.get("risk_notice")]
-        risks = list(dict.fromkeys(plain_language(value) for value in risks if value))
+        risks = list(dict.fromkeys(text for value in risks if (text := plain_language(value))))
         if risks:
             st.markdown("**风险与待核实事项**")
             for value in risks:
@@ -277,6 +278,7 @@ def answer_export_payload(advice: dict[str, Any], images: list, question: str = 
                          [result.get("opinion"), *result.get("confidence_reasons", []), *result.get("risk_flags", []), *result.get("invalidation_conditions", [])]))
     if verification_notes(advice):
         sections.append(("核验记录（附录）", verification_notes(advice)))
+    cleaned = [(title, [value for text in texts if (value := plain_language(text))]) for title, texts in sections]
     return {"question": question, "images": images,
-            "sections": [(title, [plain_language(text) for text in texts if text]) for title, texts in sections],
+            "sections": [(title, values) for title, values in cleaned if values],
             "sources": source_trace_rows(advice)}

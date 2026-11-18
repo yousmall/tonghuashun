@@ -257,7 +257,7 @@ def build_automatic_planning(profile=None, *, narrative="", risk_answers=None, t
     minimum_goal = low
     if minimum_goal is not None and (minimum_goal >= .10 and (drawdown is not None and drawdown <= .10 or risk_level in {"R1","R2"})
                                       or minimum_goal > .20 or months is not None and months <= 12 and minimum_goal >= .10):
-        warnings.append("收益目标与期限或可接受损失之间存在张力，请优先复核目标和资金用途；不能通过提高目标保证收益。")
+        warnings.append("收益目标与期限或可接受损失之间存在张力，请优先复核目标和资金用途。")
     warnings.extend(profile.get("financial_warnings") or [])
     if preference == "积极倾向" and drawdown == 0:
         warnings.append("积极偏好与零回撤要求存在矛盾，请先核对可接受损失边界。")

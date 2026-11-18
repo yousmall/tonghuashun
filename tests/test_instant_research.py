@@ -93,6 +93,61 @@ async def test_comparison_keeps_entities_separate_and_does_not_rank_stocks():
 
 
 @pytest.mark.asyncio
+async def test_watchlist_conclusion_uses_common_periods_and_keeps_unaffected_metrics():
+    now = datetime.now(timezone.utc)
+    period = (now.date() - timedelta(days=2)).isoformat()
+
+    def row(fid, name, code, field, value, unit, when=period):
+        return FactRecord(fact_id=fid, entity=name, entity_code=code, field=field,
+                          value=value, unit=unit, period=when, snapshot_time=now,
+                          source_id="SYNTHETIC_TEST_ONLY", quality=.95)
+
+    rows = [
+        row("a-roe", "甲公司", "600519.SH", "roe", .2498, "ratio"),
+        row("b-roe", "乙公司", "600036.SH", "roe", 8.74, "%"),
+        row("other-roe", "其他公司", "000001.SZ", "roe", 99, "%"),
+        row("a-pe-1", "甲公司", "600519.SH", "pe_ttm", 30, "倍"),
+        row("a-pe-2", "甲公司", "600519.SH", "pe_ttm", 40, "倍"),
+        row("b-pe", "乙公司", "600036.SH", "pe_ttm", 8, "倍"),
+        row("a-pb", "甲公司", "600519.SH", "pb", 2, "倍"),
+        row("b-pb", "乙公司", "600036.SH", "pb", 1, "倍", (now.date() - timedelta(days=8)).isoformat()),
+    ]
+    req = request("请横向比较甲公司、乙公司", facts=rows, comparison_targets=["600519", "600036"])
+    prepared, _, advice = await InstantResearchService().run(req, select_scope(req))
+
+    assert "甲公司 24.98%" in advice.conclusion and "乙公司 8.74%" in advice.conclusion
+    assert "16.24个百分点" in advice.conclusion and "现金流" in advice.conclusion
+    assert "其他公司" not in advice.conclusion and "市盈率" not in advice.conclusion
+    assert any("冲突" in risk and "市盈率" in risk for risk in advice.risks)
+    assert any("市净率" in risk for risk in advice.risks)
+    assert set(advice.evidence) == {fact.fact_id for fact in prepared.facts} == {"a-roe", "b-roe"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit,wording", [(0.30, "已触及"), (0.25, "超过")])
+async def test_portfolio_conclusion_aggregates_duplicate_positions_and_uses_selected_stress(limit, wording):
+    now = datetime.now(timezone.utc)
+    stale = FactRecord(fact_id="old-weight", entity="甲基金", field="weight", value=.8,
+                       source_id="USER_PORTFOLIO_SNAPSHOT", snapshot_time=now, quality=1)
+    req = OrchestrationRequest(query="请诊断我的持仓组合", research_mode="instant",
+        profile={"confirmed": True, "risk_level": "R3", "max_drawdown": .08, "single_security_limit": limit},
+        facts=[stale], portfolio=[
+            {"name": "甲基金", "weight": .17}, {"name": "甲基金", "weight": .13},
+            {"name": "乙基金", "weight": .25}, {"name": "丙基金", "weight": .15},
+        ], portfolio_stress_percent=20,
+    )
+
+    prepared, _, advice = await InstantResearchService().run(req, select_scope(req))
+    assert "最大持仓占30.0%（甲基金）" in advice.conclusion
+    assert "前两大合计占55.0%" in advice.conclusion and wording in advice.conclusion
+    assert "30.0%的组合权重尚未录入" in advice.conclusion
+    assert "同步下跌20%" in advice.conclusion and "-14.0%" in advice.conclusion
+    assert "回撤边界高6.0个百分点" in advice.conclusion
+    assert "old-weight" not in advice.evidence and len(prepared.facts) == 3
+    assert ("SINGLE_SECURITY_CONCENTRATION" in advice.compliance.matched_rules) == (limit < .30)
+
+
+@pytest.mark.asyncio
 async def test_instant_explains_supported_growth_divergence_only_with_matching_periods():
     rows = facts()[:3]
     rows.extend([

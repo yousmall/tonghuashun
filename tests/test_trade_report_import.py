@@ -94,7 +94,6 @@ from io import BytesIO
 from unittest.mock import patch
 import streamlit as st
 from frontend import streamlit_app as ui
-from frontend.trade_profile import render_trade_profile
 from backend.app.models.trade_history import TradeHistoryUpload
 from backend.app.services.trade_history import inspect_trade_workbook, analyze_trade_history
 ui.init_session()
@@ -110,8 +109,8 @@ def api(base, method, path, payload):
     result['confirmed'] = True
     st.session_state.did_save = True
     return dict(st.session_state.profile, trading_analysis=result, version=2)
-with patch('frontend.trade_profile.st.file_uploader', return_value=file):
-    render_trade_profile('http://offline', api_request=api)
+with patch('frontend.trade_profile.st.file_uploader', return_value=file), patch.object(ui, 'api_request', api):
+    ui.page_profile('http://offline')
 '''
     app = AppTest.from_string(script).run(timeout=15)
     next(b for b in app.button if b.label == "读取 Excel").click().run(timeout=15)
@@ -120,6 +119,8 @@ with patch('frontend.trade_profile.st.file_uploader', return_value=file):
     assert len(app.dataframe) == 6
     next(b for b in app.button if b.label == "分析交易画像").click().run(timeout=15)
     assert not app.exception
+    assert any("波段交易型" in item.value for item in app.markdown)
+    assert any("**题材方向偏好**" in item.value for item in app.markdown)
     next(b for b in app.button if b.label == "确认并保存交易画像").click().run(timeout=15)
     assert not app.exception and app.session_state['did_save']
     assert app.session_state['profile']['trading_analysis']['input_kind'] == 'analysis_report'

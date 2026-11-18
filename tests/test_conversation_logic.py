@@ -40,7 +40,7 @@ def test_all_reply_modes_have_only_two_conclusion_sections(compact, mode, status
     assert not app.expander and not app.dataframe and not app.metric
     assert not app.caption and not app.get('download_button') and not app.get('vega_lite_chart')
     text = '\n'.join(m.value for m in app.markdown)
-    assert '价格波动' in text and '不保证收益' in text
+    assert '价格波动' in text and '不保证收益' not in text
     assert '范围说明' not in text and '下次研究现金流' not in text
     if status == 'BLOCK':
         assert '风险检查未通过' in text

@@ -2,6 +2,7 @@
 import base64
 import re
 from io import BytesIO
+from random import Random
 
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -17,7 +18,8 @@ from frontend.user_settings import DEFAULT_AVATAR
 
 def image_data():
     output = BytesIO()
-    Image.new("RGB", (420, 180), "#426baf").save(output, format="JPEG")
+    image = Image.frombytes("RGB", (420, 180), Random(127).randbytes(420 * 180 * 3))
+    image.save(output, format="JPEG")
     return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode()
 
 
@@ -48,6 +50,7 @@ def test_appearance_api_persists_isolates_and_resets_without_changing_login(monk
         updated = response.json()
         assert updated["display_name"] == "小林" and updated["username"] == first["username"]
         assert updated["role"] == "user"
+        assert len(updated["avatar_data"].encode("ascii")) > 65535
         with Image.open(BytesIO(base64.b64decode(updated["avatar_data"].split(",")[1]))) as image:
             assert image.size == (256, 256) and image.format == "PNG"
         assert client.get("/api/v1/auth/me", headers=other_headers).json() == other
@@ -85,29 +88,56 @@ def test_risk_result_uses_current_avatar_and_escapes_nickname():
     assert DEFAULT_AVATAR in result_html(profile, {})
 
 
-def test_settings_save_updates_current_session_and_clears_private_widgets_on_logout():
+def test_settings_saves_an_uploaded_avatar_and_restores_it_on_login():
+    jpeg = image_data()
     script = '''
+import base64
+from io import BytesIO
+from unittest.mock import patch
+
 import streamlit as st
+from backend.app.user_appearance import normalize_avatar
 from frontend import streamlit_app as ui
 from frontend.user_settings import render_user_settings
+
 ui.init_session()
+st.session_state.setdefault('test_stored_user', {
+    'id': 1, 'username': 'test1', 'role': 'user', 'display_name': '用户a1234567', 'avatar_data': None,
+})
 if not st.session_state.get('auth_user'):
-    st.session_state.auth_user = {'id': 1, 'username': 'test1', 'display_name': '用户a1234567', 'avatar_data': None}
+    with patch.object(ui, 'prefetch_research_board_data'):
+        ui.complete_login({
+            'user': st.session_state.test_stored_user,
+            'access_token': 'isolated-token',
+            'session_beacon_token': 'isolated-beacon',
+        })
+file = None
+if not st.session_state.test_stored_user['avatar_data']:
+    file = BytesIO(base64.b64decode(JPEG_DATA.split(',', 1)[1]))
+    file.name = 'avatar.jpg'
 def api(base, method, path, payload):
-    st.session_state.settings_payload = payload
-    return dict(st.session_state.auth_user, **payload)
-render_user_settings('http://localhost', api_request=api)
+    assert method == 'PATCH' and path == '/auth/me'
+    assert payload['avatar_data'] == JPEG_DATA
+    st.session_state.test_stored_user.update(
+        display_name=payload['display_name'], avatar_data=normalize_avatar(payload['avatar_data']),
+    )
+    return dict(st.session_state.test_stored_user)
+with patch('frontend.user_settings.st.file_uploader', return_value=file):
+    render_user_settings('http://localhost', api_request=api)
 st.button('模拟退出', on_click=ui.reset_user_session)
 '''
-    app = AppTest.from_string(script).run(timeout=15)
-    assert not app.exception
+    app = AppTest.from_string(script.replace("JPEG_DATA", repr(jpeg))).run(timeout=15)
+    assert not app.exception and app.text_input[0].value == "用户a1234567"
     app.text_input[0].set_value("自定义昵称")
     next(b for b in app.button if b.label == "保存个人设置").click().run(timeout=15)
-    assert not app.exception and app.session_state["auth_user"]["display_name"] == "自定义昵称"
-    assert app.session_state["settings_payload"] == {"display_name": "自定义昵称"}
-    assert app.success
+    assert not app.exception and app.success and not app.error
+    account = app.session_state["auth_user"]
+    assert account["display_name"] == "自定义昵称"
+    assert account["avatar_data"].startswith("data:image/png;base64,")
+    assert "id" not in account
     next(b for b in app.button if b.label == "模拟退出").click().run(timeout=15)
-    assert not app.exception and app.text_input[0].value == "用户a1234567"
+    assert not app.exception and app.text_input[0].value == "自定义昵称"
+    assert app.session_state["auth_user"] == account
 
 
 def test_planning_has_its_own_page_and_risk_page_omits_planning_sections():

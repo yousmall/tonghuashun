@@ -53,10 +53,6 @@ Verifier = Callable[[list[AgentResult], list[FactRecord]], Awaitable[list[AgentR
 ComplianceChecker = Callable[[OrchestrationRequest, list[AgentResult]], Awaitable[ComplianceResult]]
 
 # 固定风险提示与具体分析内容分离，保证通过、复核和拦截场景都能复用同一口径。
-RISK_NOTICE = (
-    "以上内容基于所示数据时点和公开/授权信息生成，仅用于投资研究辅助，"
-    "不构成收益承诺或交易指令；请结合自身风险承受能力和独立判断审慎决策。"
-)
 UNSUPPORTED_INPUT_PREFIX = "我只是个投资助手，无法输出相关信息"
 
 # 语义规则的版本号随判定口径变化而升级，便于按 trace_id 回放当时的规则行为。
@@ -121,6 +117,11 @@ class CoordinatorAgent:
 
     async def understand_request(self, request: OrchestrationRequest) -> RequestUnderstanding:
         """同时识别上下文意图和请求风险；调用方应传递结果而非重复调用。"""
+        if request.industry_collaboration:
+            return RequestUnderstanding(
+                intent=Intent.INDUSTRY_ANALYSIS, target=request.research_target,
+                confidence=1, risk_rules=[], reason="按行业协同入口指定的范围分析。",
+            )
         return await self.semantic.understand(request)
 
     async def understand_intent(self, query: str) -> Intent:
@@ -336,7 +337,6 @@ class CoordinatorAgent:
                 semantic_result = ComplianceResult(
                     status=ComplianceStatus.REVIEW, matched_rules=["SEMANTIC_REVIEW_UNAVAILABLE"],
                     reason="语义复核不可用或不确定，需要人工复核。",
-                    risk_notice=RISK_NOTICE, required_disclosures=[RISK_NOTICE],
                 )
             else:
                 semantic_result = semantic_compliance(
@@ -383,7 +383,6 @@ class CoordinatorAgent:
             agent_results=safe_results, risk_conclusion="检查未完成，暂不能形成可靠的风险判断。",
             compliance=ComplianceResult(
                 status=ComplianceStatus.REVIEW, matched_rules=[code], reason=reason,
-                risk_notice=RISK_NOTICE, required_disclosures=[RISK_NOTICE],
             ),
             cross_validation=CrossValidationResult(issues=[CrossValidationIssue(
                 code=code, severity="critical", message=reason,
@@ -427,6 +426,12 @@ class CoordinatorAgent:
         # 永远显式返回数据时点，前端不得把它改写为含糊的“当前”。
         snapshot_time = max((fact.snapshot_time for fact in request.facts), default=None)
         conclusion = self._summarize(usable, compliance.status, cross_validation)
+        if request.industry_collaboration and not evidence:
+            conclusion = (
+                "证据不足，暂时无法比较行业景气、估值与资金流向。"
+                "请补充同一统计时点的行业景气指标、估值分位及资金净流入；"
+                "要核实个股、基金和可转债与行业的关联，还需相关成分股、基金持仓、转债正股及条款资料。"
+            )
         # 只有画像已确认时才会走到此处；仍只输出目标区间/诊断而非自动交易指令。
         user_fit = self._user_fit_summary(request)
         allocation = self._allocation_summary(usable, request)
@@ -527,7 +532,6 @@ class CoordinatorAgent:
             compliance=ComplianceResult(
                 status=ComplianceStatus.REVIEW,
                 reason=reason,
-                risk_notice=RISK_NOTICE,
             ),
             task_plan=plan,
         )
@@ -989,7 +993,6 @@ async def basic_compliance_check(
     这里只判断已结构化的目标、回撤、持仓上限和证据完整性。协调器合并语义审核结果，
     并确保 BLOCK 优先于 REVIEW、REVIEW 优先于 PASS。
     """
-    disclosures = [RISK_NOTICE]
     # 目标收益与最大回撤明显不匹配时先教育和复核，不据此反推更高风险仓位。
     if (
         request.profile.expected_annual_return is not None
@@ -1001,8 +1004,6 @@ async def basic_compliance_check(
             status=ComplianceStatus.REVIEW,
             matched_rules=["RETURN_DRAWDOWN_MISMATCH"],
             reason="期望收益与最大可接受回撤存在明显张力，请先重新确认目标和风险边界。",
-            risk_notice=RISK_NOTICE,
-            required_disclosures=disclosures,
         )
     # 规则 5：组合单标的权重不得超过已确认的硬上限。MVP 返回 REVIEW，
     # 让结果压缩到区间并解释风险；绝不把它升级成自动调仓。
@@ -1011,13 +1012,14 @@ async def basic_compliance_check(
         for holding in request.portfolio
         if isinstance(holding, dict) and isinstance(holding.get("weight"), (int, float))
     ]
-    if portfolio_weights and max(portfolio_weights) > request.profile.single_security_limit:
+    checked_weight = max((float(result.details.get("largest_weight", 0))
+                          for result in results if result.agent_id == "portfolio" and result.facts_used
+                          and isinstance(result.details.get("largest_weight"), (float, int))), default=0)
+    if portfolio_weights and max(checked_weight, max(portfolio_weights)) - request.profile.single_security_limit > 1e-9:
         return ComplianceResult(
             status=ComplianceStatus.REVIEW,
             matched_rules=["SINGLE_SECURITY_CONCENTRATION"],
             reason="持仓存在超过已确认单标的上限的集中度风险。",
-            risk_notice=RISK_NOTICE,
-            required_disclosures=disclosures,
         )
     # 规则 6：具体价格/估值等判断没有通过事实层时不可放行。该检查也覆盖
     # 事实过期、质量过低或 source_id 为空导致 verifier 清空证据的情形。
@@ -1027,14 +1029,10 @@ async def basic_compliance_check(
             status=ComplianceStatus.REVIEW,
             matched_rules=["EVIDENCE_INSUFFICIENT"],
             reason="证据不足，仅可展示教育性说明。",
-            risk_notice=RISK_NOTICE,
-            required_disclosures=disclosures,
         )
     # 所有已实现的硬规则均未命中时才允许通过；风险提示仍必须随结果一同返回。
     return ComplianceResult(
         status=ComplianceStatus.PASS,
-        risk_notice=RISK_NOTICE,
-        required_disclosures=disclosures,
     )
 
 
@@ -1062,7 +1060,7 @@ def semantic_compliance(
     explanation = SUITABILITY_REVIEW_REASON if adaptation_unverified and status is ComplianceStatus.REVIEW else reason
     return ComplianceResult(
         status=status, matched_rules=normalized, reason=explanation,
-        risk_notice=RISK_NOTICE, required_disclosures=[RISK_NOTICE], rule_version=SEMANTIC_RULE_VERSION,
+        rule_version=SEMANTIC_RULE_VERSION,
     )
 
 

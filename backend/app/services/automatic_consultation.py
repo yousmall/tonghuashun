@@ -48,7 +48,6 @@ SOURCES = re.compile(r"第\s*([1-9]\d?|[一二三四五六七八九十])\s*(?:�
 CHINESE_NUMBERS = "一二三四五六七八九十"
 SCREEN = re.compile(r"(?:请)?(?:筛选|找出|查找)\s*(?:A股中?\s*)?(?:ROE|净资产收益率)\s*(?:超过|大于|高于)\s*(\d{1,3}(?:\.\d{1,2})?)\s*[%％]\s*(?:的)?\s*非\s*ST\s*股票[。？！?!]?", re.I)
 HISTORY_REQUEST = re.compile(r"历史|季度|中报|半年报|一季报|三季报|20\d{2}年?\d{1,2}月|20\d{2}[-/]\d{2}|近[一二三四五六七八九十\d]+(?:年|月|日|天)|截至|当时|去年|上年|20\d{2}\s*年")
-RISK_NOTICE = "此回答整理已核验的资料，不能代替投资决策。"
 
 
 @dataclass(frozen=True)
@@ -203,7 +202,7 @@ def _answer(intent, conclusion, *, rows=(), missing=(), conflicts=(), source=Fal
         evidence=[f.fact_id for f in rows], answer_fact_ids=[] if source else [f.fact_id for f in rows],
         source_reference=rows[0].fact_id if source and rows else None,
         snapshot_time=max((f.snapshot_time for f in rows), default=None),
-        compliance=ComplianceResult(status=status, reason="已核对客观资料范围。", risk_notice=RISK_NOTICE),
+        compliance=ComplianceResult(status=status, reason="已核对客观资料范围。"),
         task_plan=TaskPlan(trace_id=trace_id, intent=intent),
         cross_validation=CrossValidationResult(status=status, issues=issues),
     )
@@ -386,6 +385,10 @@ async def _announcement(request, pipeline, symbol):
 async def run_automatic(request, pipeline, instant, understanding, *, history=None, progress_sink=None):
     if (understanding.risk_rules or understanding.reason == "请求不在只读研究范围内"
             or understanding.intent is Intent.EDUCATION or not assessment_is_current(request.profile)):
+        prepared, audit, advice = await instant.run(request, understanding, progress_sink=progress_sink)
+        return prepared, audit, advice, understanding
+
+    if request.comparison_targets:
         prepared, audit, advice = await instant.run(request, understanding, progress_sink=progress_sink)
         return prepared, audit, advice, understanding
 

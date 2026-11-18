@@ -10,7 +10,7 @@ from datetime import date, datetime
 from time import perf_counter
 from uuid import uuid4
 
-from backend.app.agents.coordinator import RISK_NOTICE, CoordinatorAgent, cross_validate_results
+from backend.app.agents.coordinator import CoordinatorAgent, cross_validate_results
 from backend.app.fact_taxonomy import NEWS_FIELDS, fact_is_current
 from backend.app.models import (
     AgentResult, ComplianceStatus, DataAcquisitionResult, FactRecord,
@@ -476,7 +476,7 @@ class StockRecommendationService:
         entry.status, entry.score, entry.confidence = "recommended", security.score, advice.confidence
         entry.reasons = [fit_reason, security.opinion]
         entry.reasons.extend(entry.personal_fit.get("reasons", []))
-        entry.risks = list(dict.fromkeys([*advice.risks, "历史回撤不代表未来最大亏损，短期价格仍可能波动。", RISK_NOTICE]))
+        entry.risks = list(dict.fromkeys([*advice.risks, "历史回撤不代表未来最大亏损，短期价格仍可能波动。"]))
         if entry.personal_fit.get("cost_scenario"):
             entry.risks.append("计划交易的费用情景门槛为" + format(entry.personal_fit["cost_scenario"]["break_even_return"],".2%") + "；不代表能取得对应收益。")
         entry.evidence = sorted(set(entry.evidence + advice.evidence + fit_ids))

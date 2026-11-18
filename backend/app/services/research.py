@@ -134,6 +134,11 @@ class AutomatedResearchPipeline:
         topical news retain the user's conditions; macro calls use macro scope.
         """
 
+        if intent is Intent.PORTFOLIO_REVIEW and request.portfolio:
+            # 已提交持仓是本次口径，去掉早先的权重和行业统计。
+            current_facts = [fact for fact in request.facts
+                             if fact.field.casefold() not in {"weight", "portfolio_weight", "sector_weight"}]
+            request = request.model_copy(update={"facts": current_facts})
         supplied = [fact.model_copy(deep=True) for fact in request.facts]
         portfolio_facts = self._portfolio_facts(request)
         base_facts = _merge_by_fact_id([*supplied, *portfolio_facts])
@@ -497,15 +502,16 @@ class AutomatedResearchPipeline:
             for fact in request.facts
             if fact.field.casefold() in {"weight", "portfolio_weight"}
         }
-        for index, holding in enumerate(request.portfolio, start=1):
-            if not isinstance(holding, dict):
-                continue
+        positions: dict[str, tuple[str, list[float]]] = {}
+        for holding in request.portfolio:
             entity = _holding_entity(holding)
             weight = _number(holding.get("weight"))
-            if not entity or weight is None or not 0 <= weight <= 1:
+            if entity and weight is not None and 0 <= weight <= 1:
+                positions.setdefault(entity.casefold(), (entity, []))[1].append(weight)
+        for index, (key, (entity, entries)) in enumerate(positions.items(), start=1):
+            if (key, "weight") in existing:
                 continue
-            if (entity.casefold(), "weight") in existing:
-                continue
+            weight = math.fsum(entries)
             stable_id = uuid5(NAMESPACE_URL, f"portfolio:{request.profile.user_id}:{index}:{entity}:{weight}")
             facts.append(
                 FactRecord(

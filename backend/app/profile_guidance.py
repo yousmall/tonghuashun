@@ -123,7 +123,7 @@ def build_profile_guidance(answers: dict[str, str], values: dict[str, Any]) -> d
         stress.append({"name": name, "assumptions": dict(zip(ASSET_CLASSES, shocks, strict=True)),
                        "estimated_loss": loss, "exceeds_tolerance": drawdown is not None and loss > drawdown + 1e-8})
     if any(s["exceeds_tolerance"] for s in stress):
-        warnings.append("配置参考在较大跌幅假设下仍可能超过您的回撤边界；请降低风险暴露或复核目标，情景测算不是损失上限保证。")
+        warnings.append("配置参考在较大跌幅假设下仍可能超过您的回撤边界；请降低风险暴露或复核目标。")
     groups = (
         ("财务承受能力", capacity, ("q01", "q02", "q03", "q04", "q19", "q20", "q21", "q22", "q23")),
         ("风险意愿与回撤边界", f"损失偏好：{values['loss_tolerance_label']}；回撤选择：{labels['q26']}", ("q13", "q14", "q15", "q26")),

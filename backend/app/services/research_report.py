@@ -15,6 +15,7 @@ from backend.app.models.research_report import (
     ResearchReport,
     ResearchSection,
 )
+from backend.app.answer_text import clean_answer_text
 from backend.app.services.local_consultation import observation_value, observation_unit
 
 DIMENSIONS = (
@@ -263,12 +264,13 @@ def research_report_markdown(report: ResearchReport, *, question: str | None = N
     if report.targets:
         lines.append(f"- 研究对象：{'、'.join(report.targets)}")
     lines.append(f"- 审核状态：{ {'reviewed': '已核验', 'needs_review': '待复核', 'limited': '范围受限'}.get(report.status, report.status) }")
-    lines.extend(["", "## 一、结论", "", report.conclusion or "资料不足，暂未形成结论。"])
+    lines.extend(["", "## 一、结论", "", clean_answer_text(report.conclusion) or "资料不足，暂未形成结论。"])
     if report.key_findings:
         lines.extend(["", "## 二、关键信息", ""])
         for finding in report.key_findings:
             stance = {"favorable": "有利", "caution": "不利", "neutral": "中性/待核实"}[finding.stance]
-            lines.append(f"- **[{stance}] {finding.title}**：{finding.detail}")
+            if detail := clean_answer_text(finding.detail):
+                lines.append(f"- **[{stance}] {finding.title}**：{detail}")
     if report.coverage.cited:
         coverage = report.coverage
         lines.extend([
@@ -286,18 +288,17 @@ def research_report_markdown(report: ResearchReport, *, question: str | None = N
                 stance = {"favorable": "有利", "caution": "不利", "neutral": "中性"}[item.stance]
                 period = item.period or "统计期未注明"
                 lines.append(f"- [{stance}] {item.observation}（{period}）")
-                lines.append(f"  - 解读：{item.interpretation}")
+                if interpretation := clean_answer_text(item.interpretation):
+                    lines.append(f"  - 解读：{interpretation}")
                 source = item.source_url or item.source
                 lines.append(f"  - 来源：{source}")
-            for limitation in section.limitations:
-                lines.append(f"- 判断限制：{limitation}")
-            for condition in section.change_conditions:
-                lines.append(f"- 重新评估条件：{condition}")
+            lines.extend(f"- 判断限制：{text}" for value in section.limitations if (text := clean_answer_text(value)))
+            lines.extend(f"- 重新评估条件：{text}" for value in section.change_conditions if (text := clean_answer_text(value)))
             lines.append("")
     if report.limitations:
         lines.extend(["## 五、报告限制", ""])
-        lines.extend(f"- {item}" for item in report.limitations)
-    lines.extend(["", "---", report.method, "本报告由已引用资料整理，仅供研究参考，不构成投资建议。"])
+        lines.extend(f"- {text}" for value in report.limitations if (text := clean_answer_text(value)))
+    lines.extend(["", "---", clean_answer_text(report.method)])
     return "\n".join(lines)
 
 

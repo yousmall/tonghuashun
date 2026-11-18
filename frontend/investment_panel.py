@@ -1,6 +1,8 @@
 """收益情景、仓位区间的统一展示，供回答、历史详情与导出复用。"""
 from __future__ import annotations
 
+from backend.app.answer_text import clean_answer_text
+
 import math
 from typing import Any
 
@@ -87,8 +89,8 @@ def investment_summary(advice: dict) -> list[tuple[str, list[str]]]:
     positions = positions or ["暂不提供仓位建议。" if blocked else "本次未形成仓位区间；可在持仓分析中提交持仓并核对风险评估。"]
     if allocations:
         positions.append("各区间不应直接相加；选定比例合计应为 100%，并复核期限、流动性及集中度约束。")
-        positions.append("资产类别目标区间仅供研究参考；不构成具体标的买卖或自动交易指令。")
-    return [("收益预期", returns), ("仓位建议", positions)]
+    return [("收益预期", [text for value in returns if (text := clean_answer_text(value))]),
+            ("仓位建议", positions)]
 
 
 def render_investment_panel(advice: dict, *, key: str, compact: bool = False) -> None:
@@ -96,7 +98,8 @@ def render_investment_panel(advice: dict, *, key: str, compact: bool = False) ->
     if compact:
         for title, texts in sections:
             st.markdown(f"**{title}**")
-            st.write(texts[0])
+            if texts:
+                st.write(texts[0])
         return
     returns = return_scenario_rows(advice)
     positions = allocation_rows(advice)

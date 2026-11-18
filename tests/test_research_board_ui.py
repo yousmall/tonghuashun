@@ -41,7 +41,9 @@ class ImmediateExecutor:
         return future
 ui.init_session()
 st.session_state.auth_token='test-only'
-st.session_state.auth_user={'username':'test-only'}
+st.session_state.auth_user={
+    'username': 'test-only', 'role': 'user', 'display_name': '测试账号', 'avatar_data': None,
+}
 st.session_state.profile['confirmed']=True
 st.session_state.profile_restored=True
 st.session_state.setdefault('navigation','投资问答')

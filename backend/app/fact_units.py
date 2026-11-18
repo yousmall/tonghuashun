@@ -1,6 +1,10 @@
 """Explicit percentage units. Raw values remain available for audit."""
 from __future__ import annotations
 
+from calendar import monthrange
+from datetime import date
+import re
+
 from backend.app.numeric import finite_number
 from typing import Any
 from backend.app.fund_fields import FUND_PERCENT_FIELDS
@@ -33,3 +37,26 @@ def percentage_points(value: Any, unit: str | None) -> float | None:
     if unit == "ratio":
         return finite_number(number * 100)
     return number if unit == "percent" else None
+
+
+def period_info(raw):
+    """返回规范标签、截至日、期间类型；不把季度与某个交易日混为一谈。"""
+    value = str(raw or "").strip().upper()
+    if re.fullmatch(r"\d{8}", value):
+        value = f"{value[:4]}-{value[4:6]}-{value[6:]}"
+    quarter = re.fullmatch(r"(\d{4})[- ]?Q([1-4])", value)
+    try:
+        if quarter:
+            year, q = map(int, quarter.groups())
+            month = q * 3
+            return f"{year}Q{q}", date(year, month, monthrange(year, month)[1]), "quarter"
+        if re.fullmatch(r"\d{4}(?:年报)?", value):
+            year = int(value[:4])
+            return f"{year}年报", date(year, 12, 31), "year"
+        if re.fullmatch(r"\d{4}-\d{2}", value):
+            year, month = map(int, value.split("-"))
+            return value, date(year, month, monthrange(year, month)[1]), "month"
+        stamp = date.fromisoformat(value)
+        return stamp.isoformat(), stamp, "date"
+    except ValueError:
+        return None

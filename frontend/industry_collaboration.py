@@ -117,7 +117,7 @@ def render_industry_collaboration(api_base: str, *, ready: bool, submit: Callabl
                 "综合已加载的市场、个股、基金和可转债资料，由市场、行业、证券和基金智能体分别研判，"
                 "汇总行业景气、估值、资金和风险的支持证据、反面证据、观点分歧与待补证事项。"
                 "其他标的只作有依据的关联研究；没有证据时说明无法确认关联。"
-                "既有研究摘要和历史走势仅供参考，结论必须重新引用有效事实，不作收益承诺。"
+                "结论必须重新引用有效事实，既有研究摘要和历史走势用于定位复核线索。"
             )
             submit(api_base, "行业分析", query, collaboration=bundle)
             st.rerun()

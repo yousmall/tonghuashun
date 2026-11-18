@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from html import escape
 from typing import Any
 import streamlit as st
+from backend.app.answer_text import clean_answer_text
 from frontend.answer_visibility import verification_notes, visible_risks, visible_next_steps, visible_risk_conclusion, visible_compliance_reason
 from frontend.investment_panel import render_investment_panel
 
@@ -439,10 +440,9 @@ def _render_conclusion_content(advice: dict[str, Any], *, key: str = "analysis-c
     if advice.get("user_fit"):
         with st.expander("与您的投资偏好是否匹配", icon=":material/person_check:"):
             st.write(plain_language(advice["user_fit"]))
-    if compliance.get("risk_notice"):
-        st.caption(plain_language(compliance["risk_notice"]))
-    for disclosure in compliance.get("required_disclosures", []):
-        st.caption(plain_language(disclosure))
+    for notice in [compliance.get("risk_notice"), *compliance.get("required_disclosures", [])]:
+        if text := plain_language(notice):
+            st.caption(text)
 
 
 def collaboration_rows(advice: dict[str, Any]) -> list[dict[str, str]]:
@@ -604,7 +604,7 @@ def render_profile_summary(profile: dict[str, Any]) -> None:
 
 def plain_language(value: Any) -> str:
     """将服务端文案转换成用户语言，并拦截内部诊断信息。"""
-    text = str(value or "").strip()
+    text = clean_answer_text(str(value or ""))
     # 模型复核说明会保留给后台审计，但不能原样进入浏览器。它可能同时包含
     # 状态枚举、节点字段、事实编号和合规规则代码；逐词替换仍会留下难以理解的
     # 调试式长段落，因此在展示边界统一收口为简短、可行动的业务提示。
@@ -699,7 +699,7 @@ def profile_evidence_language(value: Any) -> str:
         elif field == "target":
             detail = f"投资目标是{raw}"
         elif field == "expected_annual_return":
-            detail = f"期望的年收益约为 {display_value(field, raw)}（不代表保证收益）"
+            detail = f"期望的年收益约为 {display_value(field, raw)}"
         elif field == "investment_experience_years":
             detail = f"投资经验约为 {display_value(field, raw)}"
         elif field in {"constraints", "investment_history", "behavioral_notes"}:

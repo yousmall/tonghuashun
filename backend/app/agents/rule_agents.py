@@ -281,17 +281,67 @@ class PortfolioAgent(BaseAgent):
         selected = _matching_facts(request.facts, self._weight_fields)
         # 持仓快照也可带 weight；转换时没有引用 ID，因此只把它作为辅助风险提示，
         # 不把其数值作为可引用证据写入 AgentResult。
-        fact_weights = [(fact, value) for fact, value in numeric_fact_values(selected)]
+        fact_weights = [(fact, value) for fact, value in numeric_fact_values(selected) if value >= 0]
         if not fact_weights:
             return _degraded(self.agent_id, ["weight 或 portfolio_weight"])
-        total_weight = sum(value for _, value in fact_weights)
-        largest_fact, largest_weight = max(fact_weights, key=lambda item: item[1])
-        concentration_excess = largest_weight > request.profile.single_security_limit
+        # 组合权重与行业权重可能描述同一笔暴露，分开选用。
+        position_weights = [(fact, value) for fact, value in fact_weights if fact.field.casefold() != "sector_weight"]
+        if position_weights:
+            by_entity = {}
+            for fact, value in position_weights:
+                by_entity.setdefault(fact.entity, (fact, value))
+                if fact.field.casefold() == "weight":
+                    by_entity[fact.entity] = (fact, value)
+            fact_weights = list(by_entity.values())
+        ranked = sorted(fact_weights, key=lambda item: item[1], reverse=True)
+        total_weight = math.fsum(value for _, value in ranked)
+        largest_fact, largest_weight = ranked[0]
+        limit = request.profile.single_security_limit
+        over_limit = [(fact, value) for fact, value in ranked if value - limit > 1e-9]
+        at_limit = [fact.entity for fact, value in ranked if math.isclose(value, limit, abs_tol=1e-9)]
+        gap = max(0, 1 - total_weight)
+        concentration_excess = bool(over_limit)
+        is_portfolio = bool(position_weights)
+        if not is_portfolio:
+            opinion = f"最大行业权重为{largest_fact.entity}的{largest_weight:.1%}。补齐各标的权重后，可判断单标的集中度和组合压力。"
+        elif total_weight <= 0 or total_weight > 1 + 1e-9:
+            opinion = f"录入的持仓权重合计为{total_weight:.1%}。请核对比例后重新计算组合集中度和压力情景。"
+        else:
+            top_two = math.fsum(value for _, value in ranked[:2])
+            tied = [fact.entity for fact, value in ranked if math.isclose(value, largest_weight, abs_tol=1e-9)]
+            lead = f"最大持仓占{largest_weight:.1%}"
+            if len(tied) > 1:
+                lead += f"（{'、'.join(tied[:4])}{'等' if len(tied) > 4 else ''}并列）"
+            else:
+                lead += f"（{largest_fact.entity}）"
+            if len(ranked) > 1:
+                lead += f"，前两大合计占{top_two:.1%}"
+            if over_limit:
+                lead += f"。{len(over_limit)}项超过{limit:.1%}的单一标的上限，"
+                lead += f"优先复核{largest_fact.entity}，其比例高出上限{(largest_weight - limit) * 100:.1f}个百分点。"
+            elif at_limit:
+                lead += f"。其中{len(at_limit)}项已触及{limit:.1%}的单一标的上限，权重继续上升时需复核。"
+            else:
+                lead += f"。已录入的持仓均在{limit:.1%}的单一标的上限以内。"
+            if gap > 1e-9:
+                lead += f" 另有{gap:.1%}的组合权重尚未录入，补齐后可复核整体配置。"
+            shock = request.portfolio_stress_percent or 10
+            loss = total_weight * shock / 100
+            scenario = f"假设已录入持仓同步下跌{shock}%，其对组合资产的影响约为-{loss:.1%}。"
+            boundary = request.profile.max_drawdown
+            if boundary is not None:
+                if loss - boundary > 1e-9:
+                    scenario += f"这部分损失比您设定的{boundary:.1%}回撤边界高{(loss - boundary) * 100:.1f}个百分点。"
+                elif math.isclose(loss, boundary, abs_tol=1e-9):
+                    scenario += f"这部分损失触及您设定的{boundary:.1%}回撤边界。"
+                else:
+                    scenario += f"这部分损失低于您设定的{boundary:.1%}回撤边界。"
+            opinion = lead + "\n\n" + scenario
         fact_ids, citations = evidence_metadata(fact for fact, _ in fact_weights)
         risk_flags = list(request.profile.financial_warnings)
         if concentration_excess:
             risk_flags.append("单标的集中度超限")
-        if total_weight > 1.05:
+        if is_portfolio and total_weight > 1 + 1e-9:
             risk_flags.append("持仓权重和超过 100%，请检查口径")
         target_range = "以较高流动性和较低波动资产为主" if (
             request.profile.liquidity_need == "高"
@@ -302,7 +352,7 @@ class PortfolioAgent(BaseAgent):
         return AgentResult(
             agent_id=self.agent_id,
             status=TaskStatus.COMPLETED,
-            opinion="组合已完成规则型集中度诊断；调整应分批执行并在新快照下复核。",
+            opinion=opinion,
             score=clamp_score((1 - min(largest_weight / request.profile.single_security_limit, 2) / 2) * 100),
             confidence=round(sum(fact.quality for fact, _ in fact_weights) / len(fact_weights), 2),
             facts_used=fact_ids,

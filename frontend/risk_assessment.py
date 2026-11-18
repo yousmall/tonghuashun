@@ -39,7 +39,7 @@ def _matching_rules() -> None:
         "风险承受能力等级": [f"C{i}（{name}）" for i, name in enumerate(RISK_NAMES, 1)],
         "匹配的产品或服务等级": ["、".join(f"R{j}" for j in range(i, 0, -1)) for i in range(1, 6)],
     })
-    st.caption("投资品种和投资期限还应分别匹配，风险等级匹配不代表保证收益。")
+    st.caption("请分别核对投资品种与期限是否符合测评结果。")
     if st.button("关闭", width="stretch"):
         st.rerun()
 
@@ -71,7 +71,7 @@ def result_html(profile: dict, user: dict | None = None) -> str:
     </section>"""
 
 
-def render_risk_assessment(api_base: str, *, api_request: Callable) -> None:
+def render_risk_assessment(api_base: str, *, api_request: Callable) -> st.delta_generator.DeltaGenerator:
     current = st.session_state.profile
     is_new = current.get("questionnaire_version") == QUESTIONNAIRE_VERSION
     first_missing = next((i for i, q in enumerate(QUESTIONS) if q.id not in (current.get("risk_answers") or {})), 0)
@@ -85,6 +85,7 @@ def render_risk_assessment(api_base: str, *, api_request: Callable) -> None:
     with st.container(border=True, key="risk-assessment-box"):
         st.html('<div class="risk-box-heading">风险评估</div>')
         if st.session_state.risk_assessment_editing:
+            portrait_slot = st.container()
             if not is_new and current.get("risk_answers"):
                 st.caption("问卷已增加财务规划补充题，原有答案已保留，请补答后核对并保存。")
             index = max(0, min(len(QUESTIONS) - 1, st.session_state.risk_assessment_index))
@@ -134,10 +135,11 @@ def render_risk_assessment(api_base: str, *, api_request: Callable) -> None:
                                 st.session_state.risk_assessment_editing = False
                                 st.rerun()
             st.caption(SCORING_NOTICE)
-            return
+            return portrait_slot
 
         st.html(result_html(current, st.session_state.get("auth_user")))
         _render_guidance(current)
+        portrait_slot = st.container()
         if st.button("查看投资者分类标准及适当性匹配规则 ›", key="risk_matching_rules", width="stretch"):
             _matching_rules()
         draft = st.session_state.get("profile_draft")
@@ -154,6 +156,7 @@ def render_risk_assessment(api_base: str, *, api_request: Callable) -> None:
             if not assessment_is_current(current):
                 st.warning("风险测评已过期，请重新测评后再开始个性化分析。")
             st.button("重新评估", key="risk_retake", type="primary", width="stretch", on_click=_start_assessment)
+        return portrait_slot
 
 
 def _render_guidance(profile: dict) -> None:

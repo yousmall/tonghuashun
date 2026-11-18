@@ -149,6 +149,9 @@ def enrich_results(results, facts, query):
     enriched = []
     for result in results:
         role = result.agent_id
+        if role == "portfolio":
+            enriched.append(result)
+            continue
         required = AGENT_FIELDS.get(role, ())
         allowed = (RAW_FIELDS[role] | set(required) | {"net_profit_growth", "yield_to_maturity"}
                    | ({"capital_flow", "turnover_value", "pe_ttm", "pb"} if role == "industry" else set()))
@@ -219,7 +222,8 @@ class InstantResearchService(LocalConsultationService):
             "next_steps": (research_next_steps(advice.agent_results) + ["补齐资料后重新研判；需要在线补取与多轮分析时，可在后台生成完整报告"]
                            if scope == "evidence_review" else advice.next_steps),
             "compliance": advice.compliance.model_copy(update={
-                "reason": advice.compliance.reason.replace("精简咨询", "证据研判").replace("精简范围", "本地证据范围"),
+                "reason": advice.compliance.reason.replace("精简咨询", "证据研判").replace("精简范围", "本地证据范围")
+                if advice.compliance.reason else None,
             }),
         })
         return prepared, acquisition, advice

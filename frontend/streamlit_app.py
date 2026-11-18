@@ -33,7 +33,7 @@ import httpx
 import streamlit as st
 from frontend.charts import render_bar, render_chart
 from frontend.risk_assessment import render_risk_assessment
-from frontend.user_settings import avatar_uri, display_name, render_user_settings
+from frontend.user_settings import account_session_data, avatar_uri, display_name, render_user_settings
 from backend.app.risk_questionnaire import assessment_is_current
 from backend.app.services.context_compression import client_context_messages
 from frontend.conversation_logic import render_conversation_logic_chain, render_single_answer_chain
@@ -539,6 +539,8 @@ def format_api_error(detail: Any) -> str:
         "confirmation": "确认密码",
         "query": "问题",
         "profile": "投资画像",
+        "display_name": "展示名称",
+        "avatar_data": "头像",
     }
     messages: list[str] = []
     for error in detail:
@@ -550,7 +552,9 @@ def format_api_error(detail: Any) -> str:
         error_type = str(error.get("type", ""))
         context = error.get("ctx") or {}
 
-        if error_type == "missing":
+        if field == "avatar_data" and error_type == "value_error":
+            message = "请上传不超过 2 MB、边长不超过 4096 像素的 PNG、JPG 或 WebP 图片。"
+        elif error_type == "missing":
             message = f"请填写{label}。"
         elif error_type == "string_too_short":
             minimum = context.get("min_length")
@@ -688,7 +692,8 @@ def consultation_facts(api_base: str, direction: str | None) -> list[dict]:
     return list(facts.values())
 
 
-def run_analysis(api_base: str, query: str) -> dict[str, Any] | None:
+def run_analysis(api_base: str, query: str, *, comparison_targets: list[str] | None = None,
+                 comparison_facts: list[dict] | None = None) -> dict[str, Any] | None:
     """携带最近多轮上下文调用统一分析端点，并更新会话历史。"""
     if not profile_ready():
         st.warning("请先在“风险评估”中完成问卷并确认结果，再开始分析。")
@@ -701,7 +706,8 @@ def run_analysis(api_base: str, query: str) -> dict[str, Any] | None:
         "query": query,
         "research_target": selected_research_target(st.session_state.get("active_research_direction")),
         "profile": st.session_state.profile,
-        "facts": consultation_facts(api_base, st.session_state.get("active_research_direction")),
+        "facts": (comparison_facts if comparison_targets else
+                  consultation_facts(api_base, st.session_state.get("active_research_direction"))),
         "auto_fetch": True,
         "research_mode": st.session_state.get("research_mode", "instant"),
         "portfolio": st.session_state.portfolio,
@@ -710,6 +716,13 @@ def run_analysis(api_base: str, query: str) -> dict[str, Any] | None:
         "use_conversation_history": True,
         "context_messages": client_context_messages([*st.session_state.conversation, user_turn]),
     }
+    if comparison_targets:
+        direction = st.session_state.get("active_research_direction")
+        payload.update(comparison_targets=comparison_targets, research_direction=direction,
+                       research_target=None, research_mode="instant", auto_fetch=False, portfolio=[])
+    elif st.session_state.get("active_research_direction") == "持仓分析" and query == "请诊断我的持仓组合":
+        payload.update(portfolio_stress_percent=st.session_state.get("portfolio_stress_shock", 10),
+                       research_mode="instant", auto_fetch=False)
     advice = stream_analysis(api_base, payload)
     if advice:
         advice.setdefault("facts", [dict(fact) for fact in st.session_state.facts])
@@ -1316,7 +1329,6 @@ def render_research_page(api_base: str, direction: str, *, collaboration: bool =
         st.rerun()
     if direction in st.session_state.get("analysis_jobs", {}):
         st.info("正在后台核对资料与风险。您可以切换页面，完成后会自动显示结果。")
-    st.html("<div class='legal-strip'>分析仅供参考，不保证收益。投资前，请结合自己的情况判断。</div>")
     restore_board_scroll(direction, has_conversation=bool(st.session_state.conversation))
 
 
@@ -1441,11 +1453,13 @@ def render_materials_body(api_base: str) -> None:
 
 def page_profile(api_base: str) -> None:
     """保留风险问卷，支持从股票交易记录补充行为画像。"""
-    from frontend.trade_profile import render_trade_profile
+    from frontend.trade_profile import render_trade_portrait, render_trade_profile
     render_page_header("风险评估")
     st.title("风险评估")
-    render_risk_assessment(api_base, api_request=api_request)
-    render_trade_profile(api_base, api_request=api_request)
+    portrait_slot = render_risk_assessment(api_base, api_request=api_request)
+    draft = render_trade_profile(api_base, api_request=api_request)
+    with portrait_slot:
+        render_trade_portrait(st.session_state.profile, draft=draft)
 
 
 def page_planning(api_base: str) -> None:
@@ -1695,14 +1709,16 @@ def portfolio_risk_snapshot(
 ) -> dict[str, Any]:
     """按用户填写权重生成可复算的集中度摘要，不作涨跌预测。"""
 
-    holdings = [
-        {"name": str(item.get("name", "—")), "weight": max(0.0, float(item.get("weight", 0)))}
-        for item in portfolio
-    ]
+    by_name = {}
+    for item in portfolio:
+        name = str(item.get("name", "—")).strip()
+        holding = by_name.setdefault(name.casefold(), {"name": name, "weight": 0.0})
+        holding["weight"] += max(0.0, float(item.get("weight", 0)))
+    holdings = list(by_name.values())
     weights = sorted((item["weight"] for item in holdings), reverse=True)
-    total = sum(weights)
+    total = math.fsum(weights)
     limit = float(profile.get("single_security_limit") or 0.20)
-    over_limit = [item["name"] for item in holdings if item["weight"] > limit]
+    over_limit = [item["name"] for item in holdings if item["weight"] - limit > 1e-9]
     return {
         "holdings": holdings,
         "total": total,
@@ -1721,11 +1737,8 @@ def render_portfolio_risk_dashboard(portfolio: list[dict[str, Any]]) -> None:
 
     snapshot = portfolio_risk_snapshot(portfolio, st.session_state.profile)
     st.subheader("持仓风险驾驶舱")
-    if snapshot["holdings"] and snapshot["total"] <= 1.0:
-        combined: dict[str, float] = {}
-        for item in snapshot["holdings"]:
-            combined[item["name"]] = combined.get(item["name"], 0.0) + item["weight"]
-        ranked = sorted(((name, weight) for name, weight in combined.items() if weight > 0),
+    if snapshot["holdings"] and snapshot["total"] <= 1 + 1e-9:
+        ranked = sorted(((item["name"], item["weight"]) for item in snapshot["holdings"] if item["weight"] > 0),
                         key=lambda item: item[1], reverse=True)
         slices = [{"项目": f"持仓 · {name}", "占比": weight} for name, weight in ranked[:5] if weight > 0]
         if len(ranked) > 5:
@@ -1753,7 +1766,7 @@ def render_portfolio_risk_dashboard(portfolio: list[dict[str, Any]]) -> None:
                 .properties(height=230)
             )
             render_chart(donut, width="stretch")
-    elif snapshot["total"] > 1.0:
+    elif snapshot["total"] > 1 + 1e-9:
         st.info("持仓占比超过 100%，请修正比例后查看构成图。")
     render_stat_cards(
         [
@@ -1780,10 +1793,14 @@ def render_portfolio_risk_dashboard(portfolio: list[dict[str, Any]]) -> None:
             value=10,
             format="%d%%",
             key="portfolio_stress_shock",
+            on_change=clear_portfolio_analysis,
         )
-        estimated_loss = snapshot["total"] * shock / 100
-        st.metric("组合资产估算变化", f"-{estimated_loss:.1%}", border=True)
-        st.caption("按所有持仓同比例变动机械计算，仅用于压力测试，不是价格预测。")
+        if 0 < snapshot["total"] <= 1 + 1e-9:
+            estimated_loss = snapshot["total"] * shock / 100
+            st.metric("组合资产估算变化", f"-{estimated_loss:.1%}", border=True)
+            st.caption("估算变化按已录入持仓占比乘以所选跌幅计算。")
+        else:
+            st.caption("请先核对持仓权重，再计算组合变化。")
         if snapshot["over_limit"]:
             st.warning("超过单标的上限：" + "、".join(snapshot["over_limit"]))
 
@@ -1791,19 +1808,24 @@ def render_portfolio_risk_dashboard(portfolio: list[dict[str, Any]]) -> None:
 def portfolio_stat_cards(portfolio: list[dict[str, Any]]) -> list[tuple[str, str, str]]:
     """持仓概览：条数、合计占比与集中度，都是前端可复算的展示口径。"""
 
-    total = sum(float(item.get("weight", 0)) for item in portfolio)
-    largest = max(portfolio, key=lambda item: float(item.get("weight", 0)))
-    limit = st.session_state.profile.get("single_security_limit") or 0.20
+    snapshot = portfolio_risk_snapshot(portfolio, st.session_state.profile)
+    total = snapshot["total"]
+    holdings = snapshot["holdings"]
+    largest = max(holdings, key=lambda item: item["weight"])
+    limit = snapshot["single_limit"]
     cards = [
-        ("持仓数量", f"{len(portfolio)}", "已加入组合的标的"),
-        ("占比合计", f"{total:.0%}", "超过 100% 需要检查" if total > 1 else "在合理范围内"),
-        ("第一大持仓", f"{float(largest.get('weight', 0)):.0%}",
-         f"{largest.get('name', '—')} · 单标的上限 {float(limit):.0%}"),
+        ("持仓数量", f"{len(holdings)}", "已加入组合的标的"),
+        ("占比合计", f"{total:.0%}", "超过 100% 需要检查" if total > 1 + 1e-9 else "在合理范围内"),
+        ("第一大持仓", f"{largest['weight']:.0%}", f"{largest['name']} · 单标的上限 {limit:.0%}"),
     ]
-    over = [str(item["name"]) for item in portfolio if float(item.get("weight", 0)) > float(limit)]
+    over = snapshot["over_limit"]
     if over:
         cards.append(("超过单标的上限", str(len(over)), "、".join(over)[:18]))
     return cards
+
+
+def clear_portfolio_analysis() -> None:
+    st.session_state.pop("portfolio_advice", None)
 
 
 def page_portfolio(api_base: str) -> None:
@@ -1842,8 +1864,8 @@ def page_portfolio(api_base: str) -> None:
             width="stretch",
             hide_index=True,
         )
-        total = sum(item["weight"] for item in st.session_state.portfolio)
-        if total > 1.0:
+        total = math.fsum(item["weight"] for item in st.session_state.portfolio)
+        if total > 1 + 1e-9:
             st.warning("持仓占比超过 100%，请检查填写的比例。")
         render_portfolio_risk_dashboard(st.session_state.portfolio)
     else:
@@ -2055,7 +2077,7 @@ def complete_login(result: dict[str, Any]) -> None:
     账号归属由后端根据令牌判定，前端不保存、也不展示用户标识。
     """
 
-    identity = {"username": result["user"]["username"], "role": result["user"].get("role", "user")}
+    identity = account_session_data(result["user"])
     if (st.session_state.get("auth_token") == result["access_token"]
             and st.session_state.get("session_beacon_token") == result["session_beacon_token"]
             and st.session_state.get("auth_user") == identity):
@@ -2181,15 +2203,15 @@ def main() -> None:
         return
     login_screen.empty()
     api_base = st.session_state.api_base
-    # 登录响应已经保存了展示所需的账号信息；普通组件交互无需每次重跑都再查
-    # 一遍数据库。旧会话缺少该字段时才补查，令牌有效性仍由下方定时片段校验。
-    if not st.session_state.get("auth_user"):
+    # 补齐此前只保存了用户名与角色的会话。新登录直接复用返回的资料。
+    account = st.session_state.get("auth_user") or {}
+    if not {"display_name", "avatar_data"} <= account.keys():
         current_user = api_request(api_base, "GET", "/auth/me")
-        if current_user is None:
+        if not isinstance(current_user, dict) or not current_user.get("username"):
             # 会话失效或后端不可用时保留侧栏，避免整页空白无从操作。
             _render_service_unavailable(api_base)
             return
-        st.session_state.auth_user = current_user
+        st.session_state.auth_user = account_session_data(current_user)
     register_browser_session(api_base)
     enforce_session_timeout(api_base)
     if st.session_state.get("service_unavailable", False):

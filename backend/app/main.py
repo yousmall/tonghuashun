@@ -29,6 +29,7 @@ from backend.app.services.rag import configured_store, DocumentUpload, SearchReq
 from backend.app.services.history import cited_facts_of
 from backend.app.services.model_telemetry import analysis_telemetry, summarize_costs
 from backend.app.services.local_consultation import LocalConsultationService, select_scope
+from backend.app.answer_text import clean_advice
 from backend.app.services.instant_research import InstantResearchService
 from backend.app.services.trend_analytics import analyze_trend
 from backend.app.services.technical_indicators import history_bars
@@ -1366,9 +1367,12 @@ async def _analyze_portfolio(
             except (DatabaseUnavailable, SQLAlchemyError, TimeoutError):
                 context_history_status = "unavailable"
         request = prepare_request_context(request, history=history_context, history_status=context_history_status)
-        report("选择精简范围" if request.research_mode in {"lite", "instant"} else "理解问题")
+        scope_stage = "选择精简范围" if request.research_mode in {"lite", "instant"} else "理解问题"
+        report("准备行业协同" if request.industry_collaboration else scope_stage)
         prefetch_key: tuple[Intent, str] | None = None
-        if request.research_mode in {"lite", "instant", "auto"}:
+        if request.industry_collaboration:
+            understanding = await coordinator.understand_request(request)
+        elif request.research_mode in {"lite", "instant", "auto"}:
             understanding = select_scope(request)
         elif _is_profile_stock_recommendation(request):
             # 按钮发出的固定任务无需自由问句识别，候选及最终结论仍走完整核验。
@@ -1506,9 +1510,10 @@ async def _analyze_portfolio(
                 "reason_code": "PROVIDER_QUOTA_EXHAUSTED",
                 "message": (acquisition.message or "") + f" {label}查询额度已用完，缺失资料仍需在额度恢复后复核。",
             })
-        if request.research_mode not in {"lite", "instant", "auto"} and llm_enabled and advice.agent_results and not any(
-            (result.details or {}).get("engine") == "third_party_llm" for result in advice.agent_results
-        ):
+        if (request.research_mode not in {"lite", "instant", "auto"} and (llm_enabled or request.industry_collaboration)
+                and advice.agent_results and not any(
+                    (result.details or {}).get("engine") == "third_party_llm" for result in advice.agent_results
+                )):
             acquisition = acquisition.model_copy(update={"reason_code": "MODEL_UNAVAILABLE"})
         completed_advice = advice.model_copy(
             update={
@@ -1525,7 +1530,7 @@ async def _analyze_portfolio(
             }
         )
         from backend.app.services.research_report import attach_research_report
-        completed_advice = attach_research_report(completed_advice)
+        completed_advice = attach_research_report(clean_advice(completed_advice))
         completed_scope = completed_advice.response_scope
         if user and persist_history and not (request.preview_only and request.research_mode in {"lite", "instant"}):
             report("排入历史记录" if request.research_mode in {"lite", "instant"} else "保存对话")
@@ -1675,7 +1680,7 @@ async def open_prepared_stock_report(request: PreparedResearchRequest, user: dic
                     "generation_timings_ms": original.timings_ms, "generation_model_calls": original.model_calls,
                     "generation_model_cost": original.model_cost, "reused": True}})
             from backend.app.services.research_report import attach_research_report
-            delivered = attach_research_report(delivered)
+            delivered = attach_research_report(clean_advice(delivered))
             delivered.timings_ms = {"核对已审核报告": round((perf_counter()-started)*1000, 2)}
             payload = delivered.model_dump(mode="json")
             await asyncio.wrap_future(session_thread_pool.submit(str(user["_session_id"]), database.save_exchange,

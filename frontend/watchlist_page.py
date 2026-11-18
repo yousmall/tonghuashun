@@ -149,7 +149,7 @@ def _comparison_result(api_base, actions):
         st.warning("未取得足够的可核对指标，暂不生成比较结论。")
         return
     st.dataframe(rows, hide_index=True, width="stretch", key="comparison_matrix")
-    st.caption("优先选择各标的共有的最新期间；期间、单位不一致或缺失的指标明确标为不可直接比较。表格不代表买卖建议。")
+    st.caption("优先选择各标的共有的最新期间；期间、单位不一致或缺失的指标明确标为不可直接比较。")
     render_decision(result.get("decision"), key="watchlist")
     eligible = [row for row in rows if row["可比性"] == "同期间、同单位"]
     facts = [fact for item in items for fact in item.get("facts", [])]
@@ -168,7 +168,10 @@ def _comparison_result(api_base, actions):
             tooltip=[alt.Tooltip("name:N", title="标的"), alt.Tooltip("value:Q", title="数值", format=",.4f")]).properties(height=240), width="stretch", key="comparison_chart")
     if not eligible:
         st.warning("目前没有所有标的共有的同期间指标，需补齐资料后再比较。")
-    if st.button("解读这组对比", type="primary", key="interpret_comparison", disabled=not eligible or result.get("refreshing", False) or not actions["ready"]()):
+    targets = [item.get("entity_code") or item.get("entity") or item["target"] for item in items]
+    distinct_targets = len({target.casefold() for target in targets}) == len(targets)
+    if st.button("解读这组对比", type="primary", key="interpret_comparison",
+                 disabled=not eligible or not distinct_targets or result.get("refreshing", False) or not actions["ready"]()):
         prefix = WATCHLIST_RESEARCH_PREFIX[request["asset_type"]]
         direction = next(kind for kind, value in RESEARCH_PREFIX.items() if value == prefix)
         actions["activate"](direction)
@@ -176,7 +179,11 @@ def _comparison_result(api_base, actions):
         for fact in facts:
             actions["add_fact"](fact)
         names = "、".join(item["target"] + ("（" + item["entity_code"] + "）" if item.get("entity_code") else "") for item in items)
-        advice = actions["analysis"](api_base, f"{prefix}请横向比较{names}，仅使用同期间、同单位指标解释特点与风险，明确说明缺失和不可直接比较的指标")
+        advice = actions["analysis"](
+            api_base, f"{prefix}请横向比较{names}，解读同期间、同单位指标的主要差异与风险",
+            comparison_targets=[item["target"] for item in items],
+            comparison_facts=list({fact["fact_id"]: fact for fact in facts if fact.get("fact_id")}.values()),
+        )
         if advice:
             st.session_state.watchlist_comparison_advice = advice
             actions["save"]()

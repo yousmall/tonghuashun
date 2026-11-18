@@ -212,7 +212,6 @@ def build_answer_pdf(report: dict[str, Any]) -> BytesIO:
             story.append(paragraph(text, small))
             if row.get('原文'):
                 story.append(paragraph('原文：' + row['原文'], small))
-    story.append(paragraph('分析仅供参考，不保证收益。投资前，请结合自己的情况判断。', small))
     buffer = BytesIO()
     document = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=54, leftMargin=54, topMargin=42, bottomMargin=46,
                                  title='问策智投投资研究回答', author='问策智投')
@@ -220,7 +219,7 @@ def build_answer_pdf(report: dict[str, Any]) -> BytesIO:
         canvas.saveState()
         canvas.setFont(name, 8)
         canvas.setFillColor(colors.HexColor('#526b7c'))
-        canvas.drawString(54, 24, '问策智投 · 投资研究 · 仅供参考')
+        canvas.drawString(54, 24, '问策智投 · 投资研究')
         canvas.drawRightString(A4[0]-54, 24, f'第 {doc.page} 页')
         canvas.restoreState()
     document.build(story, onFirstPage=footer, onLaterPages=footer)

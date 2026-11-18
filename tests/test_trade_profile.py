@@ -261,9 +261,8 @@ def fake_api(base, method, path, payload=None, **kwargs):
     analysis['confirmed'] = True
     st.session_state.did_save = True
     return dict(st.session_state.profile, trading_analysis=analysis, version=2)
-with patch('frontend.trade_profile.st.file_uploader', return_value=file):
-    from frontend.trade_profile import render_trade_profile
-    render_trade_profile('http://offline', api_request=fake_api)
+with patch('frontend.trade_profile.st.file_uploader', return_value=file), patch.object(ui, 'api_request', fake_api):
+    ui.page_profile('http://offline')
 '''
     app = AppTest.from_string(script).run(timeout=15)
     assert not app.exception
@@ -272,10 +271,14 @@ with patch('frontend.trade_profile.st.file_uploader', return_value=file):
     assert app.selectbox[0].value == "成交明细"
     next(b for b in app.button if b.label == "分析交易画像").click().run(timeout=15)
     assert not app.exception and app.metric[0].value == "4 笔"
+    assert any("**行为类型**" in item.value for item in app.markdown)
+    assert any("**建议关注的品种**" in item.value for item in app.markdown)
+    assert any(item.value.startswith("待确认") for item in app.caption)
     next(b for b in app.button if b.label == "确认并保存交易画像").click().run(timeout=15)
     assert not app.exception and app.session_state["did_save"]
     assert not app.session_state["profile"]["confirmed"]
     assert app.session_state["profile"]["trading_analysis"]["confirmed"]
+    assert any(item.value.startswith("已保存 ｜ 成交明细") for item in app.caption)
 
 
 def test_page_can_use_file_last_trade_date_as_cutoff():

@@ -409,6 +409,9 @@ class OrchestrationRequest(BaseModel):
     query: str = Field(min_length=1, max_length=20000)
     # 五个研究页显式传入当前入口；未传时保留通用 API 的原有行为。
     research_direction: Literal["市场解读", "行业分析", "个股研究", "基金筛选", "可转债分析"] | None = None
+    # 自选对比页传入数据源核实后的代码或名称，只解读本组快照。
+    comparison_targets: list[str] = Field(default_factory=list, max_length=4)
+    portfolio_stress_percent: int | None = Field(default=None, ge=1, le=30)
     # 页面选择只用于解析“当前标的”；明确提到的证券仍以本次问题为准。
     research_target: str | None = Field(default=None, max_length=60)
     # 行业页显式发起的跨方向协同，沿用深度研究的核验、合规与历史记录。
@@ -456,6 +459,15 @@ class OrchestrationRequest(BaseModel):
         if self.research_mode in {"lite", "instant", "auto"} and len(self.query) > 2000:
             raise ValueError("3秒咨询的问题请控制在2000字以内")
         return self
+
+    @field_validator("comparison_targets")
+    @classmethod
+    def comparison_targets_are_distinct(cls, values: list[str]) -> list[str]:
+        targets = [value.strip() for value in values]
+        if targets and (len(targets) < 2 or any(not target or len(target) > 100 for target in targets)
+                        or len({target.casefold() for target in targets}) != len(targets)):
+            raise ValueError("请选择 2 至 4 个不同的自选标的")
+        return targets
 
     @field_validator("facts")
     @classmethod
