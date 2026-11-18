@@ -106,17 +106,23 @@ def test_page_watchlist_persists_through_api_and_reopens_in_a_new_ui_session(mon
         assert len(saved) == 1 and saved[0]["target"] == code and saved[0]["name"] == name
 
         # 新建页面会话，必须从 API/数据库恢复，而不是沿用前一页面的 Session State。
-        reopened = AppTest.from_function(render_app, args=(client, page, direction, initial_target)).run(timeout=15)
+        other_target = "600036" if direction == "stock" else None
+        reopened = AppTest.from_function(render_app, args=(client, page, direction, other_target)).run(timeout=15)
         assert not reopened.exception
-        assert reopened.selectbox(key=f"board_saved_{direction}").options == [f"{name} · {code}"]
-        next(button for button in reopened.button if button.label == "查看自选信息").click().run(timeout=15)
+        selector = reopened.selectbox(key=f"board_target_{direction}")
+        assert [label for label in selector.options if label.startswith("★")] == [f"★ {name} · {code}"]
+        assert not any("其他方向自选" in label for label in selector.options)
+        assert not any(button.label == "查看自选信息" for button in reopened.button)
+        selector.select_index(selector.options.index(f"★ {name} · {code}")).run(timeout=15)
         assert not reopened.exception and not reopened.error
-        assert reopened.session_state[f"board_target_{direction}"] == code
-        assert reopened.session_state["overview_targets"][-1] == code
+        selected = reopened.session_state[f"board_target_{direction}"]
+        assert selected in (initial_target, code)
+        assert reopened.session_state["overview_targets"][-1] == selected
         next(button for button in reopened.button if button.label == "移除自选").click().run(timeout=15)
         assert not reopened.exception and not reopened.error
         assert [item["id"] for item in database.list_watchlist(int(user["id"]))] == [other["id"]]
         assert not next(button for button in reopened.button if button.label == "加入自选").disabled
+        assert not any(label.startswith("★") for label in reopened.selectbox(key=f"board_target_{direction}").options)
     finally:
         main.app.dependency_overrides.pop(main.customer_user, None)
         client.close()

@@ -13,7 +13,7 @@ from backend.app.models import FactRecord
 from backend.app.models.schemas import DataOverviewRequest, ComparisonRequest
 from backend.app.services.market_overview import fetch_overview
 from backend.app.services.security_names import resolve_security_identity
-from frontend.research_board import format_fact
+from frontend.research_board import DIRECTIONS, format_fact
 
 
 def fact(field="fund_nav", value=1.25, code="510300.SH", name="测试基金A", period="2026-11-13", unit=None):
@@ -202,7 +202,9 @@ def test_every_research_page_can_save_and_reopen_a_verified_target(page, target,
     assert app.session_state["writes"][-1]["asset_type"] == kind
     saved = app.session_state["watchlist"][0]
     assert saved["name"] and saved["target"].split(".")[0] == target.split(".")[0]
-    assert next(button for button in app.button if button.label == "已在自选").disabled
+    assert not next(button for button in app.button if button.label == "移除自选").disabled
+    selector = app.selectbox(key=f"board_target_{DIRECTIONS[page]}")
+    assert sum(target.split(".")[0] in label for label in selector.options) == 1
     app.run(timeout=15)
     assert app.session_state["watchlist"][0] == saved
 
@@ -216,6 +218,26 @@ def test_fund_detail_shows_source_metrics_dates_and_missing_fields():
     assert returns.iloc[0]["数值"] == "3.40%" and returns.iloc[0]["数据日期"] == "2026-11-13"
     assert returns.iloc[1]["数值"] == "—"
     assert app.get("vega_lite_chart")
+
+
+def test_saved_fund_can_be_removed_when_details_are_unavailable():
+    source = board_script().replace(
+        "st.session_state.setdefault('watchlist', [])",
+        "st.session_state.setdefault('watchlist', [{'id': 42, 'target': '510300.SH', 'asset_type': '基金', 'name': '测试基金A'}])",
+    ).replace("def api(base, method, path, payload=None):", """
+data.update(status='unavailable', sections=[])
+def api(base, method, path, payload=None):
+    if method == 'DELETE' and path == '/watchlist/42':
+        st.session_state.writes.append(path)
+        return {'ok': True}""")
+    app = AppTest.from_string(source).run(timeout=15)
+    assert not app.exception
+    selector = app.selectbox(key="board_target_fund")
+    assert [label for label in selector.options if "510300" in label] == ["★ 测试基金A · 510300.SH"]
+    next(button for button in app.button if button.label == "移除自选").click().run(timeout=15)
+    assert not app.exception and app.session_state["watchlist"] == []
+    assert app.session_state["board_target_fund"] == "510300"
+    assert app.session_state["writes"] == ["/watchlist/42"]
 
 
 def test_wrong_fund_code_is_neither_shown_nor_saved():

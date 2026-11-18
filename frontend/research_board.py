@@ -276,58 +276,66 @@ def target_rows(rows, target):
     return rows
 
 
-def _open_saved_target(direction, target):
-    st.session_state[f"board_target_{direction}"] = target
+def _board_watchlist(direction):
+    return [item for item in st.session_state.get("watchlist", []) if item.get("asset_type") == ASSET_TYPES[direction]]
 
 
-def render_saved_watchlist(api_base, direction, api_request):
-    """每个方向只列出本类型自选；查看、移除均不依赖当前行情是否可用。"""
-    if api_request is None:
-        return
-    items = {int(item["id"]): item for item in st.session_state.get("watchlist", [])
-             if item.get("asset_type") == ASSET_TYPES[direction]}
-    with st.expander(f"本页自选 · {len(items)}", expanded=bool(items), icon=":material/star:"):
-        if not st.session_state.get("watchlist_loaded", True):
-            pending = (api_base, "/watchlist") in st.session_state.get("account_prefetch", {})
-            st.caption("正在加载账号自选。" if pending else "账号自选暂未加载，可重试；查询标的信息不受影响。")
-            if not pending and st.button("重试加载自选", key=f"board_saved_retry_{direction}", icon=":material/refresh:"):
-                saved = api_request(api_base, "GET", "/watchlist")
-                if isinstance(saved, list):
-                    from frontend.account_prefetch import discard_account_result
-                    discard_account_result(api_base, "/watchlist")
-                    st.session_state.watchlist = saved
-                    st.session_state.watchlist_loaded = True
-                    st.session_state.pop("watchlist_retry_at", None)
-                    st.rerun()
-        if not items:
-            st.caption("查询名称或代码后点击“加入自选”，关注的标的会保存在当前账号。")
-            return
-        selected_key = f"board_saved_{direction}"
-        if st.session_state.get(selected_key) not in items:
-            st.session_state[selected_key] = next(iter(items))
-        selected_id = st.selectbox(
-            "选择本页自选", list(items), key=selected_key, persist_state="session",
-            format_func=lambda item_id: option_label(items[item_id]["target"],
-                {items[item_id]["target"]: items[item_id].get("name") or items[item_id]["target"]}))
-        selected = items[selected_id]
-        with st.container(horizontal=True):
-            st.button("查看自选信息", key=f"board_saved_open_{direction}",
-                      icon=":material/visibility:", on_click=_open_saved_target,
-                      args=(direction, selected["target"]))
-            if st.button("移除自选", key=f"board_saved_remove_{direction}", icon=":material/star_border:",
-                         disabled=not st.session_state.get("watchlist_loaded", True)):
-                removed = api_request(api_base, "DELETE", f"/watchlist/{selected_id}")
-                if removed is not None:
-                    from frontend.account_prefetch import discard_account_result
-                    from frontend.snapshots import clear_snapshot
-                    discard_account_result(api_base, "/watchlist")
-                    st.session_state.watchlist = [item for item in st.session_state.get("watchlist", [])
-                                                  if int(item["id"]) != selected_id]
-                    clear_snapshot("comparison")
-                    st.session_state.pop("watchlist_comparison_request", None)
-                    st.session_state.pop("watchlist_comparison_advice", None)
-                    st.toast("已移除自选", icon=":material/check_circle:")
-                    st.rerun()
+def _saved_target(items, target):
+    if not target:
+        return None
+    target = str(target).casefold()
+    exact = next((item for item in items if str(item["target"]).casefold() == target), None)
+    if exact:
+        return exact
+    if not re.fullmatch(r"\d{5,6}(?:\.[a-z]{2})?", target):
+        return None
+    matches = [item for item in items
+               if re.fullmatch(r"\d{5,6}(?:\.[a-z]{2})?", saved := str(item["target"]).casefold())
+               and ("." not in target or "." not in saved)
+               and target.split(".")[0] == saved.split(".")[0]]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _board_target_options(api_base, direction, current):
+    names = known_entities(api_base, direction)
+    if direction == "industry":
+        defaults = ("广告营销", "半导体", "银行", "游戏", "数字媒体", "影视院线", "电力", "医药生物")
+        names = {**{name: name for name in defaults}, **names}
+    items = _board_watchlist(direction)
+    starred = {}
+    aliases = {}
+    for item in items:
+        target = str(item["target"])
+        bare = target.split(".")[0]
+        if (direction != "market" and bare != target and (bare in names or bare == current)
+                and _saved_target(items, bare) is item):
+            names.setdefault(bare, names.get(target) or bare)
+            names.pop(target, None)
+            aliases[target] = bare
+            starred[bare] = item
+        else:
+            starred[target] = item
+    for option, item in starred.items():
+        name = item.get("name")
+        if (name and names.get(name) == name and name not in starred
+                and option_label(name, names) == f"{name} · {option}"):
+            names.pop(name)
+            aliases[name] = option
+    return names, starred, aliases
+
+
+def _render_watchlist_retry(api_base, direction, api_request):
+    pending = (api_base, "/watchlist") in st.session_state.get("account_prefetch", {})
+    st.caption("正在加载账号自选。" if pending else "账号自选暂未加载，可重试；查询标的信息不受影响。")
+    if not pending and st.button("重试加载自选", key=f"board_saved_retry_{direction}", icon=":material/refresh:"):
+        saved = api_request(api_base, "GET", "/watchlist")
+        if isinstance(saved, list):
+            from frontend.account_prefetch import discard_account_result
+            discard_account_result(api_base, "/watchlist")
+            st.session_state.watchlist = saved
+            st.session_state.watchlist_loaded = True
+            st.session_state.pop("watchlist_retry_at", None)
+            st.rerun()
 
 
 def render_board_watchlist(api_base, direction, target, rows, api_request):
@@ -336,12 +344,16 @@ def render_board_watchlist(api_base, direction, target, rows, api_request):
         return
     ready = st.session_state.get("watchlist_loaded", True)
     if not ready:
-        st.caption("正在加载账号自选，完成后即可添加或移除。")
+        _render_watchlist_retry(api_base, direction, api_request)
+    items = _board_watchlist(direction)
+    existing = _saved_target(items, target)
     candidates = {str(row["code"]): row for row in rows if row.get("code")}
     # 代码查询必须严格对应；名称查询可能返回多个份额，由用户明确选择。
     if target and re.fullmatch(r"\d{5,6}(?:\.[A-Za-z]{2})?", target):
         candidates = {code: row for code, row in candidates.items()
                       if code.upper() == target.upper() or ("." not in target and code.split(".")[0] == target)}
+    if len(candidates) > 1:
+        existing = None
     with st.container(horizontal=True, vertical_alignment="bottom"):
         chosen = None
         if len(candidates) == 1:
@@ -352,16 +364,27 @@ def render_board_watchlist(api_base, direction, target, rows, api_request):
                                 format_func=lambda value: "选择名称 · 代码" if value is None else entity_label(candidates[value]),
                                 key=f"board_favorite_{direction}")
             chosen = candidates.get(code)
-        else:
+        elif existing is None:
             st.caption("查询名称或代码后，可在此加入自选。")
-        kind = ASSET_TYPES[direction]
         saved = st.session_state.get("watchlist", [])
-        existing = next((item for item in saved if chosen and item.get("asset_type") == kind and
-                         (str(item["target"]).upper().split(".")[0] == str(chosen["code"]).upper().split(".")[0]
-                          or item["target"] == chosen["name"])), None)
-        if st.button("已在自选" if existing else "加入自选", key=f"board_watchlist_add_{direction}",
-                     icon=":material/star:", disabled=not ready or chosen is None or existing is not None):
-            added = api_request(api_base, "POST", "/watchlist", {"target": chosen["code"], "asset_type": kind})
+        if existing is None and chosen:
+            existing = _saved_target(items, chosen["code"])
+        if existing:
+            if st.button("移除自选", key=f"board_saved_remove_{direction}", icon=":material/star_border:", disabled=not ready):
+                removed = api_request(api_base, "DELETE", f"/watchlist/{existing['id']}")
+                if removed is not None:
+                    from frontend.account_prefetch import discard_account_result
+                    from frontend.snapshots import clear_snapshot
+                    discard_account_result(api_base, "/watchlist")
+                    st.session_state.watchlist = [item for item in saved if item["id"] != existing["id"]]
+                    clear_snapshot("comparison")
+                    st.session_state.pop("watchlist_comparison_request", None)
+                    st.session_state.pop("watchlist_comparison_advice", None)
+                    st.toast("已移除自选", icon=":material/check_circle:")
+                    st.rerun()
+        elif st.button("加入自选", key=f"board_watchlist_add_{direction}",
+                       icon=":material/star:", disabled=not ready or chosen is None):
+            added = api_request(api_base, "POST", "/watchlist", {"target": chosen["code"], "asset_type": ASSET_TYPES[direction]})
             if isinstance(added, dict) and added.get("id"):
                 from frontend.account_prefetch import discard_account_result
                 discard_account_result(api_base, "/watchlist")
@@ -509,46 +532,38 @@ def _render_research_board(api_base: str, page_direction: str, fetch: Callable,
             st.subheader({"market": "市场数据", "industry": "行业数据", "stock": "股票数据", "fund": "基金数据", "convertible": "可转债数据"}[direction])
             st.space("stretch")
             refresh = st.button("刷新数据", key=f"board_refresh_{direction}", icon=":material/refresh:")
-        render_saved_watchlist(api_base, direction, api_request)
-        target = None
+        target_key = f"board_target_{direction}"
+        current = st.session_state.setdefault(target_key, "600519" if direction == "stock" else None)
+        names, starred, aliases = _board_target_options(api_base, direction, current)
+        if current in aliases:
+            current = st.session_state[target_key] = aliases[current]
+        options = list(dict.fromkeys([*starred, *names]))
+        if direction != "stock":
+            options.insert(0, None)
+        if current and current not in options:
+            options.append(current)
+
+        def format_target(value):
+            if value in starred:
+                item = starred[value]
+                code = str(item["target"])
+                return "★ " + option_label(code, {code: item.get("name") or names.get(value) or code})
+            if value is None and direction == "industry":
+                return "全部行业概览"
+            return option_label(value, names)
+
+        target = st.selectbox("查询行业" if direction == "industry" else "查看" + ASSET_TYPES[direction],
+                              options, format_func=format_target, key=target_key,
+                              accept_new_options=True, persist_state="session",
+                              placeholder="选择或输入名称 / 代码",
+                              help="★ 表示自选；选中即查看详情，也可输入名称或代码。投资问题请使用页面底部输入框。")
+        if target is not None:
+            target = str(target).strip()
+            if not target or len(target) > 60:
+                st.error("名称或代码应为 1–60 个字符。")
+                return
         if direction == "industry":
-            target_key = "board_target_industry"
-            st.session_state.setdefault(target_key, None)
-            options = [None, "广告营销", "半导体", "银行", "游戏", "数字媒体", "影视院线", "电力", "医药生物"]
-            names = known_entities(api_base, direction)
-            options.extend(code for code in names if code not in options)
-            current = st.session_state.get(target_key)
-            if current and current not in options:
-                options.append(current)
-            target = st.selectbox(
-                "查询行业", options, key=target_key, accept_new_options=True, persist_state="session",
-                format_func=lambda value: "全部行业概览" if value is None else f"{names[value]} · {value}" if value in names else value,
-                placeholder="选择或输入行业名称 / 板块代码",
-                help="可输入新行业，按回车提交；修改选择后重新查询，选择全部行业概览可恢复排名列表。")
-            if target is not None:
-                target = str(target).strip()
-                if len(target) > 60:
-                    st.error("行业名称或代码最多 60 个字符。")
-                    return
-                target = target or None
             st.caption("当前查询：" + (target or "全部行业概览") + " · 行业选择用于数据区与协同分析，普通咨询时请在问题中写明行业。")
-        if direction in {"market", "stock", "fund", "convertible"}:
-            names = known_entities(api_base, direction)
-            options = list(names) if direction == "stock" else [None, *names]
-            st.session_state.setdefault(f"board_target_{direction}", "600519" if direction == "stock" else None)
-            current = st.session_state.get(f"board_target_{direction}")
-            if current and current not in options:
-                options.append(current)
-            target = st.selectbox("查看" + ASSET_TYPES[direction],
-                                  options, format_func=lambda code: option_label(code, names),
-                                  key=f"board_target_{direction}", accept_new_options=True, persist_state="session",
-                                  placeholder="选择或输入名称 / 代码" if direction == "stock" else "全部概览 · 可选择或输入名称 / 代码",
-                                  help="可选择标的，也可输入名称或代码；投资问题请使用页面底部输入框。")
-            if target is not None:
-                target = str(target).strip()
-                if not target or len(target) > 60:
-                    st.error("名称或代码应为 1–60 个字符。")
-                    return
         result = load_board(api_base, direction, target, fetch, refresh=refresh, nonblocking=True)
         loading = result.get("status") == "loading" or result.get("refreshing")
         polling = st.session_state.get(f"board_poll_{direction}", False)
