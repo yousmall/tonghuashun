@@ -168,6 +168,7 @@ def _compact_agent_results(results: Any) -> list[dict[str, Any]]:
                     "agent_id",
                     "status",
                     "opinion",
+                    "conclusion",
                     "score",
                     "rule_score",
                     "model_score",

@@ -128,6 +128,9 @@ async def recover_research(
     extra = list(dict.fromkeys([*(data_requirements or []), *requested_capabilities]))
     requested_methods = {CAPABILITY_METHODS[cap] for cap in requested_capabilities}
     methods.update(requested_methods)
+    financial_evidence = audit.capability_evidence.get("financial", {})
+    if financial_evidence.get("required_fields") and financial_evidence.get("status") != "complete":
+        methods.add("get_financial_metrics")
     if "governance_score" in security_gaps:
         extra.extend([ResearchCapability.BASIC_INFO, ResearchCapability.SHAREHOLDER_EQUITY])
         methods.update({"get_basic_info", "get_shareholder_equity"})
@@ -235,7 +238,7 @@ async def recover_research(
                                                                    timeout_seconds=remaining())
     timings["assessment"] = round((perf_counter() - assessment_started) * 1000, 2)
     added_ids = {f.fact_id for f in assessed.facts} - {f.fact_id for f in request.facts}
-    if not attempted and not added_ids and assessment_status == "not_required":
+    if not attempted and not document_calls and not added_ids and assessment_status == "not_required":
         return request, audit
     for call in deferred:
         fulfillment[call.label] = {"status": "deferred", "required_fields": list(call.required_fields),

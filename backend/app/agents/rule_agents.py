@@ -92,6 +92,7 @@ class MacroAgent(BaseAgent):
             agent_id=self.agent_id,
             status=TaskStatus.COMPLETED,
             opinion=f"基于五个已授权宏观维度，市场环境为{state}。",
+            conclusion=f"市场环境为{state}。",
             score=clamp_score(score),
             confidence=confidence,
             facts_used=fact_ids,

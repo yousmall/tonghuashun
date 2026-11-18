@@ -62,18 +62,32 @@ async def extract_pdf(data, *, focus=None):
 
 async def _extract_pdf(data, focus=None):
     arguments = [focus] if focus else []
-    process = await asyncio.create_subprocess_exec(sys.executable, str(Path(__file__).with_name('pdf_text_worker.py')), *arguments,
-        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-        **({'creationflags': subprocess.CREATE_NO_WINDOW} if sys.platform == 'win32' else {}))
+    command = [sys.executable, str(Path(__file__).with_name('pdf_text_worker.py')), *arguments]
+    options = {'creationflags': subprocess.CREATE_NO_WINDOW} if sys.platform == 'win32' else {}
     try:
-        output, _ = await asyncio.wait_for(process.communicate(data), timeout=12)
-        if process.returncode or len(output) > 200000:
-            return {}
-        return json.loads(output.decode('utf-8')) if output else {}
-    finally:
-        if process.returncode is None:
-            process.kill()
-            await process.wait()
+        process = await asyncio.create_subprocess_exec(*command, stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL, **options)
+    except NotImplementedError:
+        # Uvicorn reload/workers on Windows use a selector loop without subprocess pipes.
+        try:
+            completed = await asyncio.to_thread(subprocess.run, command, input=data, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, timeout=12, **options)
+        except subprocess.TimeoutExpired as exc:
+            raise ProviderCallError('公告原文提取超时。', code='DOCUMENT_TIMEOUT') from exc
+        output, returncode = completed.stdout, completed.returncode
+    else:
+        try:
+            output, _ = await asyncio.wait_for(process.communicate(data), timeout=12)
+            returncode = process.returncode
+        except TimeoutError as exc:
+            raise ProviderCallError('公告原文提取超时。', code='DOCUMENT_TIMEOUT') from exc
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+    if returncode or not output or len(output) > 200000:
+        return {}
+    return json.loads(output.decode('utf-8'))
 
 
 async def read_disclosure(source, *, code, name, client=None, extractor=extract_pdf):

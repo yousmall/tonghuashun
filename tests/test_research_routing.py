@@ -1,13 +1,21 @@
 """五个研究入口的模型分类、检索上下文和执行前路由闸门。"""
+from datetime import datetime, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
 import pytest
 from streamlit.testing.v1 import AppTest
 
 from backend.app import main
 from backend.app.agents.coordinator import CoordinatorAgent, basic_compliance_check, verify_facts
 from backend.app.agents.rule_agents import make_rule_agents
-from backend.app.models import Intent, OrchestrationRequest
-from backend.app.research_routing import route_guidance
+from backend.app.data_provider.iwencai import IwencaiSkillHubProvider
+from backend.app.models import FactRecord, Intent, OrchestrationRequest
+from backend.app.research_presets import PRESET_QUESTIONS
+from backend.app.research_routing import DIRECTION_FOR_INTENT, route_guidance
 from backend.app.semantic import SemanticService
+from backend.app.services.model_input import slice_facts_for_agent
+from backend.app.services.research import AutomatedResearchPipeline
 
 
 class RouteLLM:
@@ -119,3 +127,60 @@ async def test_model_outage_is_not_mislabeled_as_unrelated_input():
     assert "语义判断服务暂时不可用" in advice.conclusion
     assert "无法输出相关信息" not in advice.conclusion
     assert advice.agent_results == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("intent", DIRECTION_FOR_INTENT)
+async def test_builtin_deep_questions_use_the_selected_study_scope_without_model_routing(intent):
+    direction = DIRECTION_FOR_INTENT[intent]
+    query = PRESET_QUESTIONS[direction][1]
+    coordinator = CoordinatorAgent(make_rule_agents(), verify_facts, basic_compliance_check, semantic=SemanticService())
+    request = research_request(direction, query).model_copy(update={"research_target": "测试标的"})
+    result = await coordinator.understand_request(request)
+    assert result.intent == intent and result.target == "测试标的"
+
+
+@pytest.mark.asyncio
+async def test_fund_preset_without_a_target_asks_for_a_name_without_spending_provider_quota(monkeypatch):
+    provider = SimpleNamespace(get_fund_candidates=AsyncMock())
+    monkeypatch.setattr(main, "research_pipeline", AutomatedResearchPipeline(provider))
+    request = research_request("基金筛选", "高收益可持续吗？回撤能接受吗？")
+    advice = await main.analyze_portfolio(request, user=None)
+    assert "请先选择基金或 ETF" in advice.conclusion
+    provider.get_fund_candidates.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fund_fee_and_risk_questions_query_distinct_evidence_and_send_raw_fields_to_agent():
+    now = datetime.now(timezone.utc)
+    facts = [FactRecord(fact_id=field, entity="测试基金", entity_code="510300.SH", field=field, value=1,
+                        period=now.date().isoformat(), snapshot_time=now, quality=.95, source_id="TEST")
+             for field in ("fee_rate", "tracking_error", "return_1y", "max_drawdown_1y")]
+    provider = SimpleNamespace(get_fund_candidates=AsyncMock(side_effect=[facts[:2], facts[2:]]))
+    pipeline = AutomatedResearchPipeline(provider, now=lambda: now)
+    first = research_request("基金筛选", "费率和跟踪误差吃掉多少收益？").model_copy(update={"research_target": "510300"})
+    prepared, _ = await pipeline.prepare(first, Intent.FUND_SCREENING, target=first.research_target)
+    second = prepared.model_copy(update={"query": "基金筛选：高收益可持续吗？回撤能接受吗？"})
+    prepared, audit = await pipeline.prepare(second, Intent.FUND_SCREENING, target=second.research_target)
+    first_filters, second_filters = [call.args[0] for call in provider.get_fund_candidates.await_args_list]
+    assert first_filters["target"] == second_filters["target"] == "510300"
+    assert "管理费率" in first_filters["fields"] and "跟踪误差" in first_filters["fields"]
+    assert "近1年最大回撤" in second_filters["fields"]
+    assert audit.capability_evidence["fund"]["status"] == "complete"
+    model_facts = slice_facts_for_agent(prepared.facts, "fund", [], mode="deep")
+    assert {item.field for item in model_facts} >= {"fee_rate", "tracking_error", "return_1y", "max_drawdown_1y"}
+
+
+@pytest.mark.asyncio
+async def test_fund_targeted_query_rejects_unrelated_facts():
+    now = datetime.now(timezone.utc)
+    target = FactRecord(fact_id="target", entity="目标基金", entity_code="510300.SH", field="fee_rate", value=0.5,
+                        snapshot_time=now, quality=.95, source_id="TEST")
+    other = target.model_copy(update={"fact_id": "other", "entity": "无关基金", "entity_code": "510500.SH"})
+    provider = SimpleNamespace(query=AsyncMock(return_value=[target, other]))
+
+    facts = await IwencaiSkillHubProvider.get_fund_candidates(provider, {"target": "510300", "fields": "管理费率"})
+
+    assert facts == [target]
+    assert provider.query.await_args.kwargs["skill_id"] == "hithink-fund-query"
+    assert provider.query.await_args.args[0].startswith("510300的基金")

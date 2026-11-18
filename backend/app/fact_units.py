@@ -12,7 +12,7 @@ from backend.app.fund_fields import FUND_PERCENT_FIELDS
 PERCENT_FIELDS = frozenset({
     "capital_flow_ratio", "interval_change",
     "max_drawdown_1y",
-    "change", "roe", "roe_weighted", "revenue_growth", "net_profit_growth",
+    "change", "roe", "roe_weighted", "revenue_growth", "net_profit_growth", "profit_excluding_non_recurring_growth",
     "fee_rate", "tracking_error", "interest_rate", "cpi", "ppi",
     "turnover_rate", "volatility", "amplitude", "nav_change",
     "conversion_premium_rate", "pure_bond_premium_rate", "yield_to_maturity",

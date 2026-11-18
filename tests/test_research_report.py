@@ -148,10 +148,11 @@ def test_blocking_a_previous_report_also_suppresses_ui_and_export():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["deep", "fast"])
-async def test_deep_prompt_adds_opposing_evidence_without_extra_model_calls(mode):
+async def test_research_prompt_separates_conclusion_from_evidence_without_extra_model_calls(mode):
     from types import SimpleNamespace
+    from backend.app.agents.coordinator import CoordinatorAgent, verify_facts
     from backend.app.agents.llm_agents import HybridInvestmentAgent
-    from backend.app.models import AgentResult, OrchestrationRequest
+    from backend.app.models import AgentResult, ComplianceStatus, CrossValidationResult, OrchestrationRequest
     evidence = fact("q")
     seen = []
     baseline = AgentResult(agent_id="security", status="completed", opinion="有限依据",
@@ -162,14 +163,36 @@ async def test_deep_prompt_adds_opposing_evidence_without_extra_model_calls(mode
         config = SimpleNamespace(model="test-model")
         async def complete_json(self, *, system, payload):
             seen.append((system, payload))
-            return baseline.model_dump(mode="json")
+            return {
+                **baseline.model_dump(mode="json"),
+                "conclusion": "核心判断：短期表现偏强。支持证据：本期涨幅为2%。"
+                              "判断限制：样本区间较短。投资评价：更像局部走强，而非普遍回升。",
+                "opinion": "这一变化支持短期偏强的判断。",
+            }
     request = OrchestrationRequest(query="研究测试公司", facts=[evidence],
                                    profile={"confirmed": True, "risk_level": "R3"}, research_mode=mode)
     result = await HybridInvestmentAgent("security", rule, Model()).run(request)
     assert len(seen) == 1 and result.facts_used == ["q"]
+    instruction, payload = seen[0]
+    opinion = payload["required_output"]["opinion"]
+    assert "不列用于推导判断的指标、数值或来源" in payload["required_output"]["conclusion"]
+    assert "直接评价并说明其实际意义" in payload["required_output"]["conclusion"]
+    assert "关键数据、数据所属期、支持和反面证据及其如何影响判断写入 opinion" in instruction
+    assert "判断限制、置信依据和缺项一律放在 opinion 或 confidence_reasons" in instruction
+    assert "不以‘无法判断’开头" in instruction
+    assert "不把缺少证据写成相反结论" in instruction and "无相关证据时" in instruction
     if mode == "deep":
-        assert "反面证据" in seen[0][1]["required_output"]["opinion"]
-        assert "数据所属期" in seen[0][0] and "不能编造多空理由" in seen[0][0]
+        assert "不超过220字" in opinion and "证据少就写短" in opinion
+        assert "独立贡献" in instruction and "不把样本表现外推到全市场" in instruction
+        assert "数据所属期" in instruction and "只写足以影响判断的反面证据" in instruction
+        assert "150字" not in instruction
     else:
-        assert "80字" in seen[0][0]
-        assert "details" not in seen[0][1]["required_output"]
+        assert "80字" in instruction
+        assert "220字" not in opinion
+        assert "details" not in payload["required_output"]
+    summary = CoordinatorAgent._summarize([result], ComplianceStatus.PASS,
+                                          CrossValidationResult(status=ComplianceStatus.PASS))
+    assert summary == "个股：短期表现偏强。\n\n更像局部走强，而非普遍回升。"
+    assert "涨幅为2%" in result.opinion and "样本区间较短" in result.opinion
+    rejected, = await verify_facts([result], [])
+    assert rejected.conclusion is None and "2%" not in rejected.opinion and "样本区间较短" not in rejected.opinion

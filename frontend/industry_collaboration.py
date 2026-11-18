@@ -96,7 +96,7 @@ def render_industry_collaboration(api_base: str, *, ready: bool, submit: Callabl
     target = str(st.session_state.get("board_target_industry") or "").strip() or None
     with st.container(border=True):
         st.subheader("多智能体协同", anchor=False)
-        st.write(f"围绕「{target or '全部行业'}」，汇总市场、个股、基金、可转债的已加载资料和最近研究结果。")
+        st.write(f"围绕「{target or '全部行业'}」，汇总已加载资料，并通过问财补查缺少的市场、行业、个股、基金和可转债数据。")
         st.caption("市场、行业、证券（个股 / 转债）、基金智能体并行研判，随后统一核验事实与风险；结论保留分歧和待补证事项。")
         with st.expander("本次汇总的信息", expanded=False):
             st.dataframe(bundle["sources"], hide_index=True, width="stretch")
@@ -121,4 +121,4 @@ def render_industry_collaboration(api_base: str, *, ready: bool, submit: Callabl
             )
             submit(api_base, "行业分析", query, collaboration=bundle)
             st.rerun()
-        st.caption("使用深度研究处理已有资料，结果和各智能体明细显示在下方对话并保存到历史记录。缺项可先到相应模块加载或刷新，再重新协同分析。")
+        st.caption("无需先逐页加载资料。补查可能需要等待；各智能体的结果、依据和待核实项会显示在下方对话并保存到历史记录。")

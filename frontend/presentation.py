@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from html import escape
 from typing import Any
 import streamlit as st
-from backend.app.answer_text import clean_answer_text
+from backend.app.answer_text import clean_answer_text, split_research_conclusion
 from frontend.answer_visibility import verification_notes, visible_risks, visible_next_steps, visible_risk_conclusion, visible_compliance_reason
 from frontend.investment_panel import render_investment_panel
 
@@ -421,17 +421,10 @@ def _render_conclusion_content(advice: dict[str, Any], *, key: str = "analysis-c
         if advice.get("agent_results"):
             st.badge(f"{len(advice['agent_results'])} 个分析维度", icon=":material/hub:", color="blue")
     st.markdown("**分析结论**")
-    conclusion = plain_language(advice.get("conclusion")) or "现有资料不足，暂时无法作出判断。"
+    evaluation, _ = split_research_conclusion(advice.get("conclusion"))
+    conclusion = plain_language(evaluation) or "本次未形成可用的评价。"
     st.write(conclusion)
-    risk_conclusion = visible_risk_conclusion(advice)
-    if risk_conclusion:
-        st.markdown("**风险结论**")
-        st.write(plain_language(risk_conclusion))
-    if compliance.get("status") != "PASS" and visible_compliance_reason(advice):
-        compliance_note = plain_language(visible_compliance_reason(advice))
-        if compliance_note and compliance_note != conclusion:
-            st.caption(compliance_note)
-    render_points("需要注意", visible_risks(advice), visible=99)
+    render_risk_summary(advice, key=key)
     render_investment_panel(advice, key=key)
     render_points("后续研究建议", visible_next_steps(advice))
     render_verification_records(advice, key=key)
@@ -440,9 +433,60 @@ def _render_conclusion_content(advice: dict[str, Any], *, key: str = "analysis-c
     if advice.get("user_fit"):
         with st.expander("与您的投资偏好是否匹配", icon=":material/person_check:"):
             st.write(plain_language(advice["user_fit"]))
-    for notice in [compliance.get("risk_notice"), *compliance.get("required_disclosures", [])]:
-        if text := plain_language(notice):
-            st.caption(text)
+
+
+def risk_summary(advice: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """Separate brief risk lines from unabridged details without changing the advice."""
+    compliance = advice.get("compliance") or {}
+    status = compliance.get("status")
+    summary = []
+    if status == "BLOCK":
+        summary.append("风险检查未通过，暂不提供投资建议。")
+    elif status != "PASS" and ("LIMITED_CONSULTATION" not in (compliance.get("matched_rules") or [])
+                               or (advice.get("cross_validation") or {}).get("issues")):
+        summary.append("风险仍需核实。")
+    if (advice.get("data_acquisition") or {}).get("mode") == "demo" or any(
+            fact.get("source_id") == "DEMO_SNAPSHOT" for fact in advice.get("facts") or []):
+        summary.append("本结果含示例数据，仅用于演示。")
+    candidates = [
+        visible_risk_conclusion(advice),
+        visible_compliance_reason(advice) if status != "PASS" else None,
+        *(compliance.get("required_disclosures") or []),
+        *visible_risks(advice),
+        compliance.get("risk_notice"),
+    ]
+    seen = {_risk_text_key(text) for text in [*summary, plain_language(advice.get("conclusion"))]}
+    specifics, details = [], []
+    for candidate in candidates:
+        text = plain_language(candidate)
+        normalized = _risk_text_key(text)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        if len(text) <= 44 and "\n" not in text and len(specifics) < 2:
+            specifics.append(text)
+        else:
+            details.append(text)
+    fallback = "具体风险请查看详情。" if details else "请留意价格波动和亏损风险。"
+    return summary + specifics or [fallback], details
+
+
+def _risk_text_key(text: str) -> str:
+    compact = re.sub(r"\s+", "", text).rstrip("。；;.!！")
+    if compact in {"这份分析仍需核实", "本次分析仍需核实", "风险仍需核实"}:
+        return "风险仍需核实"
+    return compact
+
+
+def render_risk_summary(advice: dict[str, Any], *, key: str) -> None:
+    summary, details = risk_summary(advice)
+    st.markdown("**风险结论**")
+    st.write("\n\n".join(summary))
+    if details:
+        with st.expander("查看风险详情", key=f"risk_details_{key}", on_change="rerun") as panel:
+            if panel.open:
+                for point in details:
+                    st.write(point)
 
 
 def collaboration_rows(advice: dict[str, Any]) -> list[dict[str, str]]:

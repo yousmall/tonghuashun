@@ -35,6 +35,7 @@ from frontend.charts import render_bar, render_chart
 from frontend.risk_assessment import render_risk_assessment
 from frontend.user_settings import account_session_data, avatar_uri, display_name, render_user_settings
 from backend.app.risk_questionnaire import assessment_is_current
+from backend.app.research_presets import PRESET_QUESTIONS, PRESET_TARGET_FALLBACK
 from backend.app.services.context_compression import client_context_messages
 from frontend.conversation_logic import render_conversation_logic_chain, render_single_answer_chain
 from frontend.result_views import render_advice, cached_answer_images, answer_export_payload, show_status
@@ -787,7 +788,7 @@ def submit_chat_analysis(api_base: str, direction: str, query: str, *, recommend
     }
     token = st.session_state.auth_token
     if collaboration is not None:
-        payload.update({"industry_collaboration": True, "research_mode": "deep", "auto_fetch": False,
+        payload.update({"industry_collaboration": True, "research_mode": "deep",
                         "research_target": str(selected_research_target(direction) or "").strip() or None,
                         "facts": collaboration["facts"],
                         "research_materials": collaboration["research_materials"],
@@ -1089,120 +1090,37 @@ RESEARCH_GUIDES = {
 }
 
 
-# 每个研究方向给出 3 个可直接点选的简短提问。问题只提供分析视角与验证路径，
-# 不预设结论、不代替用户判断；提交时沿用 RESEARCH_PREFIX 与当前已选标的上下文。
-# 带 {target} 的模板会在已选标的时填入名称/代码，未选标的时回退为方向默认称谓。
-PRESET_QUESTIONS = {
-    "市场解读": (
-        "政策如何影响流动性与风险偏好？",
-        "资金流向哪里？哪些板块被低估？",
-        "市场情绪过热吗？有逆向信号吗？",
-    ),
-    "行业分析": (
-        "行业景气由什么驱动？",
-        "产业链哪段拥挤、哪段被低估？",
-        "高景气是否已充分定价？",
-    ),
-    "个股研究": (
-        "{target}的盈利质量撑得住估值吗？",
-        "哪些预期已定价，还有哪些预期差？",
-        "财报改善是经营好转还是一次性？",
-    ),
-    "基金筛选": (
-        "超额收益来自选股还是押注风格？",
-        "费率和跟踪误差吃掉多少收益？",
-        "高收益可持续吗？回撤能接受吗？",
-    ),
-    "可转债分析": (
-        "{target}当前偏股还是偏债？",
-        "正股上涨，转债能跟涨多少？",
-        "强赎、下修、债底哪个风险更大？",
-    ),
-}
-
-# 未选定标的时，让带 {target} 的预设问题仍有完整措辞，避免可选问题少于 3 个。
-PRESET_TARGET_FALLBACK = {
-    "市场解读": "当前市场",
-    "行业分析": "当前行业",
-    "个股研究": "当前股票",
-    "基金筛选": "当前基金",
-    "可转债分析": "这只可转债",
-}
-
-
-def _asked_presets(direction: str) -> set[str]:
-    """已经问过的预设问题：既看当前会话的用户消息，也看本次点击记录。
-
-    以会话内容为准，刷新页面后只要对话还在，问过的问题依旧不会再出现。
-    """
-
-    prefix = RESEARCH_PREFIX.get(direction, "")
-    asked = {
-        str(turn.get("content") or "").removeprefix(prefix).strip()
-        for turn in (st.session_state.get("conversation") or [])
-        if turn.get("role") == "user"
-    }
-    scope = (direction, st.session_state.get("conversation_id"))
-    asked.update((st.session_state.get("preset_asked") or {}).get(scope) or [])
-    asked.discard("")
-    return asked
-
-
-def _remember_preset(direction: str, text: str) -> None:
-    """只有确实属于预设列表的问题才记录，避免把自由提问也当成“问过”。"""
-
-    if not text or text not in preset_questions(direction):
-        return
-    asked = dict(st.session_state.get("preset_asked") or {})
-    scope = (direction, st.session_state.get("conversation_id"))
-    current = list(asked.get(scope) or [])
-    if text not in current:
-        current.append(text)
-    asked[scope] = current
-    while len(asked) > 50:
-        asked.pop(next(iter(asked)))
-    st.session_state.preset_asked = asked
-
 
 def preset_questions(direction: str) -> list[str]:
-    """按本页方向与已选标的生成最多 3 个还没问过的预设问题。"""
+    """按本页方向与已选标的生成最多 3 个可重复使用的预设问题。"""
 
-    target = selected_research_target(direction)
-    asked = _asked_presets(direction)
-    questions: list[str] = []
-    for template in PRESET_QUESTIONS.get(direction, ()):
-        if "{target}" in template:
-            # 没选标的时用方向默认称谓补全，保证每个方向始终有 3 个可选问题。
-            text = template.format(target=target or PRESET_TARGET_FALLBACK.get(direction, "当前标的"))
-        else:
-            text = template
-        if text not in asked:
-            questions.append(text)
-    return questions[:3]
+    target = selected_research_target(direction) or PRESET_TARGET_FALLBACK.get(direction, "当前标的")
+    return [template.format(target=target) for template in PRESET_QUESTIONS.get(direction, ())[:3]]
 
 
 def _send_preset(api_base: str, direction: str, widget_key: str) -> None:
-    """点击预设问题后标记为已问过并清空选中状态，按正常提问流程提交。"""
+    """提交后清空选中状态，允许再次点击同一道问题。"""
 
     text = st.session_state.get(widget_key)
     if not text:
         return
     st.session_state[widget_key] = None
-    _remember_preset(direction, str(text))
-    submit_chat_analysis(api_base, direction, RESEARCH_PREFIX[direction] + str(text))
+    if text in preset_questions(direction):
+        submit_chat_analysis(api_base, direction, RESEARCH_PREFIX[direction] + text)
 
 
 def render_preset_questions(api_base: str, direction: str) -> None:
     """提问框上方给几个与本页相关的预设问题，点一下直接发送。"""
 
-    if not profile_ready() or direction in st.session_state.get("analysis_jobs", {}):
+    if not profile_ready():
         return
     questions = preset_questions(direction)
     if not questions:
         return
     widget_key = f"preset_question_{direction}"
     st.pills("试试这样问", questions, key=widget_key, on_change=_send_preset,
-             args=(api_base, direction, widget_key), width="stretch")
+             args=(api_base, direction, widget_key), width="stretch",
+             disabled=direction in st.session_state.get("analysis_jobs", {}))
 
 
 def render_research_guide(direction: str) -> None:
@@ -1231,6 +1149,11 @@ def render_research_guide(direction: str) -> None:
         render_review_guide()
 
 
+def _latest_answer_index(messages: list[dict]) -> int:
+    return next((index for index in range(len(messages) - 1, -1, -1)
+                 if messages[index].get("role") == "assistant"), -1)
+
+
 def render_research_page(api_base: str, direction: str, *, collaboration: bool = False) -> None:
     title = "多智能体协同" if collaboration else direction
     render_page_header(title)
@@ -1255,15 +1178,6 @@ def render_research_page(api_base: str, direction: str, *, collaboration: bool =
     if not profile_ready():
         st.info("请先确认投资偏好，再开始分析。", icon=":material/person_edit:")
         st.button("进行风险评估", type="primary", on_click=go_to, args=("风险评估",))
-    def research_from_chain(question):
-        st.session_state.research_mode = "deep"
-        submit_chat_analysis(api_base, direction, question)
-
-    render_conversation_logic_chain(
-        st.session_state.conversation, conversation_id=st.session_state.conversation_id,
-        api_base=api_base, api_request=api_request,
-        on_research=research_from_chain if profile_ready() and direction not in st.session_state.get("analysis_jobs", {}) else None,
-    )
     if direction == "个股研究":
         if profile_ready():
             render_prepared_stock_report(api_base)
@@ -1285,8 +1199,11 @@ def render_research_page(api_base: str, direction: str, *, collaboration: bool =
             st.session_state.history_before_id = older.get("next_before_id")
             save_research_session()
             st.rerun()
-    latest_answer = next((index for index in range(len(st.session_state.conversation)-1, -1, -1)
-                          if st.session_state.conversation[index].get("role") == "assistant"), -1)
+    def research_from_chain(question):
+        st.session_state.research_mode = "deep"
+        submit_chat_analysis(api_base, direction, question)
+
+    latest_answer = _latest_answer_index(st.session_state.conversation)
     for turn_index, turn in enumerate(st.session_state.conversation):
         with st.chat_message(turn["role"]):
             if turn["role"] == "assistant" and turn.get("payload"):
@@ -1301,6 +1218,11 @@ def render_research_page(api_base: str, direction: str, *, collaboration: bool =
                     render_advice({"conclusion": content, "compliance": {"status": "REVIEW"}})
                 else:
                     st.write(content)
+        if turn_index == latest_answer:
+            render_conversation_logic_chain(
+                st.session_state.conversation, conversation_id=st.session_state.conversation_id,
+                on_research=research_from_chain if profile_ready() and direction not in st.session_state.get("analysis_jobs", {}) else None,
+            )
     # 必须在页面顶层调用，Streamlit 才会将唯一输入框固定在底部。
     mode = st.session_state.get("research_mode")
     if mode not in {"instant", "deep"}:
@@ -1324,7 +1246,6 @@ def render_research_page(api_base: str, direction: str, *, collaboration: bool =
                           disabled=not profile_ready() or direction in st.session_state.get("analysis_jobs", {}),
                           width="stretch")
     if query and query.strip():
-        _remember_preset(direction, query.strip())
         submit_chat_analysis(api_base, direction, RESEARCH_PREFIX[direction] + query.strip())
         st.rerun()
     if direction in st.session_state.get("analysis_jobs", {}):
@@ -1337,7 +1258,6 @@ def render_logic_chain_banner(api_base: str, *, expanded: bool = False) -> None:
     render_conversation_logic_chain(
         st.session_state.get("conversation") or [],
         conversation_id=st.session_state.get("conversation_id", "current"), expanded=expanded,
-        api_base=api_base, api_request=api_request,
     )
 
 
@@ -2166,8 +2086,7 @@ def page_conversations(api_base: str) -> None:
             detail["next_before_id"] = older.get("next_before_id")
             st.session_state.history_detail_cache = detail
             st.rerun()
-    render_conversation_logic_chain(detail["messages"], conversation_id=selected_id,
-                                    api_base=api_base, api_request=api_request)
+    latest_answer = _latest_answer_index(detail["messages"])
     for message_index, message in enumerate(detail["messages"]):
         with st.chat_message(message["role"]):
             if message["role"] == "assistant" and message.get("payload"):
@@ -2179,6 +2098,8 @@ def page_conversations(api_base: str) -> None:
                     render_advice({"conclusion": message["content"], "compliance": {"status": "REVIEW"}})
                 else:
                     st.write(message["content"])
+        if message_index == latest_answer:
+            render_conversation_logic_chain(detail["messages"], conversation_id=selected_id)
 
 
 def _render_service_unavailable(api_base: str) -> None:

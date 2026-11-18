@@ -1,6 +1,6 @@
 """首页：首次使用指引、继续研究与自选概览。"""
 import streamlit as st
-from frontend.presentation import QUICK_ASKS, plain_language, display_value
+from frontend.presentation import QUICK_ASKS, display_value, risk_summary
 from frontend.research_board import load_board, section_facts, entity_rows, format_fact
 from streamlit.runtime.scriptrunner import get_script_run_ctx
 
@@ -81,7 +81,8 @@ def render_home(api_base, *, ready, header, go_to, recent, fetch, resume):
             st.metric("投资风格", display_value("risk_level", st.session_state.profile.get("risk_level")), border=True)
         advice = st.session_state.get("advice") or {}
         if advice.get("compliance", {}).get("status") in {"REVIEW", "BLOCK"}:
-            st.warning("上次研究仍有待核实事项：" + plain_language(advice.get("risk_conclusion") or advice.get("conclusion")))
+            summary, _ = risk_summary(advice)
+            st.warning("上次研究：" + summary[0])
         st.subheader("市场概览")
         market_glance(api_base, fetch)
         if recent:

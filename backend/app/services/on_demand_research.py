@@ -6,17 +6,20 @@ import hashlib
 import json
 import re
 from collections import defaultdict
+from functools import partial
 
 from backend.app.fact_taxonomy import NEWS_FIELDS, fact_is_current
+from backend.app.fact_units import period_info
 from backend.app.models import FactRecord, Intent
 from backend.app.services.evidence_coverage import AGENT_FIELDS, missing_fields_by_agent
 from backend.app.services.research import DataCall, _merge_by_fact_id
 from backend.app.services.recommendation_recovery import derive_explicit_state, derive_history_metrics, history_window
 from backend.app.services.return_expectation import build_return_expectation
 from backend.app.services.scoring_dimensions import QUALITATIVE_RUBRICS
-from backend.app.services.disclosure_reader import allowed_disclosure_url, read_disclosure
+from backend.app.services.disclosure_reader import allowed_disclosure_url, extract_pdf, read_disclosure
+from backend.app.services.official_disclosures import resolve_official_mirror
 from backend.app.services.provider_errors import failure_summary
-from backend.app.services.research_requirements import evidence_status
+from backend.app.services.research_requirements import evidence_status, is_financial_improvement_question
 from backend.app.services.return_expectation import _date
 
 DOCUMENT_FIELDS = {*NEWS_FIELDS, "event"}
@@ -37,7 +40,8 @@ CALL_FAMILIES = {
     "get_quote": ("quote",), "get_basic_info": ("basic_info",),
     "get_target_prices": ("institutional_research",), "get_industry_flow": ("industry",),
     "get_macro_data": ("macro",), "get_market_calendar": ("quote",),
-    "get_financial_metrics": ("financial",), "get_event_data": ("event", "announcement"),
+    "get_financial_metrics": ("financial",), "get_financial_growth_for_period": ("financial",),
+    "get_event_data": ("event", "announcement"),
     "get_company_operations": ("company_operations",), "get_shareholder_equity": ("shareholder_equity",),
     "get_news": ("news",), "get_announcements": ("announcement", "event"),
     "get_industry_rank": ("industry",), "get_fund_candidates": ("fund",),
@@ -182,6 +186,11 @@ def gap_calls(pipeline, request, intent, target, audit):
             add(f"disclosure_details:{index}", "get_stock_disclosure_details", query)
         if intent == Intent.SECURITY_RESEARCH:
             owned = [f for f in current if f.entity == name]
+            if is_financial_improvement_question(request.query) and callable(
+                    getattr(pipeline.provider, "get_financial_growth_for_period", None)):
+                call = _financial_growth_gap(pipeline, owned, name, query, audit)
+                if call:
+                    calls.append(call)
             forecast = build_return_expectation(owned, [f.fact_id for f in owned], request.profile, "PASS")
             if not forecast.scenarios:
                 quote_call = DataCall("quote", "get_quote", (query,), "quote", expected_entity=name)
@@ -337,24 +346,68 @@ def select_assessment_documents(facts, targets, *, max_per_entity=12):
     return output
 
 
+def _financial_growth_gap(pipeline, owned, name, query, audit):
+    if audit.capability_errors.get("financial", {}).get("retryable") is False:
+        return None
+    today = pipeline.now().date().isoformat()
+    periods = [_financial_report_period(str(fact.value)) for fact in owned if fact.field == "announcement"
+               and (_date(fact) or "9999") <= today]
+    latest = max(periods, default=())
+    if not latest:
+        return None
+    year, quarter = latest
+    end = period_info(f"{year}Q{quarter}")[1]
+    if end > pipeline.now().date():
+        return None
+    required = ("revenue_growth", "net_profit_growth")
+    matching = {fact.field for fact in owned if fact.normalized_value is not None
+                and (period := period_info(fact.period)) is not None and period[1] == end}
+    if set(required) <= matching:
+        return None
+    symbol = next((str(fact.entity_code).split(".")[0] for fact in owned
+                   if fact.entity_code and re.fullmatch(r"\d{6}(?:\.(?:SH|SZ|BJ))?", str(fact.entity_code).upper())), query)
+    return DataCall("financial_period", "get_financial_growth_for_period", (symbol, year, quarter),
+                    f"get_financial_growth_for_period@{symbol}:{year}Q{quarter}",
+                    priority=96, required_fields=required, expected_entity=name)
+
+
+def _financial_report_period(title):
+    match = re.search(
+        r"(20\d{2})\s*年\s*(第一季度报告|一季报|半年度报告|半年报|第三季度报告|三季报|年度报告|年报)"
+        r"(?:\s*(?:全文|[（(]修订版[）)]))?[。\s]*$", title,
+    )
+    if not match:
+        return ()
+    period = {"第一": 1, "一季": 1, "半年": 2, "第三": 3, "三季": 3, "年度": 4, "年报": 4}
+    return (int(match[1]), period[match[2][:2]])
+
+
 async def read_gap_documents(pipeline, request, intent, target, fetched, *, timeout_seconds=None):
     """最多读取两份本轮供应商返回的官方 PDF，标题不能替代原文核验。"""
     _, _, securities = scopes(pipeline, request, intent, target)
     if timeout_seconds is not None and timeout_seconds <= 0:
         return [], [], [], [], {}
     jobs, seen = [], set()
+    financial_improvement = intent == Intent.SECURITY_RESEARCH and is_financial_improvement_question(request.query)
+    if financial_improvement:
+        today = pipeline.now().date().isoformat()
+        fetched = [*fetched, *(f for f in request.facts if f.field == "announcement"
+                               and _financial_report_period(str(f.value)) and (_date(f) or "9999") <= today)]
     # Keep identity and original quotes; an already verified report does not need
     # another download/extraction merely because a second recovery phase starts.
     verified = [f for f in current_facts(pipeline, request)
                 if f.source_id == "OFFICIAL_DISCLOSURE_PDF_V1" and f.field == "announcement_excerpt"
                 and (f.derivation_rule or '').startswith('PDF_TEXT_V1:')]
     # Prefer relevant original reports by actual publication date, not retrieval time.
-    titles = {f.source_url: str(f.value) for f in fetched if f.field == 'announcement'}
+    titles = {f.source_url: str(f.value) for f in fetched if f.field == 'announcement' and f.source_url}
     def document_rank(f):
-        title = titles.get(f.source_url, '')
+        title = str(f.value) if f.field == 'announcement' else titles.get(f.source_url, '')
+        financial_period = _financial_report_period(title) if financial_improvement else ()
         full_report = (8 if '审计报告' in title else 6 if '年度报告' in title else 0)
         full_report -= 8 if any(word in title for word in ('摘要', '英文')) else 0
-        return (full_report, _date(f) or '', sum(term in str(f.value) for term in DIMENSION_TERMS['governance']))
+        return (financial_period, full_report, _date(f) or '',
+                bool(financial_period and allowed_disclosure_url(f.source_url or "")),
+                sum(term in str(f.value) for term in DIMENSION_TERMS['governance']))
     fetched = sorted(fetched, key=document_rank, reverse=True)
     for name, query in securities:
         code = re.search(r"(?<!\d)\d{6}(?!\d)", query)
@@ -363,26 +416,52 @@ async def read_gap_documents(pipeline, request, intent, target, fetched, *, time
         if not re.fullmatch(r"\d{6}", code):
             continue
         for source in fetched:
-            if (source.entity == name and source.field in DOCUMENT_FIELDS and source.source_url
-                    and source.source_url not in seen and allowed_disclosure_url(source.source_url)
-                    and fact_is_current(source, pipeline.now())):
-                seen.add(source.source_url)
+            if (source.entity != name or source.field not in DOCUMENT_FIELDS or
+                    not fact_is_current(source, pipeline.now())):
+                continue
+            if source.source_url and source.field != 'announcement':
                 source = next((f for f in fetched if f.source_url == source.source_url
                                and f.entity == name and f.field == 'announcement'), source)
-                if any(f.entity == name and f.source_url == source.source_url and f.period == source.period
-                       and str(f.entity_code or '').split('.')[0] == code
-                       and source.fact_id in f.derived_from for f in verified):
-                    continue
-                jobs.append((f"disclosure_pdf:{len(jobs)}", source, code, name))
+            financial = (financial_improvement and source.field == "announcement"
+                         and bool(_financial_report_period(str(source.value)))
+                         and (_date(source) or "9999") <= today)
+            if (not allowed_disclosure_url(source.source_url or "") and not financial
+                    or source.entity_code and str(source.entity_code).split(".")[0] != code):
+                continue
+            identity = (name, source.value, _date(source)) if financial else source.source_url
+            if identity in seen or any(f.entity == name and f.source_url == source.source_url
+                    and f.period == source.period and str(f.entity_code or '').split('.')[0] == code
+                    and source.fact_id in f.derived_from and
+                    (not financial or (f.derivation_rule or "").startswith("PDF_TEXT_V1: financial"))
+                    for f in verified):
+                continue
+            seen.add(identity)
+            jobs.append((f"disclosure_pdf:{len(jobs)}", source, code, name, financial))
     jobs = jobs[:2]
-    async def read(source, code, name):
-        return await asyncio.wait_for(read_disclosure(source, code=code, name=name),
+
+    async def extract(source, code, name, financial):
+        if not financial:
+            return await read_disclosure(source, code=code, name=name)
+        original = source
+        if not allowed_disclosure_url(source.source_url or ""):
+            source = await resolve_official_mirror(source, code=code, name=name)
+            if source is None:
+                return []
+        rows = await read_disclosure(source, code=code, name=name, extractor=partial(extract_pdf, focus="financial"))
+        rows = [row.model_copy(update={"derivation_rule": "PDF_TEXT_V1: financial report excerpt"})
+                if row.field == "announcement_excerpt" else row for row in rows]
+        return [source, *rows] if rows and source is not original else rows
+
+    async def read(source, code, name, financial):
+        return await asyncio.wait_for(extract(source, code, name, financial),
             timeout=min(30, timeout_seconds) if timeout_seconds is not None else 30)
-    results = await asyncio.gather(*(read(source, code, name) for _, source, code, name in jobs), return_exceptions=True)
+    results = await asyncio.gather(*(read(*job[1:]) for job in jobs), return_exceptions=True)
     facts, success, empty, errors = [], [], [], {}
-    for (label, _, _, _), result in zip(jobs, results, strict=True):
+    for (label, *_), result in zip(jobs, results, strict=True):
         if isinstance(result, BaseException):
             errors[label] = failure_summary(result)
+            if isinstance(result, TimeoutError):
+                errors[label]["code"] = "DOCUMENT_TIMEOUT"
         elif result:
             success.append(label)
             facts.extend(result)

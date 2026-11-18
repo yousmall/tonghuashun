@@ -6,10 +6,20 @@ import re
 from collections import defaultdict
 
 from backend.app.fact_taxonomy import NEWS_FIELDS, fact_is_current
+from backend.app.fact_units import period_info
 from backend.app.services.return_expectation import _currency, _date, _price
 
 DEFAULT_FIELDS = {"get_institutional_research": ("target_price",), "get_quote": ("close_price",)}
 DOCUMENT_FIELDS = {*NEWS_FIELDS, "event"}
+FINANCIAL_IMPROVEMENT_FIELDS = (
+    "revenue_growth", "net_profit", "net_profit_growth", "profit_excluding_non_recurring",
+    "profit_excluding_non_recurring_growth", "operating_cash_flow",
+)
+_FINANCIAL_AMOUNTS = {"net_profit", "profit_excluding_non_recurring", "operating_cash_flow"}
+
+
+def is_financial_improvement_question(query: str) -> bool:
+    return bool(re.search(r"财报改善|(?:财报|利润|业绩|经营好转).{0,30}(?:一次性|非经常性损益)", query))
 
 
 def matches_entity(fact, entity):
@@ -62,6 +72,13 @@ def evidence_status(call, facts, now):
                 okay = isinstance(fact.value, str) and bool(fact.value.strip() and fact.source_url and _date(fact))
             elif field == "industry":
                 okay = isinstance(fact.value, str) and bool(fact.value.strip())
+            elif field in FINANCIAL_IMPROVEMENT_FIELDS:
+                period = period_info(fact.period)
+                okay = period is not None and period[1] <= now.date() and finite_value(fact)
+                if field in _FINANCIAL_AMOUNTS:
+                    okay = okay and fact.unit in {"CNY", "元", "万元", "亿元"}
+                else:
+                    okay = okay and fact.normalized_value is not None
             elif field == "market_session":
                 okay = finite_value(fact) and bool(_date(fact))
             elif field == "market_session_count":
@@ -81,6 +98,15 @@ def evidence_status(call, facts, now):
         if not valid:
             output["invalid_fields"].append(field)
         valid_by_field[field] = valid
+    financial_fields = set(required).intersection(FINANCIAL_IMPROVEMENT_FIELDS)
+    if financial_fields:
+        periods = [period_info(fact.period)[1] for field in financial_fields for fact in valid_by_field.get(field, ())]
+        if periods:
+            latest = max(periods)
+            for field in financial_fields:
+                records = valid_by_field.get(field, ())
+                if records and not any(period_info(fact.period)[1] == latest for fact in records):
+                    output["invalid_fields"].append(field)
     # A count pair or cash-flow pair must refer to one actual entity/date/unit.
     for left, right in (("advancing_count", "market_total_count"), ("capital_flow", "turnover_value")):
         if left not in required or right not in required:

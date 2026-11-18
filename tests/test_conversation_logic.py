@@ -133,18 +133,48 @@ def test_chat_bubbles_stay_simple_while_chain_holds_details_and_export():
     assert any('范围说明放入逻辑链' in item.value for item in app.caption)
 
 
-def test_research_page_renders_only_one_chain_outside_the_chat_bubbles():
+@pytest.mark.parametrize('layout', [
+    (),
+    ('user',),
+    ('user', 'assistant', CHAIN_TITLE),
+    ('user', 'assistant', CHAIN_TITLE, 'user'),
+    ('user', 'assistant', 'user', 'assistant', CHAIN_TITLE),
+])
+@pytest.mark.parametrize('page', ['research', 'history'])
+def test_conversation_pages_show_one_chain_below_the_latest_answer(layout, page):
+    turns = dict(zip(('user', 'assistant'), messages()))
+    data = [turns[role] for role in layout if role != CHAIN_TITLE]
     script = ('from unittest.mock import patch\nimport streamlit as st\nfrom frontend import streamlit_app as ui\n'
               'ui.init_session()\nst.session_state.profile.update(confirmed=True, risk_level="R3")\n'
-              f'st.session_state.conversation = {messages()!r}\n'
-              "with patch.object(ui, 'render_page_header'), patch.object(ui, 'render_research_guide'), \\\n"
-              "     patch.object(ui, 'render_research_board'), patch.object(ui, 'render_prepared_stock_report'), \\\n"
-              "     patch.object(ui, 'restore_board_scroll'):\n"
-              "    ui.render_research_page('http://offline', '个股研究')\n")
+              f'st.session_state.conversation = {data!r}\n')
+    if CHAIN_TITLE in layout:
+        conversation_id = "st.session_state.conversation_id" if page == 'research' else "'saved'"
+        script += ('from frontend.conversation_logic import chain_key\n'
+                   f'key = chain_key({conversation_id})\n'
+                   "st.session_state[key] = True\n"
+                   "st.session_state[key + '_rag_manager'] = True\n")
+    if page == 'research':
+        script += ("with patch.object(ui, 'render_page_header'), patch.object(ui, 'render_research_guide'), \\\n"
+                   "     patch.object(ui, 'render_research_board'), patch.object(ui, 'render_prepared_stock_report'), \\\n"
+                   "     patch.object(ui, 'restore_board_scroll'):\n"
+                   "    ui.render_research_page('http://offline', '个股研究')\n")
+    else:
+        script += ("record = {'id': 'saved', 'title': '研究对话', 'message_count': len(st.session_state.conversation),\n"
+                   "          'updated_at': '2026-11-17T08:00:00Z'}\n"
+                   "detail = dict(record, messages=st.session_state.conversation)\n"
+                   "with patch.object(ui, 'api_request', side_effect=[[record], detail]):\n"
+                   "    ui.page_conversations('http://offline')\n")
     app = run(script)
-    assert len([e for e in [*app.expander, *app.status] if e.label == CHAIN_TITLE]) == 1
+    displayed = [node.name if node.type == 'chat_message' else CHAIN_TITLE
+                 for node in app.main.children.values()
+                 if node.type == 'chat_message' or getattr(node, 'label', None) == CHAIN_TITLE]
+    assert displayed == list(layout)
+    panels = [*app.expander, *app.status]
+    assert sum(item.label == CHAIN_TITLE for item in panels) == layout.count(CHAIN_TITLE)
+    assert all(item.label != 'RAG知识库 · 资料导入与检索' for item in panels)
+    if CHAIN_TITLE in layout:
+        assert any(item.label == '查看本对话的咨询轮次' for item in app.selectbox)
     assistants = [b for b in app.get('chat_message') if b.name == 'assistant']
-    assert assistants
     assert all(not b.expander and not b.status and not b.dataframe and not b.caption for b in assistants)
 
 

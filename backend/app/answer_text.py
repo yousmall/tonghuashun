@@ -20,6 +20,43 @@ _GENERIC_PREFIX = re.compile(
 )
 _PARENTHETICAL = re.compile(r"[（(][^（）()\n]{1,65}[）)]")
 _CLAUSE = re.compile(r"[\s\S]+?(?:[，。；！？;!?\n]+|$)")
+_RESEARCH_SECTION = re.compile(
+    r"(?<![^\n：:。！？；!?;])[ \t]*(?:[-•]\s+|#{1,6}\s+)?(?:\*\*)?"
+    r"(?:(?P<evaluation>核心判断|核心结论|主要结论|投资评价|行业评价|市场评价|投资含义|实际意义|评价)"
+    r"|(?P<basis>支持证据|反面证据|反对证据|支持依据|关键依据|数据依据"
+    r"|判断限制|判断边界|结论限制|证据缺口与判断限制|证据缺口|限制))"
+    r"(?:\*\*)?(?:[：:](?:\*\*)?|(?=[ \t]*\n))[ \t]*"
+)
+_RESEARCH_TOPICS = re.compile(r"\n[ \t]*\n(?=(?:市场|行业|个股|基金|持仓|财报分析|分析)[：:])")
+_RESEARCH_TOPIC = re.compile(r"(?:市场|行业|个股|基金|持仓|财报分析|分析)[：:]")
+
+
+def split_research_conclusion(value: str | None) -> tuple[str, str]:
+    """Separate explicitly labeled rationale without rewriting the actual judgments."""
+    evaluations, rationale = [], []
+    for topic in _RESEARCH_TOPICS.split((value or "").strip()):
+        sections = list(_RESEARCH_SECTION.finditer(topic))
+        if not sections:
+            if topic:
+                evaluations.append(topic)
+            continue
+        prefix = topic[:sections[0].start()].strip()
+        judgments = []
+        for index, section in enumerate(sections):
+            end = sections[index + 1].start() if index + 1 < len(sections) else len(topic)
+            body = topic[section.end():end].strip()
+            if not body:
+                continue
+            if section.group("basis"):
+                rationale.append(f"{section.group('basis')}：{body}")
+            else:
+                judgments.append(body)
+        if _RESEARCH_TOPIC.fullmatch(prefix):
+            if judgments:
+                evaluations.append(prefix + "\n\n".join(judgments))
+        else:
+            evaluations.extend([text for text in (prefix, *judgments) if text])
+    return "\n\n".join(evaluations), "\n\n".join(rationale)
 
 
 def clean_answer_text(value: str | None) -> str:
@@ -84,6 +121,7 @@ def clean_advice(advice):
         }),
         "agent_results": [result.model_copy(update={
             "opinion": clean_answer_text(result.opinion),
+            "conclusion": clean_answer_text(result.conclusion) or None,
             "risk_flags": _clean_list(result.risk_flags),
             "confidence_reasons": _clean_list(result.confidence_reasons),
             "invalidation_conditions": _clean_list(result.invalidation_conditions),

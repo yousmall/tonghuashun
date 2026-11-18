@@ -25,9 +25,9 @@ from backend.app.services.provider_errors import ProviderCallError
 import httpx
 from backend.app.http_clients import verified_ssl_context
 
-from backend.app.fact_taxonomy import METADATA_FIELD_NAMES
+from backend.app.fact_taxonomy import METADATA_FIELD_NAMES, adjusted_profit_field
 from backend.app.models import FactRecord
-from backend.app.fact_units import PERCENT_FIELDS
+from backend.app.fact_units import PERCENT_FIELDS, period_info
 from backend.app.fund_fields import FUND_RETURNS, FUND_PROFILE, FUND_FEES, FUND_RISK, FUND_ALLOCATION, FUND_MONEY
 
 SKILL_KEY_ENV = {
@@ -134,6 +134,11 @@ FIELD_ALIASES = {
     "营业收入": "revenue",
     "归母净利润": "net_profit",
     "归母净利润同比增长率": "net_profit_growth",
+    "经营活动产生的现金流量净额": "operating_cash_flow",
+    "经营活动现金流量净额": "operating_cash_flow",
+    "非经常性损益合计": "non_recurring_profit_loss",
+    "非经常性损益净额": "non_recurring_profit_loss",
+    "合同负债": "contract_liabilities",
     "综合评分": "fundamental_score",
     "综合评分排名": "fundamental_rank",
     "所属同花顺行业": "industry",
@@ -207,6 +212,11 @@ FIELD_ALIASES = {
     "剩余规模": "remaining_size",
     "债券余额": "remaining_size",
     "转股价值": "conversion_value",
+    "纯债价值": "pure_bond_value",
+    "正股简称": "underlying_stock",
+    "正股所属行业": "underlying_industry",
+    "强赎状态": "redemption_status",
+    "下修状态": "reset_status",
     "债券评级": "bond_rating",
     "转股价": "conversion_price",
 }
@@ -336,7 +346,11 @@ SEARCH_CHANNEL_INDEX: dict[str, tuple[tuple[str, str], ...]] = {
 class IwencaiSkillHubProvider:
     """把问财自然语言查询结果转换为带来源和时点的 FactRecord。"""
 
-    cache_method_aliases = {"get_event_data": "get_announcements"}
+    cache_method_aliases = {
+        "get_event_data": "get_announcements",
+        "get_financial_metrics": "get_financial_metrics_v2",
+        "get_annual_financial_metrics": "get_annual_financial_metrics_v2",
+    }
 
     source_id = "IWENCAI_SKILLHUB"
 
@@ -815,10 +829,25 @@ class IwencaiSkillHubProvider:
 
     async def get_financial_metrics(self, symbol: str) -> list[FactRecord]:
         return await self.query(
-            f"{symbol} 最新财报的市盈率、市净率、ROE、营业收入同比增长率",
+            f"{symbol} 最新市盈率、市净率；最新一期合并财报列出营业收入、归母净利润、扣非归母净利润及"
+            "各自的同比增长率、归属于母公司股东的非经常性损益合计、经营活动现金流量净额、"
+            "毛利率、合同负债和ROE，逐项注明报告期与单位，损益与现金流统一使用年初至报告期末累计口径",
             entity_hint=symbol,
             skill_id="hithink-finance-query",
         )
+
+    async def get_financial_growth_for_period(self, symbol: str, year: int, quarter: int) -> list[FactRecord]:
+        period = period_info(f"{year}Q{quarter}")
+        if period is None:
+            return []
+        report = {1: "一季报", 2: "半年报", 3: "三季报", 4: "年报"}[quarter]
+        rows = await self.query(
+            f"{symbol} {year}年{report}的营业收入同比增长率、归母净利润同比增长率",
+            entity_hint=symbol,
+            skill_id="hithink-finance-query",
+        )
+        return [row for row in rows if row.field in {"revenue_growth", "net_profit_growth"}
+                and (observed := period_info(row.period)) is not None and observed[1] == period[1]]
 
     async def get_annual_financial_metrics(self, symbol: str, year: int) -> list[FactRecord]:
         return await self.query(
@@ -835,6 +864,14 @@ class IwencaiSkillHubProvider:
         )
 
     async def get_fund_candidates(self, filters: dict[str, object]) -> list[FactRecord]:
+        target = filters.get("target")
+        fields = filters.get("fields")
+        if isinstance(target, str) and target and isinstance(fields, str) and fields:
+            from backend.app.services.market_overview import fund_snapshot
+
+            question = str(filters.get("research_question") or "").strip()
+            detail = f"；为核对「{question}」，只返回该基金相关且有披露的数据" if question else ""
+            return await fund_snapshot(self, target, fields + detail)
         filter_text = " ".join(f"{key}={value}" for key, value in sorted(filters.items()))
         return await self.query(
             f"筛选基金和ETF {filter_text}".strip(),
@@ -854,8 +891,11 @@ class IwencaiSkillHubProvider:
         return [f for f in facts if not f.entity_code or f.entity_code.upper().endswith('.TI')]
 
     async def get_convertible_bond(self, target: str) -> list[FactRecord]:
+        if target == "全部可转债":
+            return await self.query("可转债按成交额从高到低前8只，最新价、涨跌幅、转股溢价率", limit=8)
         return await self.query(
-            f"{target} 可转债最新价、涨跌幅、转股溢价率、纯债溢价率、到期收益率、剩余规模、债券评级和转股价",
+            f"{target} 可转债最新价、涨跌幅、转股溢价率、纯债溢价率、到期收益率、剩余规模、债券评级、转股价、"
+            "转股价值、纯债价值、正股简称、正股所属行业、强赎状态和下修状态",
             entity_hint=target,
         )
 
@@ -938,6 +978,14 @@ class IwencaiSkillHubProvider:
     async def get_announcements(self, target: str) -> list[FactRecord]:
         return await self._comprehensive_search(
             f"{target} 最新上市公司公告",
+            channel="announcement",
+            entity_hint=target,
+        )
+
+    async def get_latest_financial_report(self, target: str) -> list[FactRecord]:
+        return await self._comprehensive_search(
+            f"{target} 最近一期正式定期财务报告全文，季度报告、半年度报告或年度报告，"
+            "排除摘要、业绩预告和审计报告，返回公告日期和官方PDF链接",
             channel="announcement",
             entity_hint=target,
         )
@@ -1184,7 +1232,9 @@ def _percentage_unit(field: str, source_field: str, record: Mapping[str, Any], *
             return currency or declared_currency
         match = re.search(r"[\[(（](人民币|港元|港币|美元|CNY|HKD|USD|元)[\])）]", source_field)
         return currencies.get(match[1]) if match else None
-    if field in {"capital_flow", "turnover_value", "avg_turnover_20d", "interval_avg_turnover", "revenue", "net_profit"}:
+    if field in {"capital_flow", "turnover_value", "avg_turnover_20d", "interval_avg_turnover", "revenue",
+                 "net_profit", "profit_excluding_non_recurring", "operating_cash_flow", "non_recurring_profit_loss",
+                 "contract_liabilities"}:
         if declared in {"CNY", "元", "万元", "亿元"}:
             return "CNY" if declared == "元" else declared
         match = re.search(r"[\[(（](亿元|万元|元)[\])）]", source_field)
@@ -1319,6 +1369,12 @@ class CompositeProvider:
     async def get_announcements(self, target: str) -> list[FactRecord]:
         return await self._merge("get_announcements", target)
 
+    async def get_latest_financial_report(self, symbol: str) -> list[FactRecord]:
+        return await self._merge("get_latest_financial_report", symbol)
+
+    async def get_financial_growth_for_period(self, symbol: str, year: int, quarter: int) -> list[FactRecord]:
+        return await self._merge("get_financial_growth_for_period", symbol, year, quarter)
+
     async def get_governance_disclosures(self, target: str) -> list[FactRecord]:
         return await self._merge("get_governance_disclosures", target)
 
@@ -1407,6 +1463,9 @@ def _variant_field(key: str) -> str:
     只有确实没有口径标记时才交给别名表落到默认字段。
     """
 
+    adjusted = adjusted_profit_field(key)
+    if adjusted:
+        return adjusted
     if "市盈率" in key:
         if "静态" in key:
             return "pe_static"

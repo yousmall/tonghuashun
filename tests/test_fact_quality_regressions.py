@@ -26,6 +26,7 @@ from backend.app.data_provider.iwencai import (
     _record_scope,
 )
 from backend.app.fact_taxonomy import fact_is_current, fact_max_age_seconds
+from backend.app.services.model_input import slice_facts_for_agent
 from backend.app.models import (
     AgentResult,
     FactRecord,
@@ -52,6 +53,10 @@ FINANCIAL_ROW = {
     "最新a股流通市值": "1564152100000.000",
     "加权净资产收益率[20260630]": 16.75,
     "营业收入[20260630]": 90703260964.48,
+    "归母净利润[20260630]": 450,
+    "归母净利润同比增长率[20260630]": -0.25,
+    "扣非归母净利润[20260630]": 420,
+    "扣非归母净利润同比增长率[20260630]": 1.5,
 }
 
 
@@ -80,6 +85,9 @@ FINANCIAL_ROW = {
         ("涨跌额", "change_amount"),
         ("营业收入同比增长率[20260630]", "revenue_growth"),
         ("营业收入[20260630]", "revenue"),
+        ("扣非归母净利润[20260930]", "profit_excluding_non_recurring"),
+        ("扣除非经常性损益后的归母净利润同比增长率[20260930]", "profit_excluding_non_recurring_growth"),
+        ("归母净利润同比增长率[20260930]", "net_profit_growth"),
     ],
 )
 def test_metric_aliases_keep_variants_apart(raw: str, expected: str) -> None:
@@ -110,8 +118,32 @@ async def test_financial_payload_normalizes_into_distinct_fields() -> None:
     assert by_field["roe"] == 17.9543
     assert by_field["roe_weighted"] == 16.75
     assert by_field["revenue_growth"] == 1.4699
+    assert by_field["net_profit"] == 450
+    assert by_field["profit_excluding_non_recurring"] == 420
+    assert by_field["net_profit_growth"] == -0.25
+    assert by_field["profit_excluding_non_recurring_growth"] == 1.5
+    adjusted_growth = next(fact for fact in facts if fact.field == "profit_excluding_non_recurring_growth")
+    assert adjusted_growth.period == "2026-06-30" and adjusted_growth.normalized_value == 1.5
     # 每个字段只应出现一次：重复出现即说明口径又被合并了。
     assert len(facts) == len({fact.field for fact in facts})
+
+
+def test_financial_attribution_keeps_dated_profit_and_report_lineage():
+    current = datetime.now(timezone.utc)
+
+    def fact(field, **updates):
+        row = dict(fact_id=field, entity="示例公司", field=field, value=10,
+                   quality=.9, snapshot_time=current, source_id="TEST")
+        return FactRecord(**{**row, **updates})
+
+    dated = fact("net_profit_growth", period="2025-09-30", unit="percent")
+    undated = fact("revenue_growth", unit="percent")
+    quote = fact("close_price", unit="CNY")
+    title = fact("announcement", value="示例公司2025年第三季度报告")
+    page = fact("announcement_excerpt", value="非经常性损益项目和金额", derived_from=[title.fact_id],
+                source_id="OFFICIAL_DISCLOSURE_PDF_V1", derivation_rule="PDF_TEXT_V1: financial report excerpt")
+    picked = slice_facts_for_agent([dated, undated, quote, title, page], "security", [], financial_improvement=True)
+    assert {row.fact_id for row in picked} == {dated.fact_id, title.fact_id, page.fact_id}
 
 
 @pytest.mark.asyncio

@@ -12,6 +12,13 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from backend.app.models import FactRecord
 
+def adjusted_profit_field(raw: str) -> str | None:
+    """Identify the source's explicitly adjusted profit amount or its year-on-year change."""
+    if "净利润" in raw and ("扣非" in raw or "扣除非经常性损益" in raw):
+        return "profit_excluding_non_recurring_growth" if "同比" in raw else "profit_excluding_non_recurring"
+    return None
+
+
 FAST_MARKET_FIELDS = frozenset(
     {"capital_flow_ratio", "interval_change", "interval_avg_turnover", "name_contains_st", "close_price", "change", "change_amount", "volume", "turnover_rate", "volatility",
      "capital_flow", "turnover_value", "market_advancing_ratio", "industry_turnover_percentile",
@@ -69,7 +76,9 @@ SLOW_FINANCIAL_FIELDS = frozenset(
         "pb",
         "roe",
         "roe_weighted",
-        "revenue_growth",
+        "revenue_growth", "revenue", "net_profit", "net_profit_growth",
+        "profit_excluding_non_recurring", "profit_excluding_non_recurring_growth",
+        "operating_cash_flow", "non_recurring_profit_loss", "contract_liabilities",
         "fee_rate",
         "tracking_error",
         "gross_margin", "net_margin", "operating_margin",
@@ -116,6 +125,11 @@ FIELD_LABELS: dict[str, str] = {
     "roe_weighted": "加权净资产收益率",
     "revenue": "营业收入", "net_profit": "归母净利润", "net_profit_growth": "归母净利润同比增长率",
     "revenue_growth": "营业收入增长率",
+    "profit_excluding_non_recurring": "扣非归母净利润",
+    "profit_excluding_non_recurring_growth": "扣非归母净利润同比增长率",
+    "operating_cash_flow": "经营活动现金流量净额",
+    "non_recurring_profit_loss": "非经常性损益合计",
+    "contract_liabilities": "合同负债",
     "fee_rate": "费率",
     "tracking_error": "跟踪误差",
     "weight": "持仓权重",

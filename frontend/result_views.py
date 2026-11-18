@@ -5,16 +5,17 @@ from typing import Any
 import re
 from urllib.parse import urlsplit, urlunsplit
 import streamlit as st
+from backend.app.answer_text import split_research_conclusion
 from frontend.charts import render_chart
 from frontend.research_report import render_research_report, report_sections
 from frontend.insight_panel import render_insight_panel
 from frontend.cross_validation_view import render_validation_panel
 from frontend.answer_report import answer_images, build_answer_pdf, chart_groups, cited_facts
 from frontend.presentation import (plain_language, render_conclusion_panel, render_logic_chain, render_source_trace, source_trace_rows, friendly_fact_rows, TOPIC_LABELS)
-from frontend.presentation import render_verification_records
+from frontend.presentation import render_risk_summary, render_verification_records, risk_summary
 from frontend.logic_drilldown import render_logic_drilldown
 from frontend.investment_panel import render_investment_panel, investment_summary
-from frontend.answer_visibility import coverage_notices, verification_notes, visible_risks, visible_next_steps, visible_risk_conclusion, visible_compliance_reason
+from frontend.answer_visibility import verification_notes, visible_next_steps
 
 
 def show_status(status: str) -> None:
@@ -125,28 +126,10 @@ def render_automatic_answer(advice: dict[str, Any]) -> None:
 
 def render_advice(advice: dict[str, Any], *, export_key: str = "answer", question: str = "", compact: bool = False) -> None:
     """Conversation bubbles contain only the reviewed conclusion and material risks."""
-    compliance = advice.get("compliance") or {}
     st.markdown("**分析结论**")
-    st.write(plain_language(advice.get("conclusion")) or "现有资料不足，暂时无法作出判断。")
-    st.markdown("**风险结论**")
-    risks = [visible_risk_conclusion(advice), *visible_risks(advice),
-             *compliance.get("required_disclosures", []), compliance.get("risk_notice")]
-    if compliance.get("status") == "BLOCK":
-        risks.insert(0, "本次风险检查未通过，暂不形成可执行的投资建议。")
-    elif compliance.get("status") != "PASS" and ("LIMITED_CONSULTATION" not in (compliance.get("matched_rules") or [])
-                                                  or (advice.get("cross_validation") or {}).get("issues")):
-        risks.insert(0, "这份分析仍需核实。")
-    if (advice.get("data_acquisition") or {}).get("mode") == "demo" or any(
-            fact.get("source_id") == "DEMO_SNAPSHOT" for fact in advice.get("facts") or []):
-        risks.append("本结果含示例数据，仅用于演示。")
-    reason = visible_compliance_reason(advice)
-    if compliance.get("status") != "PASS" and reason:
-        risks.append(reason)
-    risks = list(dict.fromkeys(text for value in risks if (text := plain_language(value))))
-    if not risks:
-        risks = ["标的价格可能波动，持有期间可能出现亏损。"]
-    for value in risks:
-        st.write(value)
+    evaluation, _ = split_research_conclusion(advice.get("conclusion"))
+    st.write(plain_language(evaluation) or "本次未形成可用的评价。")
+    render_risk_summary(advice, key=export_key)
 
 
 def render_advice_details(advice: dict[str, Any], *, export_key: str = "answer", question: str = "", compact: bool = False) -> None:
@@ -185,14 +168,9 @@ def render_advice_details(advice: dict[str, Any], *, export_key: str = "answer",
         st.caption("历史记录保留了部分引用资料；未保存的依据无法在此恢复，请重新核验后再使用。")
     if compact:
         st.markdown("**分析结论**")
-        st.write(plain_language(advice.get("conclusion")) or "资料不足，暂未形成结论。")
-        risks = [visible_risk_conclusion(advice), *visible_risks(advice),
-                 *compliance.get("required_disclosures", []), compliance.get("risk_notice")]
-        risks = list(dict.fromkeys(text for value in risks if (text := plain_language(value))))
-        if risks:
-            st.markdown("**风险与待核实事项**")
-            for value in risks:
-                st.write("- " + value)
+        evaluation, _ = split_research_conclusion(advice.get("conclusion"))
+        st.write(plain_language(evaluation) or "本次未形成可用的评价。")
+        render_risk_summary(advice, key=export_key)
         render_investment_panel(advice, key=export_key, compact=True)
         render_validation_panel(advice, key=export_key)
         with st.expander("展开这条回答的图表与完整分析", key=f"answer_details_{export_key}", on_change="rerun") as details:
@@ -259,15 +237,11 @@ def cached_answer_images(advice: dict[str, Any]) -> list[tuple[str, bytes]]:
 
 
 def answer_export_payload(advice: dict[str, Any], images: list, question: str = "") -> dict:
-    compliance = advice.get("compliance", {})
-    acquisition = advice.get("data_acquisition", {})
-    notices = ["风险检查：" + {"PASS": "可供参考，仍有投资风险", "BLOCK": "暂不提供投资建议"}.get(compliance.get("status"), "仍需进一步核实")]
-    if acquisition.get("mode") == "demo" or any(fact.get("source_id") == "DEMO_SNAPSHOT" for fact in advice.get("facts", [])):
-        notices.append("本结果含示例数据，仅用于演示。")
+    summary, details = risk_summary(advice)
     sections = [
         ("分析结论", [advice.get("conclusion") or "资料不足，暂未形成结论。"]),
-        ("风险结论", [visible_risk_conclusion(advice) or "请结合资料完整性及个人承受能力进一步核实。", *notices, visible_compliance_reason(advice), compliance.get("risk_notice")]),
-        ("需要注意", [*visible_risks(advice), *compliance.get("required_disclosures", [])]),
+        ("风险结论", summary),
+        ("风险详情", details),
         ("后续研究建议", visible_next_steps(advice)),
         ("与您的投资偏好是否匹配", [advice.get("user_fit")]),
     ]

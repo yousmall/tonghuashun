@@ -110,12 +110,16 @@ st.text_input('可继续提问')
     assert any('测试行业' in item.value for item in app.markdown)
 
 
-def test_preset_click_removes_only_that_question_and_new_conversation_restores_it(monkeypatch):
+def test_preset_stays_visible_during_analysis_and_can_be_clicked_again(monkeypatch):
     import streamlit as st
     from frontend import streamlit_app as ui
-    def submit(base,direction,query):
-        st.session_state.sent=query
-    monkeypatch.setattr(ui,'submit_chat_analysis',submit)
+
+    def submit(base, direction, query):
+        st.session_state.setdefault('sent', []).append(query)
+        st.session_state.conversation.append({'role': 'user', 'content': query})
+        st.session_state.setdefault('analysis_jobs', {})[direction] = {}
+
+    monkeypatch.setattr(ui, 'submit_chat_analysis', submit)
     script = '''
 import streamlit as st
 from frontend import streamlit_app as ui
@@ -126,11 +130,17 @@ ui.render_preset_questions('test-only','市场解读')
     app = AppTest.from_string(script).run(timeout=15)
     original = list(app.pills[0].options)
     app.pills[0].set_value(original[0]).run(timeout=15)
-    assert not app.exception and original[0] in app.session_state['sent']
-    assert len(app.pills[0].options)==2
-    app.session_state['conversation_id']='new-conversation'
+    expected = '市场解读：' + original[0]
+    assert not app.exception and app.session_state['sent'] == [expected]
+    assert app.pills[0].options == original
+    assert app.pills[0].proto.disabled
+    app.session_state['analysis_jobs'] = {}
     app.run(timeout=15)
-    assert len(app.pills[0].options)==3
+    assert app.pills[0].options == original
+    assert not app.pills[0].proto.disabled
+    assert app.pills[0].value is None
+    app.pills[0].set_value(original[0]).run(timeout=15)
+    assert not app.exception and app.session_state['sent'] == [expected, expected]
 
 
 def test_logout_clears_incoming_feature_account_state():
@@ -262,4 +272,4 @@ ui.render_preset_questions('test-only', '市场解读')
     app.pills[0].set_value(question).run(timeout=20)
     assert not app.exception
     assert app.session_state['sent'] == '市场解读：' + question
-    assert len(app.pills[0].options) == 2
+    assert len(app.pills[0].options) == 3

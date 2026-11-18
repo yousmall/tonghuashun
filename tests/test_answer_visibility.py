@@ -5,6 +5,7 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 from frontend.answer_visibility import verification_notes, visible_risks, visible_next_steps
+from frontend.presentation import risk_summary
 from frontend.result_views import answer_export_payload
 
 
@@ -38,11 +39,13 @@ def test_latest_and_history_hide_diagnostics_by_default_but_keep_review_and_real
     assert "尚缺" not in body and "宏观流动性数据缺失" not in body
     assert "补齐各专业智能体" not in body
     assert "集中度风险较高" in body and "提价对业绩影响尚不明确" in body
-    assert "观点存在分歧" in body
-    assert "仍需核实" in body
+    assert "观点存在分歧" not in body
+    assert body.count("仍需核实") == 1
     assert "收益承诺" not in body
     assert [item.value for item in app.markdown if item.value.startswith("**")] == ["**分析结论**", "**风险结论**"]
-    assert not app.expander and not app.dataframe and not app.caption
+    assert [item.label for item in app.expander] == ["查看风险详情"]
+    assert not app.expander[0].proto.expanded
+    assert not app.dataframe and not app.caption
 
 
 def test_projection_preserves_original_audit_and_pdf_keeps_details_in_appendix():
@@ -52,13 +55,34 @@ def test_projection_preserves_original_audit_and_pdf_keeps_details_in_appendix()
     assert "补齐各专业智能体列出的缺失字段" not in visible_next_steps(data)
     assert any("毛利率同项记录" in text for text in verification_notes(data))
     exported = dict(answer_export_payload(data, [], "测试问题")["sections"])
-    assert "同项记录不一致" not in "\n".join(exported["需要注意"])
-    assert "证据不足" not in "\n".join(exported["需要注意"])
+    assert "同项记录不一致" not in "\n".join(exported["风险详情"])
+    assert "证据不足" not in "\n".join(exported["风险详情"])
     assert "同项记录不一致" not in "\n".join(exported["风险结论"])
-    assert "集中度风险较高" in "\n".join(exported["需要注意"])
+    assert any("集中度风险较高" in text for text in exported["风险结论"])
+    assert any("观点存在分歧" in text for text in exported["风险详情"])
     assert "收益承诺" not in str(exported)
     assert any("同项记录不一致" in text for text in exported["核验记录（附录）"])
     assert data == original and data["compliance"]["status"] == "REVIEW"
+
+
+def test_risk_summary_does_not_truncate_qualified_risks_or_repeat_review_notices():
+    qualified = "费率缺失，无法判断费用对净收益的影响；只有取得费率和换手率后才能核实成本，不能把跟踪误差直接当作收益损失。"
+    data = {
+        "risk_conclusion": "本次分析仍需核实。",
+        "compliance": {"status": "REVIEW", "reason": "这份分析仍需核实。"},
+        "risks": [qualified, "可能有赎回风险。", "可能有赎回风险", "持仓集中度过高。", "注意价格波动。"],
+    }
+    summary, details = risk_summary(data)
+    assert summary == ["风险仍需核实。", "可能有赎回风险。", "持仓集中度过高。"]
+    assert details == [qualified, "注意价格波动。"]
+
+
+def test_block_and_demo_notices_stay_visible_even_when_risk_details_are_long():
+    data = {"compliance": {"status": "BLOCK"}, "data_acquisition": {"mode": "demo"},
+            "risk_conclusion": "风险检查未通过，暂不提供投资建议。"}
+    summary, details = risk_summary(data)
+    assert summary == ["风险检查未通过，暂不提供投资建议。", "本结果含示例数据，仅用于演示。"]
+    assert not details
 
 
 @pytest.mark.parametrize("risk", [

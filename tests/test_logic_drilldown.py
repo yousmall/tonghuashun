@@ -120,6 +120,41 @@ def test_drilldown_keeps_only_verified_evidence():
     assert "02 · 个股研究 · 2 条数据点" in text
 
 
+def test_evidence_explanation_appears_in_logic_chain_not_chat_summary():
+    data = advice()
+    basis = "本期市盈率为18倍，估值与盈利基本匹配。"
+    data["agent_results"][1]["opinion"] = basis
+    app = run("import streamlit as st\n"
+              "from frontend.result_views import render_advice\n"
+              "from frontend.logic_drilldown import render_logic_drilldown\n"
+              f"with st.chat_message('assistant'):\n    render_advice({data!r})\n"
+              f"render_logic_drilldown({data!r})")
+    assert not app.exception
+    bubble = "\n".join(item.value for item in app.get("chat_message")[0].markdown)
+    assert data["conclusion"] in bubble and "18倍" not in bubble
+    assert basis in rendered_text(app)
+
+
+def test_legacy_evidence_and_limits_move_out_of_chat_without_losing_evaluation():
+    data = advice(conclusion=(
+        "市场：核心判断：景气偏结构性，并非普遍复苏。支持证据：制造业指标低于荣枯线。"
+        "判断限制：观测窗口较短。投资评价：产业链走强更值得跟踪。\n\n"
+        "行业：**核心判断**：需求侧线索强于政策侧。\n**反面证据**\n尚无订单改善的量化记录。"
+    ))
+    app = run("import streamlit as st\n"
+              "from frontend.result_views import render_advice\n"
+              "from frontend.logic_drilldown import render_logic_drilldown\n"
+              f"with st.chat_message('assistant'):\n    render_advice({data!r})\n"
+              f"render_logic_drilldown({data!r})")
+    assert not app.exception
+    bubble = "\n".join(item.value for item in app.get("chat_message")[0].markdown)
+    for evaluation in ("市场：景气偏结构性，并非普遍复苏", "产业链走强更值得跟踪", "行业：需求侧线索强于政策侧"):
+        assert evaluation in bubble
+    chain = rendered_text(app)
+    for rationale in ("制造业指标低于荣枯线", "观测窗口较短", "尚无订单改善的量化记录"):
+        assert rationale not in bubble and rationale in chain
+
+
 def test_drilldown_hidden_when_compliance_blocks():
     blocked = advice(compliance={"status": "BLOCK"})
     app = run(f"from frontend.logic_drilldown import render_logic_drilldown\n"

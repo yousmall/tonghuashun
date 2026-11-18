@@ -23,14 +23,20 @@ from backend.app.models import (
     OrchestrationRequest,
     ResearchCapability,
 )
-from backend.app.fact_taxonomy import fact_is_current, fact_max_age_seconds
+from backend.app.fact_taxonomy import adjusted_profit_field, fact_is_current, fact_max_age_seconds
 from backend.app.fact_units import PERCENT_FIELDS
+from backend.app.fund_fields import FUND_ALLOCATION, FUND_FEES, FUND_RETURNS, FUND_RISK
+from backend.app.research_routing import user_question
 from backend.app.services.evidence_coverage import missing_fields_by_agent
 from backend.app.services.research_cache import ResearchFactCache
 from backend.app.services.provider_errors import failure_summary
 from backend.app.services.scoring_dimensions import additional_dimensions
 from backend.app.services.derived_score_cache import DerivedScoreCache
-from backend.app.services.research_requirements import evidence_status
+from backend.app.services.research_requirements import (
+    FINANCIAL_IMPROVEMENT_FIELDS,
+    evidence_status,
+    is_financial_improvement_question,
+)
 
 
 @dataclass(frozen=True)
@@ -140,6 +146,13 @@ class AutomatedResearchPipeline:
                              if fact.field.casefold() not in {"weight", "portfolio_weight", "sector_weight"}]
             request = request.model_copy(update={"facts": current_facts})
         supplied = [fact.model_copy(deep=True) for fact in request.facts]
+        for fact in supplied:
+            if (fact.source_id == "IWENCAI_SKILLHUB" and fact.field in {"net_profit", "net_profit_growth"}
+                    and fact.source_field):
+                field = adjusted_profit_field(fact.source_field)
+                if field:
+                    fact.field = field
+                    fact.normalize_percentage()
         portfolio_facts = self._portfolio_facts(request)
         base_facts = _merge_by_fact_id([*supplied, *portfolio_facts])
 
@@ -324,7 +337,9 @@ class AutomatedResearchPipeline:
                 latest[field] = fact
         if not any(field not in NON_SUBSTANTIVE_FIELDS for field in latest):
             return False
-        return all(fact_is_current(fact, now) for fact in latest.values())
+        return all(fact_is_current(fact, now) for fact in latest.values()) and (
+            not call.required_fields or evidence_status(call, list(latest.values()), now)["status"] == "complete"
+        )
 
     @staticmethod
     def _research_scope(request: OrchestrationRequest, intent: Intent, target: str | None) -> str:
@@ -352,7 +367,8 @@ class AutomatedResearchPipeline:
         target: str | None = None,
         data_requirements: list[ResearchCapability] | None = None,
     ) -> list[DataCall]:
-        query_text = request.query
+        if request.industry_collaboration and intent is Intent.INDUSTRY_ANALYSIS:
+            return self._collaboration_calls(target)
         research_target = self._research_scope(request, intent, target)
         routes: dict[Intent, tuple[tuple[str, str], ...]] = {
             Intent.MARKET_ANALYSIS: (
@@ -396,13 +412,15 @@ class AutomatedResearchPipeline:
                      key=f"{method}@{research_target}")
             for name, method in routes[intent]
         ]
+        if intent is Intent.SECURITY_RESEARCH and target and is_financial_improvement_question(user_question(request.query)):
+            calls = [DataCall(call.label, call.method, call.args, call.key,
+                              required_fields=FINANCIAL_IMPROVEMENT_FIELDS, expected_entity=target)
+                     if call.method == "get_financial_metrics" else call for call in calls]
+            if callable(getattr(self.provider, "get_latest_financial_report", None)):
+                calls.append(DataCall("financial_report", "get_latest_financial_report", (target,),
+                                      f"get_latest_financial_report@{research_target}", expected_entity=target))
         if intent is Intent.FUND_SCREENING:
-            filters = {
-                "query": request.query,
-                "risk_level": request.profile.risk_level or "未指定",
-            }
-            calls.append(DataCall(label="fund", method="get_fund_candidates", args=(filters,),
-                                  key=f"get_fund_candidates@{research_target}"))
+            calls.append(self._fund_call(request, target, research_target))
         if intent is Intent.PORTFOLIO_REVIEW:
             for index, holding in enumerate(request.portfolio[: self.max_portfolio_entities], start=1):
                 if not isinstance(holding, dict):
@@ -447,11 +465,15 @@ class AutomatedResearchPipeline:
 
     @staticmethod
     def _validated_target(request: OrchestrationRequest, target: str | None) -> str | None:
+        if request.industry_collaboration:
+            return (request.research_target or "").strip() or None
         codes = set(re.findall(r"(?<!\d)\d{6}(?!\d)", request.query))
         if len(codes) == 1:
             return next(iter(codes))  # explicit current symbol takes precedence
         if not target or codes:
             return None
+        if target.strip().casefold() == (request.research_target or "").strip().casefold():
+            return target.strip()
         user_text = " ".join([request.query, *(turn.content for turn in request.context_messages[-10:] if turn.role == "user"),
                               *(fact.entity for fact in request.facts),
                               *(fact.entity_code or "" for fact in request.facts)])
@@ -468,6 +490,54 @@ class AutomatedResearchPipeline:
         return target.strip()[:60] if target else request.query
 
     @staticmethod
+    def _collaboration_calls(target: str | None) -> list[DataCall]:
+        scope = target or "全部同花顺行业"
+        stock_scope = f"同花顺{target}行业成分股" if target else "各主要同花顺行业的代表性成分股"
+        fund_scope = f"跟踪{target}行业指数的ETF" if target else "跟踪主要行业指数的代表性ETF"
+        bond_scope = f"正股所属同花顺行业为{target}的可转债" if target else "全部可转债"
+        specs = (
+            ("macro", "get_macro_data", "中国最新宏观经济"),
+            ("industry", "get_industry_rank", target or "全部"),
+            ("news", "get_news", f"{scope}景气、盈利与政策风险"),
+            ("stock_screen", "screen_stocks", f"{stock_scope}，列简称、代码、所属同花顺行业、市盈率、营收同比，最多5只"),
+            ("fund", "get_fund_candidates", {"query": f"{fund_scope}，列简称、代码、跟踪标的、管理费率、跟踪误差、风险等级和近一年回撤，最多5只"}),
+            ("convertible", "get_convertible_bond", bond_scope),
+        )
+        return [DataCall(label, method, (argument,), f"{method}@collaboration:{_target_key(scope, scope)}")
+                for label, method, argument in specs]
+
+    @staticmethod
+    def _fund_call(request: OrchestrationRequest, target: str | None, research_target: str) -> DataCall:
+        question = user_question(request.query)
+        if not target:
+            filters = {"query": question, "risk_level": request.profile.risk_level or "未指定"}
+            return DataCall("fund", "get_fund_candidates", (filters,), f"get_fund_candidates@{research_target}")
+
+        fields = {"fund_nav": "单位净值", "fund_risk_level": FUND_RISK["fund_risk_level"],
+                  "performance_benchmark": "业绩比较基准", "tracking_index": "跟踪标的"}
+        required = []
+        if re.search(r"费率|费用|跟踪|成本", question):
+            fields.update({**FUND_FEES, "tracking_error": FUND_RISK["tracking_error"]})
+            if re.search(r"费率|费用|成本", question):
+                required.append("fee_rate")
+            if "跟踪" in question:
+                required.append("tracking_error")
+        if re.search(r"收益|业绩|绩效|回撤|波动|风险|选股|风格", question):
+            fields.update({**FUND_RETURNS, **FUND_RISK})
+            if "回撤" in question:
+                required.append("max_drawdown_1y")
+            if re.search(r"收益|业绩|绩效", question):
+                required.append("return_1y")
+        if re.search(r"持仓|配置|选股|风格|归因", question):
+            fields.update(FUND_ALLOCATION)
+        if not required:
+            fields.update(FUND_FEES)
+        filters = {"target": target, "fields": "、".join(fields.values()), "research_question": question}
+        return DataCall("fund", "get_fund_candidates", (filters,),
+                        f"get_fund_candidates@{research_target}:{_target_key(None, question)}",
+                        required_fields=tuple(required), expected_entity=target)
+
+    @staticmethod
     def _capability_call(
         capability: ResearchCapability,
         request: OrchestrationRequest,
@@ -480,13 +550,9 @@ class AutomatedResearchPipeline:
 
         method = CAPABILITY_METHODS[capability]
         if capability is ResearchCapability.FUND:
-            filters = {
-                "query": request.query,
-                "risk_level": request.profile.risk_level or "未指定",
-            }
-            args: tuple[Any, ...] = (filters,)
-        else:
-            args = (AutomatedResearchPipeline._query_scope(method, request, intent, target),)
+            return AutomatedResearchPipeline._fund_call(request, target if intent is Intent.FUND_SCREENING else None,
+                                                        research_target)
+        args = (AutomatedResearchPipeline._query_scope(method, request, intent, target),)
         return DataCall(
             label=capability.value,
             method=method,

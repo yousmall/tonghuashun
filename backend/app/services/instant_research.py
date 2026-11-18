@@ -59,7 +59,7 @@ def brief_analysis(chosen):
             return "市盈率不为正，通常不宜按常规市盈率比较估值；还需核查盈利口径。"
         if roe <= 0:
             return "市盈率与净资产收益率呈现不同的盈利信号，需核查统计期间及盈利质量。"
-        return "市盈率和净资产收益率均有可用数据，但缺少同行基准及盈利稳定性信息，暂不能判断估值是否合理。"
+        return "估值尚不宜定性为偏高或偏低；仍需核对同行差异及盈利稳定性。"
     return ""
 
 
@@ -143,9 +143,33 @@ def entity_review(entity, chosen, missing):
     return "\n\n".join(parts)
 
 
+def entity_conclusion(entity, chosen, focus, asks_for_value):
+    if asks_for_value:
+        requested = {}
+        for fact in sorted(chosen, key=lambda fact: (str(fact.period or ""), fact.snapshot_time), reverse=True):
+            if fact.field in focus and fact.field not in SCORE_FIELDS:
+                requested.setdefault(fact.field, fact)
+        if requested:
+            return f"{entity}：" + "；".join(format_observation(fact) for fact in requested.values()) + "。"
+    analysis = brief_analysis(chosen)
+    if analysis:
+        return f"{entity}：{analysis.split('；', 1)[0].rstrip('。')}。"
+    change = max((fact for fact in chosen if fact.field == "change" and fact.period),
+                 key=lambda fact: (fact.period, fact.snapshot_time), default=None)
+    if change is not None and (not focus or "change" in focus):
+        value = observation_value(change)
+        direction = "上涨" if value > 0 else "下跌" if value < 0 else "持平"
+        return f"{entity}（{change.period}）{direction}。"
+    return f"{entity}本次只形成部分维度的观察，暂不形成综合投资判断。"
+
+
 def enrich_results(results, facts, query):
     """Add observations and per-entity coverage before fact/conflict verification."""
     focus = set().union(*(fields for pattern, fields in TOPICS if re.search(pattern, query, re.I)))
+    asks_for_value = bool(re.search(
+        r"(?:价格|股价|市盈率|市净率|估值|涨跌幅|涨幅|跌幅|营收|利润|ROE|现金流|费率|溢价率)"
+        r"(?:的具体数值|(?:分别)?(?:是|为)?(?:多少|多高|几个点))", query, re.I,
+    ))
     enriched = []
     for result in results:
         role = result.agent_id
@@ -168,7 +192,7 @@ def enrich_results(results, facts, query):
         if not by_entity or len(by_entity) > 3:
             enriched.append(result)
             continue
-        observations, selected, coverage = [], [], {}
+        observations, conclusions, selected, coverage = [], [], [], {}
         for entity, records in sorted(by_entity.items()):
             # A dated record with the same value carries more context than a
             # duplicate undated cell returned by another capability.
@@ -183,6 +207,7 @@ def enrich_results(results, facts, query):
             coverage[entity] = {"available_fields": sorted(available), "missing_fields": missing}
             paragraph = entity_review(entity, chosen, missing)
             observations.append(paragraph)
+            conclusions.append(entity_conclusion(entity, chosen, focus, asks_for_value))
             selected.extend(chosen)
         fields_used = {fact.field for fact in selected}
         notes = [text for field, text in NOTES.items() if field in fields_used and (not focus or field in focus)]
@@ -194,6 +219,7 @@ def enrich_results(results, facts, query):
                                   *(["**下一步重点核实**", *("- " + step for step in steps)] if steps else [])])
         enriched.append(result.model_copy(update={
             "opinion": opinion, "status": TaskStatus.COMPLETED,
+            "conclusion": "\n\n".join([*conclusions, *missing_topics]),
             "facts_used": list(dict.fromkeys([*result.facts_used, *(f.fact_id for f in selected)])),
             "citations": sorted(set(result.citations) | {f.source_id for f in selected}),
             "score": None, "rule_score": None,
@@ -209,8 +235,8 @@ class InstantResearchService(LocalConsultationService):
     async def run(self, request, understanding, *, progress_sink=None):
         prepared, acquisition, advice = await super().run(request, understanding, progress_sink=progress_sink)
         scope = "evidence_review" if advice.response_scope == "snapshot" else advice.response_scope
-        conclusion = advice.conclusion.replace("精简资料概要：", "证据研判：").replace("精简咨询", "证据研判").replace("请选择研究页面或使用深入研究处理自由问答", "请明确研究标的，复杂问题可使用后台完整报告")
-        conclusion = conclusion.replace("或选择深入研究", "或在后台预生成完整报告").replace("请选择深入研究", "请在后台预生成完整报告")
+        conclusion = advice.conclusion.replace("精简资料概要：", "证据研判：").replace("精简咨询", "证据研判").replace("请选择研究页面或使用深入研究处理自由问答", "请写明研究标的；需要在线取数或回答复杂问题时，请切换到「深度思考」后重新发送")
+        conclusion = conclusion.replace("或选择深入研究", "或切换到「深度思考」").replace("请选择深入研究", "请切换到「深度思考」")
         notice = (NOTICE if scope == "evidence_review" else
                   "概念解释已完成；本次未查询行情，也未生成标的研究报告。" if scope == "education" else
                   "请求检查已完成；本次未生成证据研判或投资建议，请查看下方原因。")

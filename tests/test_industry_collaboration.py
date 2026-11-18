@@ -2,6 +2,7 @@
 import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from pydantic import ValidationError
@@ -14,6 +15,7 @@ from backend.app.agents.rule_agents import make_rule_agents
 from backend.app.models import AgentResult, FactRecord, Intent, OrchestrationRequest, UserProfile
 from backend.app.semantic import RequestUnderstanding
 from backend.app.services.model_input import slice_facts_for_agent
+from backend.app.services.research import AutomatedResearchPipeline
 from frontend.industry_collaboration import collect_research_materials
 
 
@@ -125,6 +127,47 @@ async def test_api_runs_four_specialists_in_parallel_then_verifies(semantic, mon
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["半导体", None])
+async def test_empty_collaboration_fetches_each_domain_and_runs_all_specialists(semantic, monkeypatch, target):
+    fixture = {
+        "get_macro_data": ("market", "pmi", 50),
+        "get_industry_rank": ("industry", "pe_ttm", 20),
+        "get_news": ("news", "news", "测试资讯"),
+        "screen_stocks": ("stock", "roe", 15),
+        "get_fund_candidates": ("fund", "fee_rate", 0.5),
+        "get_convertible_bond": ("convertible", "conversion_premium_rate", 10),
+    }
+    provider = SimpleNamespace(**{method: AsyncMock(return_value=[FactRecord.model_validate(
+        fact(label, field=field, value=value))]) for method, (label, field, value) in fixture.items()})
+    provider.get_news.side_effect = TimeoutError
+    seen = set()
+
+    def handler(agent_id):
+        async def run(req):
+            assert not req.research_materials
+            assert {item.fact_id for item in req.facts} >= {"market", "industry", "stock", "fund", "convertible"}
+            seen.add(agent_id)
+            return AgentResult(agent_id=agent_id, status="completed", confidence=.8,
+                               opinion="仅据测试资料给出分项观察。", facts_used=["stock" if agent_id == "security" else agent_id])
+        return run
+
+    monkeypatch.setattr(main, "coordinator", CoordinatorAgent(
+        {name: handler(name) for name in ("market", "industry", "security", "fund")},
+        verify_facts, basic_compliance_check, semantic=semantic))
+    monkeypatch.setattr(main, "research_pipeline", AutomatedResearchPipeline(provider))
+
+    result = await main.analyze_portfolio(request(research_target=target, auto_fetch=True), user=None)
+
+    assert seen == {"market", "industry", "security", "fund"}
+    assert set(result.data_acquisition.successful_capabilities) == {"macro", "industry", "stock_screen", "fund", "convertible"}
+    assert result.data_acquisition.failed_capabilities == ["news"]
+    assert (target or "代表性") in provider.screen_stocks.await_args_list[0].args[0]
+    assert (target or "代表性") in provider.get_fund_candidates.await_args_list[0].args[0]["query"]
+    assert provider.get_convertible_bond.await_args_list[0].args[0] == (
+        f"正股所属同花顺行业为{target}的可转债" if target else "全部可转债")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("has_facts", [True, False])
 async def test_reference_opinions_are_separate_from_model_evidence(has_facts):
     sent = []
@@ -178,7 +221,7 @@ with patch.object(ui, "profile_ready", return_value=True), patch.object(ui, "ana
     assert not app.exception
     payload = app.session_state["sent"]
     assert payload["industry_collaboration"] and payload["research_mode"] == "deep"
-    assert not payload["auto_fetch"]
+    assert payload["auto_fetch"]
     assert payload["research_target"] == "半导体" and payload["research_direction"] == "行业分析"
     assert payload["context_messages"] == []
     assert app.session_state["research_mode"] == "instant"

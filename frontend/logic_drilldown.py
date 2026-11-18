@@ -10,6 +10,7 @@ from typing import Any
 
 import streamlit as st
 
+from backend.app.answer_text import split_research_conclusion
 from frontend.presentation import (
     TOPIC_LABELS,
     advice_facts,
@@ -167,7 +168,11 @@ def render_logic_drilldown(advice: dict[str, Any], *, key: str = "logic") -> Non
     verified, all_facts = _fact_maps(advice)
     findings = (advice.get("research_report") or {}).get("key_findings") or []
     with st.expander("① 综合结论与关键信息", icon=":material/lightbulb:", key=f"{key}_conclusion"):
-        st.write(plain_language(advice.get("conclusion")) or "现有资料不足，暂时无法作出判断。")
+        evaluation, original_rationale = split_research_conclusion(advice.get("conclusion"))
+        st.write(plain_language(evaluation) or "本次未形成可用的评价。")
+        if original_rationale:
+            st.markdown("**原回答中的证据与判断限制**")
+            st.write(plain_language(original_rationale))
         if findings:
             st.markdown("**关键信息**（逐条展开可查看它引用的数据点）")
             for index, finding in enumerate(findings, 1):

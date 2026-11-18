@@ -324,7 +324,8 @@ class SemanticService:
                 "区分研究与科普：要求依据给定事实或评分判断市场/标的状态属于研究，"
                 "即使包含解释、测试或模拟字样；只有单纯询问概念和原理才归 education。"
                 "同时把本次想研究的具体对象（证券、基金或行业的名称/代码）写入 target；"
-                "用户用代词或省略指代时依据对话还原；没有明确对象时返回 null，不得猜测。"
+                "用户用代词、省略指代或提到当前所选标的时，先按对话还原，仍无法确定时才参考 selected_target。"
+                "不要用选中标的覆盖本轮明确指定的对象、比较对象或筛选条件；没有明确对象时返回 null，不得猜测。"
                 "再识别本轮问题明确要求查询的数据类型，把需要的问财只读能力写入 "
                 "data_requirements：quote=行情，financial=财务估值，basic_info=基本资料，"
                 "company_operations=经营构成，shareholder_equity=股东股权，event=重大事件，"
@@ -346,6 +347,7 @@ class SemanticService:
                 + RISK_INSTRUCTIONS,
                 {"query": user_question(request.query) if request.research_direction else request.query,
                  **conversation_for_model(request),
+                 "selected_target": request.research_target,
                  "profile": profile_for_routing(request.profile),
                  **({"route_catalog": [
                      {"intent": intent.value, "direction": label, "scope": scope}
@@ -487,6 +489,7 @@ class SemanticService:
                 "agent_id": item.agent_id,
                 "status": item.status.value,
                 "opinion": item.opinion,
+                **({"conclusion": item.conclusion} if item.conclusion else {}),
                 "score": item.score,
                 "confidence": item.confidence,
                 "facts_used": item.facts_used,

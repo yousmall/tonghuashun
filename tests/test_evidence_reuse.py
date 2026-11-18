@@ -2,10 +2,12 @@
 import asyncio
 import json
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 
 import httpx
 import pytest
 import pytest_asyncio
+from reportlab.pdfgen import canvas
 
 from backend.app.agents.llm_agents import LLMConfig, OpenAICompatibleLLM
 from backend.app.models import FactRecord, OrchestrationRequest
@@ -30,6 +32,20 @@ async def document_cache(monkeypatch):
     monkeypatch.setattr(reader, "_extractions", extracts)
     yield
     await reader.close_document_caches()
+
+
+def test_pdf_worker_can_extract_using_windows_reload_selector_loop():
+    if not hasattr(asyncio, "WindowsSelectorEventLoopPolicy"):
+        pytest.skip("Windows Uvicorn reload uses a selector event loop")
+    buffer = BytesIO()
+    pdf = canvas.Canvas(buffer)
+    pdf.drawString(20, 100, "Example Company 600001")
+    pdf.save()
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        found = runner.run(reader._extract_pdf(buffer.getvalue(), focus="financial"))
+    assert "600001" in found["identity"]
+    assert found["pages"][0]["page"] == 1
 
 
 @pytest.mark.asyncio

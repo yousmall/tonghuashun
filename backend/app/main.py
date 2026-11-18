@@ -1219,7 +1219,7 @@ def _speculation_key(request: OrchestrationRequest) -> tuple[Intent, str] | None
     时模型才会给 target，猜错就会白抓一次数据，因此宁可不猜。
     """
 
-    if not SPECULATIVE_PREFETCH or request.research_mode != "deep":
+    if not SPECULATIVE_PREFETCH or request.research_mode != "deep" or not request.auto_fetch:
         return None
     direction = (request.research_direction or "").strip()
     target = (request.research_target or "").strip()
@@ -1420,9 +1420,13 @@ async def _analyze_portfolio(
                 pipeline, coordinator,
             ).run(request, understanding, progress_sink=report, metrics_sink=model_slice)
         else:
-            prefetched = await _take_prefetch(
-                prefetch_task, prefetch_key, fetch_intent, understanding.target, report,
-            )
+            prefetched = None
+            if not understanding.data_requirements:
+                prefetched = await _take_prefetch(
+                    prefetch_task, prefetch_key, fetch_intent, understanding.target, report,
+                )
+            elif prefetch_task is not None and prefetch_key != (fetch_intent, understanding.target):
+                prefetch_task.cancel()
             if prefetched is not None:
                 prepared_request, acquisition = prefetched
             else:
@@ -1510,7 +1514,8 @@ async def _analyze_portfolio(
                 "reason_code": "PROVIDER_QUOTA_EXHAUSTED",
                 "message": (acquisition.message or "") + f" {label}查询额度已用完，缺失资料仍需在额度恢复后复核。",
             })
-        if (request.research_mode not in {"lite", "instant", "auto"} and (llm_enabled or request.industry_collaboration)
+        if (not acquisition.reason_code and request.research_mode not in {"lite", "instant", "auto"}
+                and (llm_enabled or request.industry_collaboration)
                 and advice.agent_results and not any(
                     (result.details or {}).get("engine") == "third_party_llm" for result in advice.agent_results
                 )):

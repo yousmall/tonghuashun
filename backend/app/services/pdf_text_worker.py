@@ -18,7 +18,8 @@ FOCUS = {
 
 def main():
     started = time.monotonic()
-    focus_groups = ({"financial": ("主要会计数据", "合并利润表", "营业收入", "归属于上市公司股东的净利润")}
+    focus_groups = ({"financial": ("非经常性损益项目和金额", "主要会计数据", "合并利润表", "营业收入",
+                                   "归属于上市公司股东的净利润", "扣除非经常性损益", "经营活动产生的现金流量净额")}
                     if sys.argv[1:] == ["financial"] else FOCUS)
     keywords = tuple(word for words in focus_groups.values() for word in words)
     data = sys.stdin.buffer.read(8 * 1024 * 1024 + 1)

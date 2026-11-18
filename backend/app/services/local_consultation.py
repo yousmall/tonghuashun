@@ -289,6 +289,7 @@ class LocalConsultationService:
             for result in results:
                 if result.facts_used and result is not safe_comparison:
                     result.opinion = "资料存在冲突或核验限制，请查看来源差异，暂不形成确定判断。"
+                    result.conclusion = None
                     result.score = None
                     result.rule_score = None
         if progress_sink:
@@ -298,10 +299,10 @@ class LocalConsultationService:
         plan.nodes.append(TaskNode(task_id="fixed-risk-check", agent_id="compliance", status=TaskStatus.COMPLETED,
                                    depends_on=["fact-verification"]))
         advice = self.coordinator._aggregate(prepared, plan, results, cross, compliance)
-        conclusion = ("精简资料概要：\n\n" + "\n\n".join(result.opinion for result in results)
+        conclusion = ("精简资料概要：\n\n" + "\n\n".join(result.summary_opinion for result in results)
                       if results else "当前没有通过核验的相关资料，无法形成数据概要。请先加载资料，或选择深入研究。")
         if results and (comparison or intent is Intent.PORTFOLIO_REVIEW):
-            conclusion = results[0].opinion
+            conclusion = results[0].summary_opinion
             if not cross.issues:
                 advice.risk_conclusion = None
         if results and carried:

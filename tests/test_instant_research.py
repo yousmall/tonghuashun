@@ -51,8 +51,10 @@ async def test_instant_completes_review_without_network_or_model(monkeypatch, st
     assert body["data_acquisition"]["reason_code"] == "INSTANT_EVIDENCE_REVIEW"
     assert body["model_calls"] == [] and body["evidence"] and body["omitted_features"]
     assert all(n["status"] == "completed" for n in body["task_plan"]["nodes"])
-    assert "20倍" in body["conclusion"] and "单一数值不足以判定贵贱" in body["conclusion"]
-    assert "乙公司" not in body["conclusion"] and "尚缺" in body["conclusion"]
+    assert "估值尚不宜定性" in body["conclusion"]
+    assert all(term not in body["conclusion"] for term in ("乙公司", "20倍", "尚缺"))
+    basis = body["agent_results"][0]["opinion"]
+    assert all(term in basis for term in ("20倍", "单一数值不足以判定贵贱", "尚缺"))
     assert body["allocation"] == [] and body["return_expectation"]["scenarios"] == []
     assert body["compliance"]["status"] == "REVIEW" and "完整在线报告审核" in body["scope_notice"]
     observed = metrics.snapshot()["analysis"]
@@ -86,7 +88,9 @@ async def test_comparison_keeps_entities_separate_and_does_not_rank_stocks():
     prepared, _, advice = await InstantResearchService().run(req, select_scope(req))
     assert advice.response_scope == "evidence_review" and len(advice.evidence) >= 4
     assert "甲公司" in advice.conclusion and "乙公司" in advice.conclusion
-    assert "20倍" in advice.conclusion and "8倍" in advice.conclusion
+    assert "估值尚不宜定性" in advice.conclusion
+    assert all(value not in advice.conclusion and value in advice.agent_results[0].opinion
+               for value in ("20倍", "8倍"))
     assert set(advice.agent_results[0].details["coverage_by_entity"]) == {"甲公司", "乙公司"}
     assert advice.agent_results[0].score is None
     assert all(f.entity in {"甲公司", "乙公司"} for f in prepared.facts)
@@ -159,7 +163,10 @@ async def test_instant_explains_supported_growth_divergence_only_with_matching_p
     req = request("请分析600519的盈利", facts=rows)
     _, _, advice = await InstantResearchService().run(req, select_scope(req))
     assert advice.response_scope == "evidence_review"
-    assert "简要分析：营收增长而净利润下降" in advice.conclusion
+    assert "营收增长而净利润下降" in advice.conclusion
+    assert "简要分析" not in advice.conclusion and "已核验数据" not in advice.conclusion
+    assert "需核查成本" not in advice.conclusion and "需核查成本" in advice.agent_results[0].opinion
+    assert "简要分析：营收增长而净利润下降" in advice.agent_results[0].opinion
     assert {"revenue", "profit"} <= set(advice.evidence)
 
     mismatched = rows[:-1] + [rows[-1].model_copy(update={"period": "2026Q2"})]
@@ -327,7 +334,7 @@ async def test_real_provider_numeric_text_is_displayed_and_raw_evidence_is_prese
     rows[0] = rows[0].model_copy(update={"value": "1,446.44", "unit": "CNY", "period": datetime.now(timezone.utc).date().isoformat()})
     rows[1] = rows[1].model_copy(update={"value": "22.007688", "unit": None})
     rows.append(rows[0].model_copy(update={"fact_id": "undated_duplicate", "period": None, "unit": None}))
-    req = request("请分析600519的价格和估值", facts=rows)
+    req = request("600519的价格和市盈率是多少？", facts=rows)
     prepared, _, advice = await InstantResearchService().run(req, select_scope(req))
     assert "1446.44元" in advice.conclusion and "22.0077倍" in advice.conclusion
     assert advice.conclusion.count("1446.44") == 1
@@ -368,11 +375,14 @@ async def test_industry_report_separates_observations_scores_and_research_limits
     req = request("请分析广告营销行业", facts=rows).model_copy(update={"research_direction": "行业分析"})
     _, _, advice = await InstantResearchService().run(req, select_scope(req))
     assert advice.response_scope == "evidence_review"
-    text = advice.conclusion
+    assert "广告营销" in advice.conclusion and "上涨" in advice.conclusion
+    assert "不能代表" not in advice.conclusion
+    text = advice.agent_results[0].opinion
     for term in ["研判摘要", "已核验数据", "规则评分", "这些数据意味着什么", "证据缺口", "下一步重点核实",
                  "4.5591%", "0.7684%", "行业涨跌幅中值", "53.5分", "0分", "不是资金净流入金额",
                  "不表示资产价值为零", "统计期未注明", "获取时间不等于", "7亿元"]:
         assert term in text
+        assert term not in advice.conclusion
     assert {"capital_flow", "turnover_value"} <= set(advice.evidence)
     assert any("政策原文" in step for step in advice.next_steps)
     assert not advice.allocation and not advice.model_calls

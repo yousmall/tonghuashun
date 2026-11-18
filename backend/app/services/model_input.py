@@ -21,7 +21,10 @@ from backend.app.fact_taxonomy import (
     SLOW_FINANCIAL_FIELDS,
     fact_is_current,
 )
+from backend.app.fact_units import period_info
 from backend.app.models import FactRecord, Intent
+from backend.app.fund_fields import FUND_ALLOCATION, FUND_FEES, FUND_RETURNS, FUND_RISK
+from backend.app.services.research_requirements import FINANCIAL_IMPROVEMENT_FIELDS
 
 # 单次模型调用的事实条数上限。经验值：约 100 条结构化事实的 JSON 长度在
 # 2-4 万字符之间，可稳定落在 6 万字符预算内。
@@ -52,12 +55,15 @@ INTENT_FIELD_PRIORITY: dict[Intent, tuple[str, ...]] = {
     ),
     Intent.INDUSTRY_ANALYSIS: (
         "industry", "prosperity_score", "valuation_score", "capital_flow_score",
-        "crowding_score", "policy_score", "change", "news",
+        "crowding_score", "policy_score", "capital_flow", "turnover_value", "industry_revenue_growth",
+        "pe_ttm", "pb", "change", "news",
     ),
     Intent.SECURITY_RESEARCH: (
         "close_price", "change", "volume", "turnover_rate",
         "pe_ttm", "pe_static", "pe_dynamic", "pb", "roe", "roe_weighted",
-        "revenue_growth", "fundamental_score", "technical_score",
+        "revenue_growth", "net_profit_growth", "revenue", "net_profit", "operating_cash_flow",
+        "profit_excluding_non_recurring", "profit_excluding_non_recurring_growth",
+        "non_recurring_profit_loss", "contract_liabilities", "fundamental_score", "technical_score",
         "target_price", "rating", "earnings_forecast", "event",
         "industry", "news", "announcement", "research_report",
         "prosperity_score", "valuation_score", "policy_score",
@@ -68,11 +74,15 @@ INTENT_FIELD_PRIORITY: dict[Intent, tuple[str, ...]] = {
     ),
     Intent.FUND_SCREENING: (
         "fee_rate", "tracking_error", "fund_score", "fund_risk_level", "liquidity_score",
-        "close_price", "change", "weight",
+        "fund_nav", "fund_size", "nav_change", "fund_type", "tracking_index", "performance_benchmark",
+        "close_price", "change", "weight", *FUND_RETURNS,
+        *(field for field in FUND_RISK if field not in {"fund_risk_level", "tracking_error"}),
+        *(field for field in FUND_FEES if field != "fee_rate"), *FUND_ALLOCATION,
     ),
     Intent.CONVERTIBLE_BOND_ANALYSIS: (
         "close_price", "change", "conversion_premium_rate", "pure_bond_premium_rate",
-        "yield_to_maturity", "remaining_size", "bond_rating", "conversion_price",
+        "yield_to_maturity", "remaining_size", "bond_rating", "conversion_price", "conversion_value",
+        "pure_bond_value", "underlying_stock", "underlying_industry", "redemption_status", "reset_status",
         "pe_ttm", "pe_static", "pe_dynamic", "pb", "roe", "roe_weighted", "news",
     ),
     Intent.PORTFOLIO_REVIEW: (
@@ -144,11 +154,12 @@ def slice_facts_for_model(
 
 
 def slice_facts_for_agent(facts: list[FactRecord], agent_id: str, baseline_ids: list[str], *, mode: str = "deep",
-                         industry_collaboration: bool = False) -> list[FactRecord]:
+                         industry_collaboration: bool = False, financial_improvement: bool = False) -> list[FactRecord]:
     """Role-specific input, always retaining the baseline and its full lineage."""
     role_intent = {"market": Intent.MARKET_ANALYSIS, "industry": Intent.INDUSTRY_ANALYSIS,
                    "security": Intent.SECURITY_RESEARCH, "fund": Intent.FUND_SCREENING,
                    "portfolio": Intent.PORTFOLIO_REVIEW}[agent_id]
+    financial_attribution = financial_improvement and agent_id == "security"
     by_id = {fact.fact_id: fact for fact in facts}
     required = set(baseline_ids)
     current = datetime.now(timezone.utc)
@@ -166,8 +177,15 @@ def slice_facts_for_agent(facts: list[FactRecord], agent_id: str, baseline_ids: 
         role_intent, limit=20,
     )
     required.update(fact.fact_id for fact in supplement)
-    required.update(fact.fact_id for fact in facts if fact.field in {"rag_document_excerpt", "rag_education_excerpt"}
-                    and fact_is_current(fact, current))
+    if not financial_attribution:
+        required.update(fact.fact_id for fact in facts if fact.field in {"rag_document_excerpt", "rag_education_excerpt"}
+                        and fact_is_current(fact, current))
+    if financial_attribution:
+        excerpts = [fact for fact in facts if fact.field == "announcement_excerpt"
+                    and fact.source_id == "OFFICIAL_DISCLOSURE_PDF_V1"
+                    and (fact.derivation_rule or "").startswith("PDF_TEXT_V1: financial")
+                    and fact_is_current(fact, current)]
+        required.update(fact.fact_id for fact in excerpts[:3])
     pending = list(required)
     while pending:
         fact = by_id.get(pending.pop())
@@ -176,8 +194,14 @@ def slice_facts_for_agent(facts: list[FactRecord], agent_id: str, baseline_ids: 
                 required.add(parent)
                 pending.append(parent)
     relevant = set(INTENT_FIELD_PRIORITY[role_intent])
+    if financial_attribution:
+        relevant &= {*FINANCIAL_IMPROVEMENT_FIELDS, "revenue", "gross_margin", "net_margin", "operating_margin",
+                     "non_recurring_profit_loss", "contract_liabilities"}
     extra = [fact for fact in facts if fact.field.casefold() in relevant and fact.fact_id not in required
              and fact_is_current(fact, current)]
+    if financial_attribution:
+        extra = [fact for fact in extra if (period := period_info(fact.period)) is not None
+                 and period[1] <= current.date()]
     budget = 40 if mode == "fast" else 80
     selected, _ = slice_facts_for_model(extra, role_intent, limit=max(0, budget - len(required)),
                                       multi_record_limit=2 if mode == "fast" else MULTI_RECORD_LIMIT)

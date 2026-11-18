@@ -8,6 +8,7 @@ from __future__ import annotations
 import re
 
 from backend.app.models import Intent
+from backend.app.research_presets import PRESET_QUESTIONS, PRESET_TARGET_FALLBACK
 
 
 DIRECTION_FOR_INTENT: dict[Intent, str] = {
@@ -19,6 +20,12 @@ DIRECTION_FOR_INTENT: dict[Intent, str] = {
 }
 
 PROFILE_STOCK_RECOMMENDATION_QUERY = "个股研究：请按我已确认的投资偏好推荐最多3只A股股票。"
+
+PRESET_TARGET_PROMPTS = {
+    Intent.SECURITY_RESEARCH: "请先选择股票，或在问题里写明股票名称或代码。",
+    Intent.FUND_SCREENING: "请先选择基金或 ETF，或在问题里写明名称、基金代码及份额类别。",
+    Intent.CONVERTIBLE_BOND_ANALYSIS: "请先选择可转债，或在问题里写明转债名称或代码。",
+}
 
 
 ROUTE_CARDS = (
@@ -42,6 +49,17 @@ def user_question(query: str) -> str:
         if query.startswith(prefix):
             return query[len(prefix):].strip()
     return query.strip()
+
+
+def preset_research_intent(query: str, direction: str | None) -> Intent | None:
+    question = user_question(query).rstrip(" ？?。")
+    for intent, label in DIRECTION_FOR_INTENT.items():
+        if label == direction and any(
+            question == template.format(target=PRESET_TARGET_FALLBACK[label]).rstrip(" ？?。")
+            for template in PRESET_QUESTIONS[label]
+        ):
+            return intent
+    return None
 
 
 def _terms(value: str) -> set[str]:

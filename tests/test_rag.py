@@ -7,7 +7,6 @@ import json
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
-from streamlit.testing.v1 import AppTest
 from backend.app import main
 from backend.app.models import FactRecord, UserProfile, OrchestrationRequest, Intent
 from backend.app.services.rag import RagStore, DocumentUpload, SearchRequest, PUBLIC, chunks
@@ -174,25 +173,6 @@ def test_api_requires_auth_owner_is_server_defined_and_disable_does_not_leak(sto
         assert client.patch('/api/v1/rag/documents/'+docid,json={'enabled':False}).status_code==404
     finally:
         main.app.dependency_overrides.clear()
-
-
-def test_rag_ui_is_inside_shared_chain_even_without_a_question():
-    script="""
-import streamlit as st
-from frontend.conversation_logic import render_conversation_logic_chain,chain_key
-key=chain_key('rag-ui')
-st.session_state[key]=True
-st.session_state[key+'_rag_manager']=True
-def api(base,method,path,payload=None,**kwargs):
-    if path=='/rag/status':return {'enabled':True,'ready':True,'documents':12,'chunks':12,'model':'test'}
-    if path=='/rag/documents':return []
-render_conversation_logic_chain([],conversation_id='rag-ui',api_base='test',api_request=api)
-"""
-    app=AppTest.from_string(script).run(timeout=20)
-    assert not app.exception
-    assert any('资料标题'==item.label for item in app.text_input)
-    assert any('保存原文' in button.label for button in app.button)
-    assert any('本对话尚未发起咨询' in item.value for item in app.info)
 
 
 @pytest.mark.asyncio

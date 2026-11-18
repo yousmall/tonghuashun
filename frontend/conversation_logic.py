@@ -37,8 +37,7 @@ def chain_key(conversation_id: str) -> str:
 
 def render_conversation_logic_chain(messages: list[dict], *, conversation_id: str,
                                     expanded: bool = False,
-                                    on_research: Callable[[str], None] | None = None,
-                                    api_base: str | None = None, api_request: Callable | None = None) -> None:
+                                    on_research: Callable[[str], None] | None = None) -> None:
     """A stable container and round selector; never borrow another conversation."""
     from frontend.result_views import render_advice_details
     from frontend.logic_drilldown import render_logic_drilldown
@@ -50,9 +49,6 @@ def render_conversation_logic_chain(messages: list[dict], *, conversation_id: st
         if not panel.open:
             return
         st.caption('本对话共用一个投资逻辑链；每次提问追加一轮依据，新建对话后重新开始。')
-        if api_base and api_request:
-            from frontend.rag_view import render_rag_manager
-            render_rag_manager(api_base, api_request, key=key)
         if not rounds:
             st.info('本对话尚未发起咨询。提问后，分析过程、引用资料、图表和完整报告会保存在这里。')
             return

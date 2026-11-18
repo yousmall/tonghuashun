@@ -21,9 +21,10 @@ from time import perf_counter
 from uuid import uuid4
 
 from backend.app.semantic import RequestUnderstanding, SemanticService, UNAVAILABLE_REASON
-from backend.app.research_routing import DIRECTION_FOR_INTENT
+from backend.app.research_routing import DIRECTION_FOR_INTENT, PRESET_TARGET_PROMPTS, preset_research_intent, user_question
 from backend.app import fact_taxonomy as _TAXONOMY
 from backend.app.services.model_input import slice_facts_for_model
+from backend.app.services.research_requirements import is_financial_improvement_question
 from backend.app.services.return_expectation import build_return_expectation
 from backend.app.risk_questionnaire import assessment_is_current
 from backend.app.profile_guidance import allocation_for_profile
@@ -38,6 +39,7 @@ from backend.app.models import (
     FactRecord,
     Intent,
     OrchestrationRequest,
+    ResearchCapability,
     TaskNode,
     TaskPlan,
     TaskStatus,
@@ -122,6 +124,21 @@ class CoordinatorAgent:
                 intent=Intent.INDUSTRY_ANALYSIS, target=request.research_target,
                 confidence=1, risk_rules=[], reason="按行业协同入口指定的范围分析。",
             )
+        preset_intent = preset_research_intent(request.query, request.research_direction)
+        if preset_intent is not None and request.research_mode == "deep":
+            target = (request.research_target or "").strip() or None
+            if not target and preset_intent in PRESET_TARGET_PROMPTS:
+                if any(turn.role == "user" and user_question(turn.content) != user_question(request.query)
+                       for turn in request.context_messages):
+                    return await self.semantic.understand(request)
+                return RequestUnderstanding(intent=Intent.UNKNOWN, confidence=1, risk_rules=[],
+                                            reason=PRESET_TARGET_PROMPTS[preset_intent])
+            requirements = ([ResearchCapability.COMPANY_OPERATIONS, ResearchCapability.ANNOUNCEMENT]
+                            if preset_intent is Intent.SECURITY_RESEARCH and is_financial_improvement_question(user_question(request.query))
+                            else [])
+            return RequestUnderstanding(intent=preset_intent, target=target, confidence=1, risk_rules=[],
+                                        data_requirements=requirements,
+                                        reason="按已选研究方向和标的分析预设问题。")
         return await self.semantic.understand(request)
 
     async def understand_intent(self, query: str) -> Intent:
@@ -238,7 +255,8 @@ class CoordinatorAgent:
         if understanding.intent is Intent.UNKNOWN:
             # 模型故障不代表用户问题无关，不能显示“无法处理该内容”的拒绝话术。
             plan.clarification_question = (
-                UNAVAILABLE_REASON if understanding.reason == UNAVAILABLE_REASON
+                understanding.reason if understanding.reason == UNAVAILABLE_REASON or
+                understanding.reason in PRESET_TARGET_PROMPTS.values()
                 else unsupported_input_message(request, understanding)
             )
 
@@ -260,8 +278,10 @@ class CoordinatorAgent:
             progress_sink("分项研判")
         results = await self._run_parallel(model_view, specialist_nodes)
         # 收益面板计算使用的价格和目标价也必须进入同一个引用核验闸门。
-        scenarios = build_return_expectation(request.facts, [f.fact_id for f in request.facts],
-                                              request.profile, ComplianceStatus.PASS).scenarios
+        financial_improvement = (plan.intent is Intent.SECURITY_RESEARCH and request.research_mode == "deep"
+                                 and is_financial_improvement_question(user_question(request.query)))
+        scenarios = [] if financial_improvement else build_return_expectation(
+            request.facts, [f.fact_id for f in request.facts], request.profile, ComplianceStatus.PASS).scenarios
         by_id = {f.fact_id: f for f in request.facts}
         for result in results:
             if result.agent_id != "security" or result.status in {TaskStatus.FAILED, TaskStatus.UNKNOWN}:
@@ -380,7 +400,7 @@ class CoordinatorAgent:
         return AdvicePackage(
             trace_id=plan.trace_id, intent=plan.intent, conclusion=reason, confidence=0,
             risks=[reason], next_steps=["重新核验后再作判断"], task_plan=plan,
-            agent_results=safe_results, risk_conclusion="检查未完成，暂不能形成可靠的风险判断。",
+            agent_results=safe_results, risk_conclusion="风险检查未完成。",
             compliance=ComplianceResult(
                 status=ComplianceStatus.REVIEW, matched_rules=[code], reason=reason,
             ),
@@ -425,7 +445,10 @@ class CoordinatorAgent:
         confidence = sum(result.confidence for result in usable) / len(usable) if usable else 0
         # 永远显式返回数据时点，前端不得把它改写为含糊的“当前”。
         snapshot_time = max((fact.snapshot_time for fact in request.facts), default=None)
-        conclusion = self._summarize(usable, compliance.status, cross_validation)
+        financial_improvement = (plan.intent is Intent.SECURITY_RESEARCH and request.research_mode == "deep"
+                                 and is_financial_improvement_question(user_question(request.query)))
+        conclusion = self._summarize(usable, compliance.status, cross_validation,
+                                     financial_improvement=financial_improvement)
         if request.industry_collaboration and not evidence:
             conclusion = (
                 "证据不足，暂时无法比较行业景气、估值与资金流向。"
@@ -526,7 +549,7 @@ class CoordinatorAgent:
             intent=plan.intent,
             conclusion=reason,
             confidence=0,
-            risk_conclusion="画像或分析对象尚待确认，暂不能形成风险判断。",
+            risk_conclusion="研究对象或投资偏好待确认。",
             user_fit="待确认：尚未具备生成个性化建议的必要条件。",
             next_steps=["确认画像或补充希望分析的对象与授权事实"],
             compliance=ComplianceResult(
@@ -541,6 +564,8 @@ class CoordinatorAgent:
         results: list[AgentResult],
         status: ComplianceStatus,
         cross_validation: CrossValidationResult,
+        *,
+        financial_improvement: bool = False,
     ) -> str:
         """在不篡改专业分歧的前提下，生成最小可读的聚合结论。
 
@@ -548,13 +573,19 @@ class CoordinatorAgent:
         不同观点保留给用户与合规器，而非伪造一个单一确定结论。
         """
         supported = [result for result in results if result.facts_used]
+        if financial_improvement:
+            supported = [result for result in supported if result.agent_id == "security"]
+            if not supported:
+                return "财报分析：暂未核实可用于同口径比较的公司财务资料。"
         if not supported:
             # 未引用核验事实的观点只能留在分项状态，不能进入风险结论。
             return "证据不足，暂不输出投资建议。"
         # 节点标识和分数保留在结构化结果中，用户摘要按主题分段。
         labels = {"market": "市场", "industry": "行业", "security": "个股", "fund": "基金", "portfolio": "持仓"}
+        if financial_improvement:
+            labels["security"] = "财报分析"
         opinions = "\n\n".join(
-            f"{labels.get(result.agent_id, '分析')}：{result.opinion}" for result in supported
+            f"{labels.get(result.agent_id, '分析')}：{result.summary_opinion}" for result in supported
         )
         prefix = ""
         if status is ComplianceStatus.REVIEW:
@@ -933,6 +964,7 @@ async def verify_facts(
             result.confidence_reasons.append("存在无来源、低质量或过期事实")
             # 原观点和风险文字可能含被剔除事实，不能继续作为已核实结论展示。
             result.opinion = "部分引用未通过核验，该维度暂不形成确定判断。"
+            result.conclusion = None
             result.score = None
             result.risk_flags = ["证据质量不足"]
             result.invalidation_conditions = ["刷新资料并重新核验"]
@@ -962,27 +994,25 @@ def build_risk_conclusion(
     """只根据已核验结果、同源一致性和固定规则形成有边界的风险判断。"""
 
     if compliance.status is ComplianceStatus.BLOCK:
-        return "风险检查已拦截，本次未形成投资风险结论。"
+        return "风险检查未通过，暂不提供投资建议。"
 
     rules = set(compliance.matched_rules)
     identified: list[str] = []
     if "SINGLE_SECURITY_CONCENTRATION" in rules:
-        identified.append("持仓超过已确认的单标的比例上限，存在集中度风险")
+        identified.append("超过单标的比例上限，存在集中度风险")
     if "RETURN_DRAWDOWN_MISMATCH" in rules:
         identified.append("期望收益与可接受回撤明显不匹配")
     if identified:
-        finding = "；".join(identified) + "；请先核对持仓与风险边界。"
-        if cross_validation.status is not ComplianceStatus.PASS:
-            finding += "同时资料交叉核验待完成，暂不形成完整的风险判断。"
-        return finding
+        pending = "；资料待核对" if cross_validation.status is not ComplianceStatus.PASS else ""
+        return "；".join(identified) + pending + "。"
 
     if not any(result.facts_used for result in results):
-        return "缺少通过核验的资料引用，暂不能形成风险判断。"
+        return "缺少通过核验的资料引用，暂无法判断风险。"
     if cross_validation.status is not ComplianceStatus.PASS:
-        return "本次资料的引用、时点、同项记录或分项观点存在待核对之处，暂不能形成可靠的风险判断。"
+        return "资料或分项观点待核对，暂无法判断风险。"
     if compliance.status is not ComplianceStatus.PASS:
-        return "资料已完成交叉核验，但风险或适当性检查仍待复核，暂不能形成确定的风险判断。"
-    return "基于本次已核验资料与已确认画像，未触发已配置的硬性风险规则；这不表示标的没有投资风险。"
+        return "风险匹配仍需复核。"
+    return "未触发已配置的硬性风险规则，但不表示标的没有投资风险。"
 
 
 async def basic_compliance_check(

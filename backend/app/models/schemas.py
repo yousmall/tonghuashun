@@ -338,6 +338,7 @@ class AgentResult(BaseModel):
     status: TaskStatus
     # 在已授权事实范围内形成的专业判断，不应包含虚构的实时数字。
     opinion: str
+    conclusion: str | None = None
     # 可选的 0-100 标准化评分；无可比评分时应保持 None。
     score: float | None = Field(default=None, ge=0, le=100)
     rule_score: float | None = Field(default=None, ge=0, le=100)
@@ -360,6 +361,10 @@ class AgentResult(BaseModel):
     invalidation_conditions: list[str] = Field(default_factory=list)
     # 供前端展示的确定性明细（如评分维度、集中度）。不得放未引用的市场数字。
     details: dict[str, Any] = Field(default_factory=dict)
+
+    @property
+    def summary_opinion(self) -> str:
+        return (self.conclusion or "").strip() or self.opinion
 
 
 class VerificationResult(BaseModel):

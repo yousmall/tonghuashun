@@ -33,6 +33,51 @@ def test_target_price_requires_metadata_and_exact_security(updates):
     assert evidence_status(call, [fact], provider.now)["status"] == "complete"
 
 
+def test_financial_improvement_requires_separate_same_period_profit_metrics():
+    pipeline = AutomatedResearchPipeline(Provider())
+    req = request(pipeline.provider).model_copy(update={"query": "示例科技财报改善是经营好转还是一次性？"})
+    calls = pipeline._calls_for(req, Intent.SECURITY_RESEARCH, "示例科技")
+    financial = next(call for call in calls if call.label == "financial")
+    earlier = (pipeline.provider.now.date() - timedelta(days=365)).isoformat()
+    facts = [pipeline.provider.fact("示例科技", field, num, unit=unit, code="600001.SH")
+             for field, num, unit in [
+                 ("revenue_growth", 2, "percent"), ("net_profit_growth", 1, "percent"),
+                 ("net_profit", 300, "CNY"), ("profit_excluding_non_recurring", 270, "CNY"),
+                 ("operating_cash_flow", 260, "CNY"),
+             ]]
+    status = evidence_status(financial, facts, pipeline.provider.now)
+    assert status["status"] == "partial"
+    assert status["missing_fields"] == ["profit_excluding_non_recurring_growth"]
+    adjusted_growth = pipeline.provider.fact("示例科技", "profit_excluding_non_recurring_growth", -2,
+                                             unit="percent", code="600001.SH", period=earlier)
+    status = evidence_status(financial, [*facts, adjusted_growth], pipeline.provider.now)
+    assert status["invalid_fields"] == ["profit_excluding_non_recurring_growth"]
+    adjusted_growth.period = pipeline.provider.now.date().isoformat()
+    assert evidence_status(financial, [*facts, adjusted_growth], pipeline.provider.now)["status"] == "complete"
+
+
+def test_financial_recovery_targets_missing_growth_at_the_latest_full_report_period():
+    class FinancialProvider(Provider):
+        async def get_financial_growth_for_period(self, symbol, year, quarter):
+            raise AssertionError("planning must not fetch")
+
+    provider = FinancialProvider()
+    req = request(provider).model_copy(update={"query": "示例科技财报改善是经营好转还是一次性？"})
+    req.facts.extend([
+        provider.fact("示例科技", "announcement", "示例科技2025年第三季度报告", code="600001.SH", document=True),
+        provider.fact("示例科技", "announcement", "示例科技2025年年度报告摘要", code="600001.SH", document=True),
+        provider.fact("示例科技", "revenue_growth", 3, unit="percent", code="600001.SH", period="2025-09-30"),
+    ])
+    pipeline = AutomatedResearchPipeline(provider)
+    calls = gap_calls(pipeline, req, Intent.SECURITY_RESEARCH, "示例科技", DataAcquisitionResult())
+    call = next(call for call in calls if call.label == "financial_period")
+    assert call.args == ("600001", 2025, 3)
+    req.facts.append(provider.fact("示例科技", "net_profit_growth", 2, unit="percent",
+                                    code="600001.SH", period="2025-09-30"))
+    assert not any(call.label == "financial_period" for call in
+                   gap_calls(pipeline, req, Intent.SECURITY_RESEARCH, "示例科技", DataAcquisitionResult()))
+
+
 def test_count_pair_needs_one_scope_date_and_integer_counts():
     provider = Provider()
     call = DataCall("breadth", "get_market_breadth", ("中国宏观经济",), "test",

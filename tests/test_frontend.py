@@ -171,8 +171,8 @@ ui.page_questions('http://localhost')
     assert not app.warning
     assert any("仍需核实" in item.value for item in app.markdown)
     assert not any(item.label == '核验记录' for item in app.expander)
-    assert any('风险丁' in item.value for item in app.markdown)
-    assert not any('其余需要注意' in item.label for item in app.expander)
+    assert not any('风险丁' in item.value for item in app.markdown)
+    assert any(item.label == '查看风险详情' and not item.proto.expanded for item in app.expander)
 
 
 def test_failed_analysis_does_not_append_or_send_result_payload():

@@ -23,6 +23,8 @@ DIMENSIONS = (
      "单个时点不能确认趋势，需结合连续价格、成交量及同口径基准。",
      "价格方向或量价配合发生变化时，重新核对行情判断。"),
     ("经营与盈利", {"revenue", "net_profit", "revenue_growth", "net_profit_growth", "industry_revenue_growth",
+                    "profit_excluding_non_recurring", "profit_excluding_non_recurring_growth", "non_recurring_profit_loss",
+                    "operating_cash_flow", "contract_liabilities",
                     "roe", "roe_weighted", "gross_margin", "net_margin", "fundamental_score", "prosperity_score"},
      "需核对财报期间、经营现金流及非经常性损益，正增长不等于盈利质量改善。",
      "新财报出现增长放缓、利润与现金流背离时，重新评估经营判断。"),
@@ -52,6 +54,8 @@ DIRECTIONAL = {
     "change": ("价格上涨", "价格下跌", "价格表现不代表未来收益或经营改善。"),
     "revenue_growth": ("营业收入同比增长", "营业收入同比下降", "需结合利润率及现金流核对增长质量。"),
     "net_profit_growth": ("归母净利润同比增长", "归母净利润同比下降", "需核查非经常性损益与利润持续性。"),
+    "profit_excluding_non_recurring_growth": ("扣非归母净利润同比增长", "扣非归母净利润同比下降",
+                                             "需结合营收、毛利率及现金流判断经营改善的持续性。"),
     "industry_revenue_growth": ("行业收入同比增长", "行业收入同比下降", "需核对行业样本及利润表现。"),
     "capital_flow": ("本期资金净流入", "本期资金净流出", "需结合统计口径与连续交易日判断持续性。"),
 }
